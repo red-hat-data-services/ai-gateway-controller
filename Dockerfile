@@ -1,4 +1,4 @@
-ARG GOLANG_VERSION=1.25
+ARG GOLANG_VERSION=1.26
 
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
@@ -12,7 +12,9 @@ ARG TARGETARCH
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+
+COPY cmd/ cmd/
+COPY pkg/ pkg/
 
 USER root
 
