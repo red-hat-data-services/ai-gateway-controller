@@ -19,7 +19,10 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"os"
+	"strconv"
 	"time"
 
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -67,7 +70,10 @@ func main() {
 			"watch any CR in Phase 1 (see DESIGN.md), so this interval is the only re-apply trigger "+
 			"besides restart.")
 
-	opts := zap.Options{Development: true}
+	opts := zap.Options{}
+	if err := applyLogDevelopment(&opts, os.Stderr); err != nil {
+		os.Exit(1)
+	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -124,4 +130,20 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// applyLogDevelopment reads LOG_DEVELOPMENT into opts. Invalid values are
+// written to errOut: ctrl.Log is a NullLogSink until SetLogger runs.
+func applyLogDevelopment(opts *zap.Options, errOut io.Writer) error {
+	v, ok := os.LookupEnv("LOG_DEVELOPMENT")
+	if !ok {
+		return nil
+	}
+	dev, err := strconv.ParseBool(v)
+	if err != nil {
+		fmt.Fprintf(errOut, "invalid LOG_DEVELOPMENT value %q: %v\n", v, err)
+		return err
+	}
+	opts.Development = dev
+	return nil
 }

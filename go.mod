@@ -1,6 +1,6 @@
 module github.com/opendatahub-io/ai-gateway-controller
 
-go 1.25.13
+go 1.26.7
 
 require (
 	github.com/go-logr/logr v1.4.3
