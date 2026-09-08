@@ -125,7 +125,7 @@ type Overlay struct {
 // Frozen error surface (port plan §6): each maps to a Ready=False condition
 // with a stable reason, and is what E2E failure-injection asserts against.
 var (
-	ErrWeightUnsupported    = errors.New("envelope: non-uniform weights unsupported in 3.6 (uniform split or single provider only)")
+	ErrWeightUnsupported    = errors.New("envelope: non-uniform (proportional) weights are not supported in 3.6; use uniform weights or a single provider (proportional canaries: known 3.6 limitation, see ADR 0001 D5)")
 	ErrUnknownCluster       = errors.New("envelope: candidate references cluster absent from load_balancer config")
 	ErrScopeMismatch        = errors.New("envelope: scope fields must be non-empty")
 	ErrGenerationRegression = errors.New("envelope: source_generation must strictly increase on content change")
