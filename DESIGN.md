@@ -2,25 +2,113 @@
 
 ## Status
 
-Implemented: `make build` (tidy, lint, test, binary) passes clean, 94.7%
+**Phase 1:** `make build` (tidy, lint, test, binary) passes clean, 94.7%
 coverage on `pkg/render`. Not yet built into a released image, not yet
 pushed to a remote, not yet wired end-to-end into a live
 `ai-gateway-operator` reconcile (see "Out of scope").
 
+**Phase 2 (EA2):** `ExternalModel` / `ExternalProvider` reconciliation and
+multi-tenant fan-out — in progress.
+
 ## Purpose
 
-`ai-gateway-controller` installs the `praxis-extproc` dataplane manifests. It
-is a sibling of `maas-controller`, deployed by `ai-gateway-operator`:
+`ai-gateway-controller` is the AI Gateway control-plane controller. Target
+state (3.6): sibling of `maas-controller`, both deployed by
+`ai-gateway-operator`:
 
 ```
-ai-gateway-operator ──deploys──▶ ai-gateway-controller ──installs──▶ praxis-extproc
+ai-gateway-operator ──deploys──▶ ai-gateway-controller ──reconciles──▶ external models (control plane)
+ai-gateway-operator ──deploys──▶ ai-gateway-controller ──installs──▶ praxis-extproc (dataplane)
 ai-gateway-operator ──deploys──▶ maas-controller ──installs──▶ maas-api
 ```
 
-This is Phase 1 of splitting `payload-processing`'s dual role (Envoy ExtProc
-dataplane + `ExternalModel` reconciler). Phase 1 only replaces the "install
-the dataplane" half; the `ExternalModel`-watching / dynamic-config half stays
-on `maas-controller` for now (see "Out of scope").
+This repo replaces the control-plane half of `payload-processing` (IPP):
+watching `ExternalModel` / `ExternalProvider` and generating per-model
+configuration. The dataplane half moves to **Praxis** (`praxis-extproc`).
+
+Today `maas-controller` deploys the required infrastructure
+(CRDs, Deployments, etc.) and the IPP repo watches `ExternalModel` /
+`ExternalProvider`, doing both control-plane reconciliation and the ExtProc
+dataplane. 3.5 ships only `maas-controller` + IPP; see
+[Deployment architecture](#deployment-architecture).
+
+**Phase 1 (implemented today)** vendors and installs `praxis-extproc`
+manifests only.
+
+**Phase 2 (EA2, in progress)** adds `ExternalModel` / `ExternalProvider` watch,
+dynamic per-model config generation, and multi-tenant fan-out via
+`MaasTenantConfig` / `AITenant` (see [Scope](#scope)).
+
+## Deployment architecture
+
+### Current architecture (3.5)
+
+```mermaid
+flowchart TD
+    DSC["DataScienceCluster<br/>aigateway.modelsAsAService: Managed"]
+    ODH["ODH / RHOAI Operator"]
+    AIGO["AI Gateway Operator"]
+    MAAS["MaaS Controller"]
+    IPP["payload-processing (IPP)"]
+    API["maas-api, policies, subscriptions, ..."]
+
+    DSC --> ODH
+    ODH --> AIGO
+    AIGO --> MAAS
+    MAAS --> IPP
+    MAAS --> API
+```
+
+- **Operator chain:** `DataScienceCluster` (`aigateway.modelsAsAService: Managed`) → ODH/RHOAI operator → AI Gateway Operator → **`maas-controller` only**.
+- **`ai-gateway-controller` is not deployed in 3.5.** ExtProc dataplane is **IPP** (`payload-processing`), owned entirely by MaaS.
+- **`maas-controller` bootstraps infrastructure** (CRDs, Deployments, gateway policies, etc.).
+- **IPP owns both control plane and dataplane for external models:**
+  - Watches `ExternalModel` / `ExternalProvider` and reconciles per-model configuration.
+  - Runs the ExtProc dataplane (Deployment, EnvoyFilter, plugins ConfigMap).
+- **`AITenant` is a MaaS-owned object:**
+  - `maas-controller` bootstraps `AITenant/models-as-a-service` on startup.
+  - AITenant reconciler drives tenant namespace, `MaasTenantConfig`, maas-api, and gateway-scoped platform resources per tenant.
+- **IPP is injected through MaaS tenant reconciliation:**
+  - Tenant reconcile deploys `payload-processing` based on the owning `AITenant`.
+  - No `AITenant` field to pick dataplane backend — IPP is always what gets installed.
+
+### 3.6 architecture (target)
+
+```mermaid
+flowchart TD
+    DSC["DataScienceCluster<br/>aigateway.modelsAsAService: Managed"]
+    ODH["ODH / RHOAI Operator"]
+    AIGO["AI Gateway Operator"]
+    AIGC["AI Gateway Controller"]
+    MAAS["MaaS Controller"]
+    PRAXIS["praxis-extproc (Praxis dataplane)"]
+    IPP["payload-processing (IPP, legacy)"]
+    API["maas-api, policies, subscriptions, ..."]
+
+    DSC --> ODH
+    ODH --> AIGO
+    AIGO --> AIGC
+    AIGO --> MAAS
+    AIGC --> PRAXIS
+    AIGC --> EM["ExternalModel / ExternalProvider reconcile"]
+    MAAS --> IPP
+    MAAS --> API
+```
+
+- **AI Gateway Operator deploys two sibling controllers:**
+  - **`ai-gateway-controller`** — external-model control plane (watch + reconcile `ExternalModel` / `ExternalProvider`) and installs `praxis-extproc` (Praxis dataplane).
+  - **`maas-controller`** — MaaS platform (maas-api, gateway policies, subscriptions, telemetry, infrastructure bootstrap).
+- **Control-plane / dataplane split (replaces IPP's dual role):**
+  - **`ai-gateway-controller`** — deployment and reconciling of external models (per-model config generation, formerly in IPP).
+  - **Praxis (`praxis-extproc`)** — ExtProc dataplane only.
+- **`AITenant` selects the dataplane backend per tenant (EA2 / Phase 2):**
+  - New field (or equivalent) on `AITenant` to choose **Praxis** (`praxis-extproc`, via `ai-gateway-controller`) vs **IPP** (`payload-processing`, legacy MaaS path).
+  - Required so 3.6 can support both backends during the Praxis migration.
+- **Multi-tenancy works the same way it does today:**
+  - `MaasTenantConfig` / `AITenant` fan-out drives per-tenant namespaces, gateway binding, and dataplane install — no change to the tenancy model, only which ExtProc backend is selected.
+- **Split of responsibilities:**
+  - **`ai-gateway-controller`** — external-model control plane, `praxis-extproc` install, per-tenant Praxis/IPP dataplane selection.
+  - **`maas-controller`** — MaaS auth, rate limits, API keys, model refs, subscription/policy concerns under that tenant.
 
 ## Approach
 
@@ -40,7 +128,7 @@ resync interval. There is no CR watch in Phase 1; all configuration
 
 ## Scope
 
-### In scope (this repo, Phase 1)
+### Phase 1 — `praxis-extproc` install (implemented)
 
 - Vendor `deploy/overlays/odh` from `opendatahub-io/praxis-extproc@main` at a
   pinned commit (`hack/scripts/get-manifests.sh`) into
@@ -54,12 +142,16 @@ resync interval. There is no CR watch in Phase 1; all configuration
   (`ai-gateway-controller`).
 - PR/CI conventions — see [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-### Out of scope (explicitly deferred)
+### Phase 2 — external models + multi-tenancy (EA2, in progress)
 
-- `ExternalModel` watch / dynamic per-model config generation — stays on
-  `maas-controller`.
-- Multi-tenant fan-out (`MaasTenantConfig` / `AITenant`). Add only if
-  `praxis-extproc` itself needs more than one instance.
+- `ExternalModel` / `ExternalProvider` watch and dynamic per-model config
+  generation — full control-plane replacement for IPP (Praxis handles the
+  dataplane). **Not** in `maas-controller` today; lives in IPP and moves here.
+- Multi-tenant fan-out (`MaasTenantConfig` / `AITenant`) — same tenancy model
+  as today (per-tenant namespace, gateway binding, and dataplane install).
+  `AITenant` determines whether a tenant uses Praxis or IPP.
+
+### Out of scope (explicitly deferred)
 - Watching `AIGateway` (or any CR). Revisit once `AIGatewaySpec` gains a
   field relevant to this controller (today it only has `BatchGateway` and
   `ModelsAsAService` toggles).
@@ -74,8 +166,10 @@ resync interval. There is no CR watch in Phase 1; all configuration
 
 ## Dependencies
 
-No CR watch means no cross-repo Go type imports (no dependency on
-`ai-gateway-operator/api/...` or `models-as-a-service/...`). Only:
+Phase 1 has no CR watch, so no cross-repo Go type imports (no dependency on
+`ai-gateway-operator/api/...` or `models-as-a-service/...`). Phase 2 will
+add watches for `ExternalModel`, `ExternalProvider`, and tenant-scoped CRs.
+Today only:
 
 - `sigs.k8s.io/controller-runtime` (client + manager, leader election, health
   endpoints)
