@@ -102,7 +102,10 @@ func TestRender_CredentialOmittedForUnmappedAuth(t *testing.T) {
 		if env.Overlay.Candidates[0].Credential != nil {
 			t.Errorf("%s: credential must be omitted, got %+v", authType, env.Overlay.Candidates[0].Credential)
 		}
-		raw, _ := json.Marshal(env.Overlay.Candidates[0])
+		raw, err := json.Marshal(env.Overlay.Candidates[0])
+		if err != nil {
+			t.Fatalf("marshal candidate: %v", err)
+		}
 		if strings.Contains(string(raw), "credential") {
 			t.Errorf("%s: credential key must be absent from the wire: %s", authType, raw)
 		}
@@ -289,10 +292,10 @@ func TestComputeDigest_KnownVectors(t *testing.T) {
 		{
 			name: "unicode, line separators, empty fields, weighted policy",
 			overlay: Overlay{
-				Network: "netz-ünïcode-日本", LocalSite: "site‑a\u2028line\u2029sep",
+				Network: "netz-ünïcode-日本", LocalSite: "site‑a\u2028line\u2029sep", //nolint:gosmopolitan // deliberate non-ASCII round-trip fixture
 				Candidates: []Candidate{
 					{
-						Cluster: "cls", Kind: "mcp_tool", Name: "tügel — 名称",
+						Cluster: "cls", Kind: "mcp_tool", Name: "tügel — 名称", //nolint:gosmopolitan // deliberate non-ASCII round-trip fixture
 						Site: "s", Fresh: false,
 						Credential: &Credential{Strategy: "oauth2", SecretRef: SecretRef{Name: "n/a?b&c=d", Namespace: "", Key: ""}},
 					},
@@ -325,13 +328,19 @@ func TestRender_SelectionPolicyOnWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	raw, _ := json.Marshal(env.Overlay)
+	raw, err := json.Marshal(env.Overlay)
+	if err != nil {
+		t.Fatalf("marshal overlay: %v", err)
+	}
 	if !strings.Contains(string(raw), `"selection_policy":{"mode":"random"}`) {
 		t.Errorf("selection_policy must serialize verbatim: %s", raw)
 	}
 	// absent by default
 	env2, _ := Render(set, scope(), Revision{}, Options{})
-	raw2, _ := json.Marshal(env2.Overlay)
+	raw2, err := json.Marshal(env2.Overlay)
+	if err != nil {
+		t.Fatalf("marshal overlay: %v", err)
+	}
 	if strings.Contains(string(raw2), "selection_policy") {
 		t.Errorf("empty policy must be omitted: %s", raw2)
 	}
@@ -373,7 +382,10 @@ func TestRender_TopLevelWireFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(env)
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
 	var generic map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &generic); err != nil {
 		t.Fatal(err)

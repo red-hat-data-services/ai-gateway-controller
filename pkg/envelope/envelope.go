@@ -328,7 +328,7 @@ func ComputeDigestFromWire(raw []byte) (string, error) {
 	if _, isEnvelope := doc["schema_version"]; isEnvelope {
 		inner, ok := doc["overlay"]
 		if !ok {
-			return "", fmt.Errorf("envelope: envelope document has no overlay section")
+			return "", errors.New("envelope: envelope document has no overlay section")
 		}
 		if err := json.Unmarshal(inner, &overlay); err != nil {
 			return "", fmt.Errorf("envelope: overlay section is not a JSON object: %w", err)

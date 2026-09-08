@@ -133,7 +133,7 @@ func main() {
 		os.Stdout.Write(data)
 		return
 	}
-	if err := os.WriteFile(*out, data, 0o644); err != nil {
+	if err := os.WriteFile(*out, data, 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "render-overlay: write: %v\n", err)
 		os.Exit(1)
 	}
