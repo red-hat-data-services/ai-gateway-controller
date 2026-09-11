@@ -1,0 +1,34 @@
+ai-gateway-controller
+Copyright 2026 The opendatahub.io Authors
+
+This product includes software developed at
+The Open Data Hub project (https://opendatahub.io/).
+
+================================================================================
+
+This product includes code derived from the ai-gateway-payload-processing
+project's api/inference/v1alpha1 API types (ExternalModel, ExternalProvider),
+which are mirrored here to decouple this controller from that module.
+
+  Copyright 2026 The opendatahub.io Authors
+  Licensed under the Apache License, Version 2.0
+
+================================================================================
+
+This product includes test fixtures (routing-overlay contract golden vectors,
+pkg/envelope/testdata/overlay-contract/v1) derived from the praxis-ai
+project (https://github.com/praxis-proxy/ai, tests/fixtures/overlay-contract/v1
+at commit 1ef8a53ee9f2fd33db40862d4c70180ec80b20a6):
+
+  Copyright (c) 2024 Shane Utt and Praxis Contributors
+  Licensed under the MIT License
+
+================================================================================
+
+This product includes the jcs library (RFC 8785 JSON Canonicalization Scheme),
+used for content-addressed envelope digests
+(https://github.com/gowebpki/jcs, v1.0.1):
+
+  Copyright 2021 Bret Jordan & Benedikt Thoma
+  Copyright 2006-2019 WebPKI.org (http://webpki.org)
+  Licensed under the Apache License, Version 2.0

@@ -1,0 +1,118 @@
+# Two identical llm-katan echo backends. They are deliberately interchangeable
+# except for which one a request lands on: the hot-swap assertion checks which
+# backend's access log grows, not what the response says.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-a
+  namespace: overlay-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: katan-a
+  template:
+    metadata:
+      labels:
+        app: katan-a
+    spec:
+      containers:
+        - name: katan
+          image: llm-katan:e2e
+          imagePullPolicy: IfNotPresent
+          args:
+            - llm-katan
+            - --model
+            - echo-served
+            - --backend
+            - echo
+            - --providers
+            - anthropic
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: katan-a
+  namespace: overlay-e2e
+spec:
+  selector:
+    app: katan-a
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-b
+  namespace: overlay-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: katan-b
+  template:
+    metadata:
+      labels:
+        app: katan-b
+    spec:
+      containers:
+        - name: katan
+          image: llm-katan:e2e
+          imagePullPolicy: IfNotPresent
+          args:
+            - llm-katan
+            - --model
+            - echo-served
+            - --backend
+            - echo
+            - --providers
+            - anthropic
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: katan-b
+  namespace: overlay-e2e
+spec:
+  selector:
+    app: katan-b
+  ports:
+    - port: 8000
+      targetPort: 8000

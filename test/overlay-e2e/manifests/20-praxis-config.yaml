@@ -1,0 +1,54 @@
+# Static praxis pipeline for the overlay hot-swap e2e. Cluster names follow
+# the reconciler's fixed convention provider-<ExternalProvider CR name>, so
+# this file is exactly what a real gateway deployment's load_balancer section
+# would look like for providers katan-a and katan-b. The overlay itself lives
+# in the separate routing-overlay ConfigMap — never in here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-config
+  namespace: overlay-e2e
+data:
+  praxis.yaml: |
+    admin:
+      address: "0.0.0.0:9901"
+
+    insecure_options:
+      allow_public_admin: true
+      # The katan backends resolve to cluster-internal (pod CIDR) addresses.
+      # Praxis refuses "sensitive" endpoints unless this is set — a real
+      # finding for any deployment whose load_balancer clusters are in-cluster
+      # services (dogfood runs everything on public hostnames, which is why
+      # this never bit us there).
+      allow_private_endpoints: true
+
+    listeners:
+      - name: proxy
+        address: "0.0.0.0:8080"
+        filter_chains:
+          - main
+
+    filter_chains:
+      - name: main
+        filters:
+          - filter: json_body_field
+            field: model
+            header: X-Model
+
+          - filter: intelligent_route
+            overlay_file: /etc/praxis/routing/routing-overlay.json
+            model_header: X-Model
+            reload:
+              enabled: true
+              debounce_ms: 500
+
+          - filter: load_balancer
+            clusters:
+              - name: provider-katan-a
+                endpoints:
+                  - "katan-a.overlay-e2e.svc.cluster.local:8000"
+              - name: provider-katan-b
+                endpoints:
+                  - "katan-b.overlay-e2e.svc.cluster.local:8000"
+
+    shutdown_timeout_secs: 5
