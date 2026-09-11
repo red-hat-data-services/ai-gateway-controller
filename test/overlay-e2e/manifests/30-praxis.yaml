@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: praxis
+  namespace: overlay-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: praxis
+  template:
+    metadata:
+      labels:
+        app: praxis
+    spec:
+      containers:
+        - name: praxis
+          image: praxis-ai:overlay-e2e
+          imagePullPolicy: IfNotPresent
+          args: ["-c", "/etc/praxis/praxis.yaml"]
+          ports:
+            - containerPort: 8080
+              name: proxy
+            - containerPort: 9901
+              name: admin
+          volumeMounts:
+            - name: config
+              mountPath: /etc/praxis
+              readOnly: true
+            # NOTE: no subPath on the overlay mount — the hot-reload watcher
+            # depends on the ConfigMap projected volume's ..data symlink flip.
+            - name: routing-overlay
+              mountPath: /etc/praxis/routing
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 1000m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthy
+              port: 9901
+            initialDelaySeconds: 2
+            periodSeconds: 2
+      volumes:
+        - name: config
+          configMap:
+            name: praxis-config
+        - name: routing-overlay
+          configMap:
+            name: routing-overlay
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: praxis
+  namespace: overlay-e2e
+spec:
+  selector:
+    app: praxis
+  ports:
+    - name: proxy
+      port: 8080
+      targetPort: 8080
+    - name: admin
+      port: 9901
+      targetPort: 9901
