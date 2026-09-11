@@ -31,7 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
 
 var setupLog = ctrl.Log.WithName("setup")
@@ -41,23 +41,17 @@ func main() {
 		metricsAddr          string
 		probeAddr            string
 		enableLeaderElection bool
-		namespace            string
-		gatewayName          string
 		image                string
 		manifestPath         string
 		maasAPIRouteName     string
 		resyncInterval       time.Duration
+		deletionTimeout      time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. Enable this when running multiple replicas.")
-	flag.StringVar(&namespace, "namespace", "openshift-ingress",
-		"The namespace to install praxis-extproc into. Must match the Gateway's namespace "+
-			"(--gateway-namespace on maas-controller) so EnvoyFilter workloadSelector / targetRefs resolve.")
-	flag.StringVar(&gatewayName, "gateway-name", "maas-default-gateway",
-		"The name of the Gateway resource praxis-extproc's EnvoyFilter targets.")
 	flag.StringVar(&image, "image", "quay.io/opendatahub/odh-praxis-extproc:odh-stable",
 		"Container image for the payload-processing and payload-pre-processing Deployments.")
 	flag.StringVar(&manifestPath, "manifest-path", "/config/manifests/praxis-extproc/overlays/odh",
@@ -66,9 +60,12 @@ func main() {
 		"Base name of maas-api's HTTPRoute, used to disable ext_proc on its own routes. "+
 			"Exact fidelity depends on the Istio version's route-naming scheme; see DESIGN.md.")
 	flag.DurationVar(&resyncInterval, "resync-interval", 5*time.Minute,
-		"How often to re-render and re-apply the praxis-extproc manifests. This controller does not "+
-			"watch any CR in Phase 1 (see DESIGN.md), so this interval is the only re-apply trigger "+
-			"besides restart.")
+		"RequeueAfter used once a tenant's praxis-extproc resources have been applied, so drift "+
+			"gets corrected periodically even without a new AITenant watch event.")
+	flag.DurationVar(&deletionTimeout, "deletion-timeout", 10*time.Minute,
+		"Maximum time to retry praxis-extproc cleanup for a tenant switching away from praxis or "+
+			"being deleted before force-removing this controller's cleanup finalizer without "+
+			"confirming cleanup succeeded. Zero disables the timeout and retries indefinitely.")
 
 	opts := zap.Options{}
 	if err := applyLogDevelopment(&opts, os.Stderr); err != nil {
@@ -79,8 +76,8 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	if namespace == "" || gatewayName == "" || image == "" {
-		setupLog.Error(errors.New("missing required flag"), "--namespace, --gateway-name, and --image must be non-empty")
+	if image == "" {
+		setupLog.Error(errors.New("missing required flag"), "--image must be non-empty")
 		os.Exit(1)
 	}
 
@@ -107,25 +104,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	installer := &render.Installer{
-		Client:       mgr.GetClient(),
-		ManifestPath: manifestPath,
-		Params: render.Params{
-			Namespace:        namespace,
-			GatewayName:      gatewayName,
-			Image:            image,
-			MaaSAPIRouteName: maasAPIRouteName,
-		},
-		ResyncInterval: resyncInterval,
-		Log:            ctrl.Log.WithName("installer"),
+	reconciler := &tenant.Reconciler{
+		Client:               mgr.GetClient(),
+		ManifestPath:         manifestPath,
+		Image:                image,
+		MaaSAPIRouteNameBase: maasAPIRouteName,
+		ResyncInterval:       resyncInterval,
+		DeletionTimeout:      deletionTimeout,
+		Log:                  ctrl.Log.WithName("tenant"),
 	}
-	if err := mgr.Add(installer); err != nil {
-		setupLog.Error(err, "unable to register installer")
+	if err := reconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up AITenant reconciler")
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting ai-gateway-controller",
-		"namespace", namespace, "gatewayName", gatewayName, "manifestPath", manifestPath, "image", image)
+	setupLog.Info("starting ai-gateway-controller", "manifestPath", manifestPath, "image", image)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
