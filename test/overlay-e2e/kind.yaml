@@ -1,0 +1,13 @@
+# Minimal cluster for the routing-overlay hot-swap e2e (port plan M3).
+# The kubelet Watch strategy makes ConfigMap volume projection propagate in
+# seconds instead of the default ~1m sync period, which keeps the hot-swap
+# assertions fast and honest (it is still the real kubelet projection path —
+# praxis sees the ..data symlink flip exactly like in a real cluster).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        configMapAndSecretChangeDetectionStrategy: Watch
