@@ -1,4 +1,5 @@
-# Permissions ai-gateway-controller needs to render+apply the vendored
+# Permissions ai-gateway-controller needs to watch AITenant and, per
+# opted-in tenant, render+apply a per-tenant copy of the vendored
 # praxis-extproc overlay (config/manifests/praxis-extproc/overlays/odh).
 # Verified against a live OpenShift cluster; every Kind here is one this
 # controller actually creates/updates/deletes, no wildcard groups/resources.
@@ -7,7 +8,19 @@ kind: ClusterRole
 metadata:
   name: ai-gateway-controller-role
 rules:
-# Resources rendered from the vendored overlay.
+# Drives the per-tenant fan-out: watch AITenant for the
+# maas.opendatahub.io/payload-processing-type annotation and
+# status.{phase,gatewayRef}. This controller does not write AITenant
+# status (maas-controller's own AITenant reconciler owns that) or any
+# other field, only metadata.finalizers (PraxisCleanupFinalizer), hence
+# update/patch here but no separate status subresource rule.
+- apiGroups: ["maas.opendatahub.io"]
+  resources: ["aitenants"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["maas.opendatahub.io"]
+  resources: ["aitenants/finalizers"]
+  verbs: ["update"]
+# Resources rendered from the vendored overlay, one set per praxis tenant.
 - apiGroups: [""]
   resources: ["services", "serviceaccounts", "configmaps"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -20,14 +33,12 @@ rules:
 - apiGroups: ["networking.istio.io"]
   resources: ["envoyfilters", "destinationrules"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-# Manage the payload-processing-reader ClusterRole/ClusterRoleBinding by name.
+# Manage the shared payload-processing-reader ClusterRole plus one
+# payload-processing-reader-{tenantID} ClusterRoleBinding per tenant. Names
+# are dynamic per tenant, so this can't be scoped down with resourceNames.
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["clusterroles", "clusterrolebindings"]
-  verbs: ["create", "list", "watch"]
-- apiGroups: ["rbac.authorization.k8s.io"]
-  resources: ["clusterroles", "clusterrolebindings"]
-  resourceNames: ["payload-processing-reader"]
-  verbs: ["get", "patch", "delete"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 # Escalation-check mirror: ai-gateway-controller must hold every permission it
 # grants via payload-processing-reader.
 - apiGroups: [""]
