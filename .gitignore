@@ -9,6 +9,11 @@
 coverage.out
 coverage.html
 
+# Local end-to-end test output
+/evidence/
+/test/local-env/.cache/
+/test/local-env/evidence/
+
 # config/manifests/praxis-extproc/ is intentionally NOT ignored: it is
 # vendored by hack/scripts/get-manifests.sh at a pinned commit and committed.
 # Re-run "make get-manifests" after bumping the pinned commit and commit the

@@ -2,7 +2,7 @@ package envelope
 
 // M1 cross-language golden vectors (port plan R3): fixtures vendored from
 // praxis-proxy/ai tests/fixtures/overlay-contract/v1 @ 1ef8a53e (see
-// testdata/overlay-contract/v1/manifest.json for the manifest and the
+// test/testdata/overlay-contract/v1/manifest.json for the manifest and the
 // NOTICE entry for provenance). The manifest encodes what the Rust consumer
 // (compute_semantic_digest + validation in overlay.rs) does with each
 // document; these tests assert ComputeDigestFromWire reaches the same
@@ -22,6 +22,10 @@ import (
 
 const digest75 = "75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"
 
+func fixturePath(parts ...string) string {
+	return filepath.Join(append([]string{"..", "..", "test", "testdata", "overlay-contract", "v1"}, parts...)...)
+}
+
 type fixtureExpect struct {
 	Expected      string `json:"expected"` // accept | accept_legacy | reject
 	Reason        string `json:"reason"`
@@ -31,7 +35,7 @@ type fixtureExpect struct {
 
 func loadManifest(t *testing.T) map[string]fixtureExpect {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("testdata", "overlay-contract", "v1", "manifest.json"))
+	raw, err := os.ReadFile(fixturePath("manifest.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +53,7 @@ func loadManifest(t *testing.T) map[string]fixtureExpect {
 
 func readFixture(t *testing.T, name string) []byte {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("testdata", "overlay-contract", "v1", name))
+	raw, err := os.ReadFile(fixturePath(name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +240,7 @@ func TestGoldenVectors_Manifest(t *testing.T) {
 // fixture added upstream (or locally) without a manifest entry must fail
 // here, not be quietly skipped by the manifest-driven loop.
 func TestGoldenVectors_AllFixturesManifested(t *testing.T) {
-	entries, err := os.ReadDir(filepath.Join("testdata", "overlay-contract", "v1"))
+	entries, err := os.ReadDir(fixturePath())
 	if err != nil {
 		t.Fatal(err)
 	}
