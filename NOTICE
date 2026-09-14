@@ -16,7 +16,7 @@ which are mirrored here to decouple this controller from that module.
 ================================================================================
 
 This product includes test fixtures (routing-overlay contract golden vectors,
-pkg/envelope/testdata/overlay-contract/v1) derived from the praxis-ai
+test/testdata/overlay-contract/v1) derived from the praxis-ai
 project (https://github.com/praxis-proxy/ai, tests/fixtures/overlay-contract/v1
 at commit 1ef8a53ee9f2fd33db40862d4c70180ec80b20a6):
 

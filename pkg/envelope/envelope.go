@@ -313,7 +313,7 @@ func ComputeDigest(overlay Overlay) (string, error) {
 // praxis hashes, and overlay-level fields outside the four keys (e.g.
 // generated_at) do not. It is the independent verifier: audit and read-back
 // paths recompute digests over bytes they did not render, and the M1 golden
-// vectors (testdata/overlay-contract/v1, pinned from praxis fixtures) assert
+// vectors (test/testdata/overlay-contract/v1, pinned from praxis fixtures) assert
 // this path agrees with the Rust consumer byte for byte.
 //
 // Shape detection mirrors praxis: a document with a schema_version field is

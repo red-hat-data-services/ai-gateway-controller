@@ -79,7 +79,7 @@ cluster and cached images. All kubectl calls are pinned to
 Done: the Rust-side fixtures from praxis-ai
 `tests/fixtures/overlay-contract/v1/` (source commit
 `1ef8a53ee9f2fd33db40862d4c70180ec80b20a6`) are vendored under
-`pkg/envelope/testdata/overlay-contract/v1/` and driven by
+`test/testdata/overlay-contract/v1/` and driven by
 `pkg/envelope/golden_vectors_test.go` against
 `envelope.ComputeDigestFromWire` — digest agreement is now asserted on every
 CI run, not only when this kind e2e executes. The e2e keeps its distinct
