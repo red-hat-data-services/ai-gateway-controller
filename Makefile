@@ -112,7 +112,7 @@ uninstall: ##	delete config/self/default resources
 ##@ Container image
 
 CONTAINER_ENGINE ?= podman
-REPO ?= quay.io/opendatahub/ai-gateway-controller
+REPO ?= quay.io/opendatahub/odh-ai-gateway-controller
 TAG ?= latest
 FULL_IMAGE ?= $(REPO):$(TAG)
 
