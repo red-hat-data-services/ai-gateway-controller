@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"cmp"
 	"errors"
 	"flag"
 	"fmt"
@@ -52,7 +53,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. Enable this when running multiple replicas.")
-	flag.StringVar(&image, "image", "quay.io/opendatahub/odh-praxis-extproc:odh-stable",
+	flag.StringVar(&image, "image", resolveExtprocImage(),
 		"Container image for the payload-processing and payload-pre-processing Deployments.")
 	flag.StringVar(&manifestPath, "manifest-path", "/config/manifests/praxis-extproc/overlays/odh",
 		"Path to the vendored praxis-extproc kustomize overlay.")
@@ -123,6 +124,18 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// resolveExtprocImage returns the praxis-extproc container image.
+// In operator-managed deployments the RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE
+// env var carries a digest-pinned reference suitable for disconnected clusters.
+// When the variable is unset (local development), the mutable tag fallback is
+// returned instead.
+func resolveExtprocImage() string {
+	return cmp.Or(
+		os.Getenv("RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE"),
+		"quay.io/opendatahub/odh-praxis-extproc:odh-stable",
+	)
 }
 
 // applyLogDevelopment reads LOG_DEVELOPMENT into opts. Invalid values are
