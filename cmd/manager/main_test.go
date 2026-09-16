@@ -26,6 +26,39 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
+const wantFallbackImage = "quay.io/opendatahub/odh-praxis-extproc:odh-stable"
+
+func TestResolveExtprocImageUsesEnvVar(t *testing.T) {
+	digest := "quay.io/opendatahub/odh-praxis-extproc@sha256:abc123"
+	t.Setenv("RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE", digest)
+
+	got := resolveExtprocImage()
+	if got != digest {
+		t.Fatalf("resolveExtprocImage() = %q, want %q", got, digest)
+	}
+}
+
+func TestResolveExtprocImageFallsBackToDefault(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE", "")
+	if err := os.Unsetenv("RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := resolveExtprocImage()
+	if got != wantFallbackImage {
+		t.Fatalf("resolveExtprocImage() = %q, want %q", got, wantFallbackImage)
+	}
+}
+
+func TestResolveExtprocImageIgnoresEmptyEnvVar(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE", "")
+
+	got := resolveExtprocImage()
+	if got != wantFallbackImage {
+		t.Fatalf("resolveExtprocImage() = %q, want %q (empty env should fall back)", got, wantFallbackImage)
+	}
+}
+
 func TestApplyLogDevelopmentInvalidValueWritesStderr(t *testing.T) {
 	t.Setenv("LOG_DEVELOPMENT", "maybe")
 
