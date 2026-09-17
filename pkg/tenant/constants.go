@@ -47,6 +47,10 @@ const (
 	// means IPP (maas-controller), out of scope for this controller.
 	AnnotationPayloadProcessingType = "maas.opendatahub.io/payload-processing-type"
 
+	// AnnotationIPPMigrationCleanupComplete is set on AITenant by maas-controller
+	// when one-shot legacy IPP cleanup finishes. Praxis apply waits for this signal.
+	AnnotationIPPMigrationCleanupComplete = "maas.opendatahub.io/ipp-migration-cleanup-complete"
+
 	// PayloadProcessingBackendPraxis is the only AnnotationPayloadProcessingType
 	// value that opts a tenant into this controller (mirrors
 	// maas-controller's tenantreconcile.PayloadProcessingTypePraxis).
@@ -85,6 +89,13 @@ const (
 	// per-tenant praxis-extproc stacks share a gateway namespace (mirrors
 	// maas-controller's tenantreconcile.LabelTenantInstance).
 	LabelTenantInstance = "maas.opendatahub.io/tenant-instance"
+
+	// LabelManagedBy identifies resources applied by this controller. maas-controller
+	// ensureIPPWritersStopped skips pods with this label when checking legacy IPP writers.
+	LabelManagedBy = "app.kubernetes.io/managed-by"
+
+	// ManagedByAIGatewayController is the LabelManagedBy value on praxis resources.
+	ManagedByAIGatewayController = "ai-gateway-controller"
 
 	// maxKubernetesNameLength is the Kubernetes object name limit (RFC 1123
 	// label / DNS subdomain component). Rename returns an error rather than
