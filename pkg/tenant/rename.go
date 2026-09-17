@@ -104,6 +104,12 @@ func renamePayloadProcessingDeployment(u *unstructured.Unstructured, tenantID st
 	if err := setName(u, newName); err != nil {
 		return err
 	}
+	if err := setObjectLabel(u, LabelManagedBy, ManagedByAIGatewayController); err != nil {
+		return fmt.Errorf("managed-by label: %w", err)
+	}
+	if err := addPodTemplateLabel(u, LabelManagedBy, ManagedByAIGatewayController); err != nil {
+		return fmt.Errorf("pod template managed-by label: %w", err)
+	}
 	if err := addPodTemplateLabel(u, LabelTenantInstance, newName); err != nil {
 		return fmt.Errorf("tenant-instance label: %w", err)
 	}
@@ -128,6 +134,12 @@ func renamePayloadPreProcessingDeployment(u *unstructured.Unstructured, tenantID
 	newName := PayloadPreProcessingDeploymentName(tenantID)
 	if err := setName(u, newName); err != nil {
 		return err
+	}
+	if err := setObjectLabel(u, LabelManagedBy, ManagedByAIGatewayController); err != nil {
+		return fmt.Errorf("managed-by label: %w", err)
+	}
+	if err := addPodTemplateLabel(u, LabelManagedBy, ManagedByAIGatewayController); err != nil {
+		return fmt.Errorf("pod template managed-by label: %w", err)
 	}
 	if err := addPodTemplateLabel(u, LabelTenantInstance, newName); err != nil {
 		return fmt.Errorf("tenant-instance label: %w", err)
@@ -342,6 +354,16 @@ func setClusterUpstreamAddress(value map[string]any, fqdn string) error {
 
 func serviceFQDN(serviceName, namespace string) string {
 	return fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace)
+}
+
+func setObjectLabel(u *unstructured.Unstructured, key, value string) error {
+	labels := u.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[key] = value
+	u.SetLabels(labels)
+	return nil
 }
 
 func addPodTemplateLabel(u *unstructured.Unstructured, key, value string) error {
