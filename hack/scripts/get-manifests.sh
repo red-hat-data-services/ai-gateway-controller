@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 PRAXIS_EXTPROC_REPO="https://github.com/opendatahub-io/praxis-extproc"
-PRAXIS_EXTPROC_COMMIT="efa73d1720bb8d391c46a373a2c0566d0ff6b43d"
+PRAXIS_EXTPROC_COMMIT="d030ea0b2e4d775df4c7485652a48198d1a364ec"
 
 # The "odh" overlay references "../../base/..." paths that resolve relative to
 # deploy/, so we vendor deploy/base and deploy/overlays/odh together, preserving
