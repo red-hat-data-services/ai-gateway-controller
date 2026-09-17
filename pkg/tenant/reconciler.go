@@ -134,6 +134,11 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
+	if !IsIPPMigrationCleanupComplete(aitenant) {
+		log.Info("waiting for maas IPP migration cleanup before applying praxis-extproc")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+
 	rendered, err := render.Build(r.ManifestPath)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render: %w", err)
@@ -278,13 +283,29 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, namespace string) er
 	}
 
 	for _, t := range targets {
-		obj := &unstructured.Unstructured{}
-		obj.SetGroupVersionKind(t.gvk)
-		obj.SetName(t.name)
-		obj.SetNamespace(t.namespace)
-		if err := client.IgnoreNotFound(r.Client.Delete(ctx, obj)); err != nil {
-			return fmt.Errorf("delete %s %s/%s: %w", t.gvk.Kind, t.namespace, t.name, err)
+		if err := r.deleteResourceIfOwned(ctx, t.gvk, t.name, t.namespace); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func (r *Reconciler) deleteResourceIfOwned(ctx context.Context, gvk schema.GroupVersionKind, name, namespace string) error {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	obj.SetName(name)
+	obj.SetNamespace(namespace)
+	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get %s %s/%s: %w", gvk.Kind, namespace, name, err)
+	}
+	if !shouldDeletePraxisResource(obj) {
+		return nil
+	}
+	if err := client.IgnoreNotFound(r.Client.Delete(ctx, obj)); err != nil {
+		return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, namespace, name, err)
 	}
 	return nil
 }

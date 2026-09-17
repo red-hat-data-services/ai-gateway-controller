@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -67,6 +68,16 @@ func newAITenant(name, payloadProcessingType, phase, gatewayName, gatewayNamespa
 		status["gatewayRef"] = map[string]any{"name": gatewayName, "namespace": gatewayNamespace}
 	}
 	u.Object["status"] = status
+	return u
+}
+
+func withIPPMigrationCleanupComplete(u *unstructured.Unstructured) *unstructured.Unstructured {
+	annotations := u.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[AnnotationIPPMigrationCleanupComplete] = "true"
+	u.SetAnnotations(annotations)
 	return u
 }
 
@@ -214,10 +225,31 @@ func TestReconcileRequeuesShortlyWhenActiveButGatewayRefNotReady(t *testing.T) {
 	}
 }
 
+func TestReconcileWaitsForMigrationMarkerBeforeApply(t *testing.T) {
+	scheme := aitenantSchemeForTests()
+	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
+	delete(aitenant.GetAnnotations(), AnnotationIPPMigrationCleanupComplete)
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	names, _, _ := rec.snapshot()
+	if len(names) != 0 {
+		t.Fatalf("expected no praxis apply before migration marker, got %v", names)
+	}
+}
+
 func TestReconcileAppliesAndRequeuesResyncIntervalForNonDefaultTenant(t *testing.T) {
 	requireManifests(t)
 	scheme := aitenantSchemeForTests()
-	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
+	aitenant := withIPPMigrationCleanupComplete(newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns"))
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
@@ -255,7 +287,7 @@ func TestReconcileAppliesAndRequeuesResyncIntervalForNonDefaultTenant(t *testing
 func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 	requireManifests(t)
 	scheme := aitenantSchemeForTests()
-	aitenant := newAITenant(DefaultAITenantName, PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "openshift-ingress")
+	aitenant := withIPPMigrationCleanupComplete(newAITenant(DefaultAITenantName, PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "openshift-ingress"))
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
@@ -303,6 +335,33 @@ func expectedCleanupNames(tenantID string) []string {
 	}
 }
 
+func seedPraxisOwnedForCleanup(tenantID, namespace string) []client.Object {
+	setManager := func(u *unstructured.Unstructured) client.Object {
+		u.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController})
+		return u
+	}
+	mk := func(gvk schema.GroupVersionKind, name, ns string) client.Object {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvk)
+		u.SetName(name)
+		u.SetNamespace(ns)
+		return setManager(u)
+	}
+	return []client.Object{
+		mk(gvkDeployment, PayloadProcessingDeploymentName(tenantID), namespace),
+		mk(gvkDeployment, PayloadPreProcessingDeploymentName(tenantID), namespace),
+		mk(gvkService, PayloadProcessingServiceName(tenantID), namespace),
+		mk(gvkService, PayloadPreProcessingServiceName(tenantID), namespace),
+		mk(gvkConfigMap, PayloadProcessingPluginsConfigMapForTenant(tenantID), namespace),
+		mk(gvkServiceAccount, PayloadProcessingServiceAccountName(tenantID), namespace),
+		mk(gvkNetworkPolicy, PayloadProcessingNetworkPolicyName(tenantID), namespace),
+		mk(gvkEnvoyFilter, PayloadProcessingEnvoyFilterName(tenantID), namespace),
+		mk(gvkDestinationRule, PayloadProcessingServiceName(tenantID), namespace),
+		mk(gvkDestinationRule, PayloadPreProcessingServiceName(tenantID), namespace),
+		mk(gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID), ""),
+	}
+}
+
 func TestReconcileCleansUpAndRemovesFinalizerWhenSwitchedAwayFromPraxis(t *testing.T) {
 	scheme := aitenantSchemeForTests()
 	// No AnnotationPayloadProcessingType: this tenant switched back to IPP
@@ -310,7 +369,9 @@ func TestReconcileCleansUpAndRemovesFinalizerWhenSwitchedAwayFromPraxis(t *testi
 	// praxis is still present.
 	aitenant := withFinalizer(newAITenant("redteam", "", AITenantPhaseActive, "my-gateway", "tenant-ns"))
 	rec := &recorder{}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
+	seed := seedPraxisOwnedForCleanup("redteam", "tenant-ns")
+	objs := append([]client.Object{aitenant}, seed...)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(rec.funcs()).Build()
 
 	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
@@ -339,6 +400,31 @@ func TestReconcileCleansUpAndRemovesFinalizerWhenSwitchedAwayFromPraxis(t *testi
 	}
 }
 
+func TestReconcileCleanupSkipsMaaSOwnedResources(t *testing.T) {
+	scheme := aitenantSchemeForTests()
+	aitenant := withFinalizer(newAITenant("redteam", "", AITenantPhaseActive, "my-gateway", "tenant-ns"))
+	legacyDeploy := &unstructured.Unstructured{}
+	legacyDeploy.SetGroupVersionKind(gvkDeployment)
+	legacyDeploy.SetName(PayloadProcessingDeploymentName("redteam"))
+	legacyDeploy.SetNamespace("tenant-ns")
+	legacyDeploy.SetLabels(map[string]string{LabelManagedBy: maasControllerFieldOwner})
+
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, legacyDeploy).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	_, _, deleted := rec.snapshot()
+	for _, name := range deleted {
+		if name == PayloadProcessingDeploymentName("redteam") {
+			t.Fatalf("should not delete maas-controller-owned %q, got deletes %v", name, deleted)
+		}
+	}
+}
+
 func TestReconcileSwitchAwayWithoutFinalizerIsNoop(t *testing.T) {
 	scheme := aitenantSchemeForTests()
 	aitenant := newAITenant("redteam", "", AITenantPhaseActive, "my-gateway", "tenant-ns")
@@ -362,7 +448,9 @@ func TestReconcileDeleteCleansUpAndRemovesFinalizer(t *testing.T) {
 	now := metav1.Now()
 	aitenant.SetDeletionTimestamp(&now)
 	rec := &recorder{}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
+	seed := seedPraxisOwnedForCleanup("redteam", "tenant-ns")
+	objs := append([]client.Object{aitenant}, seed...)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(rec.funcs()).Build()
 
 	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute, DeletionTimeout: 10 * time.Minute}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})

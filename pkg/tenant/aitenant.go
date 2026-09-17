@@ -38,6 +38,12 @@ func UsesPraxis(aitenant *unstructured.Unstructured) bool {
 	return PayloadProcessingType(aitenant) == PayloadProcessingBackendPraxis
 }
 
+// IsIPPMigrationCleanupComplete reports whether maas-controller has finished
+// one-shot legacy IPP cleanup for this tenant (mirrors MaasTenantConfig marker).
+func IsIPPMigrationCleanupComplete(aitenant *unstructured.Unstructured) bool {
+	return aitenant.GetAnnotations()[AnnotationIPPMigrationCleanupComplete] == "true"
+}
+
 // IsActive reports whether maas-controller's AITenant reconciler has
 // finished validating and bootstrapping this tenant (status.phase ==
 // "Active": its Gateway is validated, and its namespace, MaasTenantConfig,
