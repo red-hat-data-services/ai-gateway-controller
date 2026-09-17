@@ -3,7 +3,8 @@ kind: ConfigMap
 metadata:
   name: payload-processing-plugins
 data:
-  # Pre-auth (BBR) Praxis chain: lightweight model extraction only.
+  # Pre-auth (BBR) Praxis chain: promote body model to a routing header, then
+  # rewrite publisher IDs in the JSON body for KServe upstream routing.
   pre-extproc.yaml: |
     server:
       grpc_address: "0.0.0.0:9004"
@@ -16,6 +17,8 @@ data:
       - name: bbr
         filters:
           - filter: model_to_header
+            header: X-Gateway-Model-Name
+          - filter: llmisvc_model_provider_resolver
             header: X-Gateway-Model-Name
 
     insecure_options:
