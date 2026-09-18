@@ -1,0 +1,70 @@
+# Creates run-owned credential-enforcing Katan HTTPS endpoints for OpenAI Chat Completions; service-ca issues their test certificates.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-a
+  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: provider-a}}
+  template:
+    metadata: {labels: {app: provider-a}}
+    spec:
+      containers:
+      - name: provider
+        image: ${KATAN_IMAGE}
+        imagePullPolicy: IfNotPresent
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=llm-katan-openai-key, --port, "8443", --tls-cert, /etc/katan/tls/tls.crt, --tls-key, /etc/katan/tls/tls.key]
+        env: [{name: HOME, value: /tmp}]
+        ports: [{name: https, containerPort: 8443}]
+        volumeMounts: [{name: writable-home, mountPath: /tmp}, {name: tls, mountPath: /etc/katan/tls, readOnly: true}]
+      volumes: [{name: writable-home, emptyDir: {}}, {name: tls, secret: {secretName: provider-a-tls}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-a
+  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+  annotations: {service.beta.openshift.io/serving-cert-secret-name: provider-a-tls}
+spec:
+  selector: {app: provider-a}
+  ports:
+  - {name: https, port: 443, targetPort: https}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-b
+  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: provider-b}}
+  template:
+    metadata: {labels: {app: provider-b}}
+    spec:
+      containers:
+      - name: provider
+        image: ${KATAN_IMAGE}
+        imagePullPolicy: IfNotPresent
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=llm-katan-openai-key, --port, "8443", --tls-cert, /etc/katan/tls/tls.crt, --tls-key, /etc/katan/tls/tls.key]
+        env: [{name: HOME, value: /tmp}]
+        ports: [{name: https, containerPort: 8443}]
+        volumeMounts: [{name: writable-home, mountPath: /tmp}, {name: tls, mountPath: /etc/katan/tls, readOnly: true}]
+      volumes: [{name: writable-home, emptyDir: {}}, {name: tls, secret: {secretName: provider-b-tls}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-b
+  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+  annotations: {service.beta.openshift.io/serving-cert-secret-name: provider-b-tls}
+spec:
+  selector: {app: provider-b}
+  ports:
+  - {name: https, port: 443, targetPort: https}

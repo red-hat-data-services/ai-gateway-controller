@@ -50,4 +50,47 @@ fetch_praxis_extproc() {
     echo "[praxis-extproc] Manifests ready at ${DST_ROOT} (commit ${PRAXIS_EXTPROC_COMMIT})"
 }
 
-fetch_praxis_extproc
+# The vendored ExtProc workload reads routing ConfigMaps and inference CRs but
+# does not consume provider Secrets. Credentials are projected only into the
+# tenant-local standalone Praxis workload. Keep this downstream least-privilege
+# adjustment structural and fail closed so regeneration cannot silently restore
+# Secret API access to ExtProc.
+normalize_extproc_cluster_role() {
+    local cluster_role=$1
+    local expected_rule='(.apiGroups[0] == "" and (.apiGroups | length) == 1 and .resources[0] == "secrets" and (.resources | length) == 1 and .verbs[0] == "get" and (.verbs | length) == 1)'
+    local rule_count secret_permission_count remaining_secret_permissions
+
+    command -v yq >/dev/null 2>&1 || { echo "yq is required to edit ${cluster_role}" >&2; return 1; }
+    rule_count=$(yq eval "[.rules[]? | select(${expected_rule})] | length" "${cluster_role}")
+    secret_permission_count=$(yq eval '[.rules[]? | select(((.resources // []) | contains(["secrets"])) or ((.resources // []) | contains(["*"])))] | length' "${cluster_role}")
+
+    if [[ "${rule_count}" == 0 ]]; then
+        [[ "${secret_permission_count}" == 0 ]] || {
+            echo "refusing RBAC rewrite: unexpected Secret permission exists in an already-normalized manifest" >&2
+            return 1
+        }
+        return 0
+    fi
+    [[ "${rule_count}" == 1 ]] || {
+        echo "refusing RBAC rewrite: expected exactly one core Secret get rule, found ${rule_count}" >&2
+        return 1
+    }
+
+    RBAC_TMP_FILE=$(mktemp "${cluster_role}.XXXXXX")
+    trap 'rm -f "${RBAC_TMP_FILE:-}"' EXIT
+    yq eval "del(.rules[] | select(${expected_rule}))" "${cluster_role}" >"${RBAC_TMP_FILE}"
+    remaining_secret_permissions=$(yq eval '[.rules[]? | select(((.resources // []) | contains(["secrets"])) or ((.resources // []) | contains(["*"])))] | length' "${RBAC_TMP_FILE}")
+    [[ "${remaining_secret_permissions}" == 0 ]] || {
+        echo "refusing RBAC rewrite: Secret permission remains after structural edit" >&2
+        return 1
+    }
+    mv "${RBAC_TMP_FILE}" "${cluster_role}"
+    trap - EXIT
+    rm -f "${RBAC_TMP_FILE}"
+    RBAC_TMP_FILE=
+}
+
+if [[ "${GET_MANIFESTS_TEST_ONLY:-false}" != true ]]; then
+    fetch_praxis_extproc
+    normalize_extproc_cluster_role "${DST_ROOT}/overlays/odh/rbac/clusterrole.yaml"
+fi

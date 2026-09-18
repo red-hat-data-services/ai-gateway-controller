@@ -15,7 +15,7 @@ func scope() Scope {
 
 func route(model, provider string, weight int) resolver.Route {
 	return resolver.Route{
-		Model: model, ClientName: model, Namespace: "ns1", Provider: provider,
+		Model: model, ClientName: model, Namespace: "ns1", Provider: provider, ProviderType: "openai",
 		Cluster: "provider-" + provider, Endpoint: provider + ".example.com",
 		TargetModel: "t", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		Weight: weight, AuthType: "apikey", SecretName: provider + "-key", SecretKey: "api-key",
@@ -65,16 +65,15 @@ func TestRender_HappyPath(t *testing.T) {
 func TestRender_CredentialWireShapeExact(t *testing.T) {
 	// The consumer rejects unknown fields inside credential objects — the
 	// emitted shape must be exactly {strategy, secretRef{name,namespace,key}},
-	// and only bearer_token is wire-representable today (see strategyFor).
+	// apikey is translated to the wire-level bearer_token strategy.
 	r := route("m1", "p1", 1)
-	r.AuthType = "bearer_token"
 	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}})
 	env, err := Render(set, scope(), Revision{}, Options{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	if env.Overlay.Candidates[0].Credential == nil {
-		t.Fatal("bearer_token must render a credential reference")
+		t.Fatal("apikey must render a credential reference")
 	}
 	raw, err := json.Marshal(env.Overlay.Candidates[0].Credential)
 	if err != nil {
@@ -86,29 +85,45 @@ func TestRender_CredentialWireShapeExact(t *testing.T) {
 	}
 }
 
+func TestRender_APIKeyRejectsUnsupportedProvider(t *testing.T) {
+	r := route("m1", "p1", 1)
+	r.ProviderType = "anthropic"
+	_, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{})
+	if err == nil || !strings.Contains(err.Error(), "provider credential semantics are not supported") {
+		t.Fatalf("expected provider-specific credential error, got %v", err)
+	}
+}
+
 func TestRender_CredentialOmittedForUnmappedAuth(t *testing.T) {
-	// apikey/sigv4/oauth2 have no faithful v1 wire strategy: the candidate
-	// must render with NO credential field (absent means "no reference" to
-	// praxis; a wrong strategy string would be rejected outright —
-	// "credential.strategy is unsupported", praxis-ai descriptor.rs).
-	for _, authType := range []string{"apikey", "sigv4", "oauth2"} {
+	// SigV4 and OAuth2 have no supported wire mapping and must fail closed.
+	for _, authType := range []string{"sigv4", "oauth2"} {
 		r := route("m1", "p1", 1)
 		r.AuthType = authType
 		set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}})
-		env, err := Render(set, scope(), Revision{}, Options{})
-		if err != nil {
-			t.Fatalf("Render(%s): %v", authType, err)
+		_, err := Render(set, scope(), Revision{}, Options{})
+		if err == nil || !strings.Contains(err.Error(), "not supported") {
+			t.Errorf("%s: expected loud unsupported-auth error, got %v", authType, err)
 		}
-		if env.Overlay.Candidates[0].Credential != nil {
-			t.Errorf("%s: credential must be omitted, got %+v", authType, env.Overlay.Candidates[0].Credential)
-		}
-		raw, err := json.Marshal(env.Overlay.Candidates[0])
-		if err != nil {
-			t.Fatalf("marshal candidate: %v", err)
-		}
-		if strings.Contains(string(raw), "credential") {
-			t.Errorf("%s: credential key must be absent from the wire: %s", authType, raw)
-		}
+	}
+}
+
+func TestRender_APIKeyMapsToReferenceOnlyBearerCredential(t *testing.T) {
+	r := route("m1", "p1", 1)
+	r.AuthType = "apikey"
+	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	raw, err := json.Marshal(env.Overlay.Candidates[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"strategy":"bearer_token"`) ||
+		!strings.Contains(string(raw), `"secretRef":{"name":"p1-key","namespace":"ns1","key":"api-key"}`) {
+		t.Fatalf("apikey reference mapping missing: %s", raw)
+	}
+	if strings.Contains(string(raw), "fixture-only-secret") {
+		t.Fatal("credential value appeared in reference-only overlay")
 	}
 }
 

@@ -1,0 +1,133 @@
+# Purpose: Creates the default, tenant-B, and transition Gateway API resources
+# plus their run-owned Services in maas-system.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the maas-system namespace and an Istio GatewayClass
+# installed by the Kind provisioner. Tenant A, tenant B, and transition
+# AITenants reference these Gateways; their listeners allow routes from the
+# tenant namespaces.
+#
+# Qualification role: Establishes the shared ingress boundary used to prove
+# authenticated routing, tenant isolation, and the separate IPP-to-Praxis
+# transition/rollback path.
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-default-gateway
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    gateway.networking.k8s.io/gateway-name: maas-default-gateway
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              local-env.opendatahub.io/gateway-tenant: models-as-a-service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maas-tenant-b-gateway
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    gateway.networking.k8s.io/gateway-name: maas-tenant-b-gateway
+spec:
+  selector:
+    gateway.networking.k8s.io/gateway-name: maas-tenant-b-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maas-default-gateway
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    gateway.networking.k8s.io/gateway-name: maas-default-gateway
+spec:
+  selector:
+    gateway.networking.k8s.io/gateway-name: maas-default-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-tenant-b-gateway
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    gateway.networking.k8s.io/gateway-name: maas-tenant-b-gateway
+spec:
+  gatewayClassName: istio
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: Selector
+        selector:
+          matchLabels:
+            local-env.opendatahub.io/gateway-tenant: ai-tenant-tenant-b
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-transition-gateway
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    gateway.networking.k8s.io/gateway-name: maas-transition-gateway
+spec:
+  gatewayClassName: istio
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: Selector
+        selector:
+          matchLabels:
+            local-env.opendatahub.io/gateway-tenant: ai-tenant-transition
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maas-transition-gateway
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    gateway.networking.k8s.io/gateway-name: maas-transition-gateway
+spec:
+  selector:
+    gateway.networking.k8s.io/gateway-name: maas-transition-gateway
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  - name: https
+    port: 443
+    targetPort: 80

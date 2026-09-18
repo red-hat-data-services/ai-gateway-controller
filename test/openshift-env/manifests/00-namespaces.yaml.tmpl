@@ -1,0 +1,16 @@
+# Creates the run-owned controller and provider namespaces. Shared platform namespaces are discovered in shell.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${OPENSHIFT_E2E_CONTROLLER_NAMESPACE}
+  labels:
+    external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels:
+    external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e

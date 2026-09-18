@@ -1,0 +1,63 @@
+# Purpose: Configures tenant B (`ai-tenant-tenant-b`) and its isolated
+# ExternalProvider and ExternalModel resources for the tenant-B routing suite.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the ai-tenants and ai-tenant-tenant-b namespaces, the
+# maas-tenant-b-gateway from 30-gateway.yaml, the tenant-B credential Secret,
+# and provider-a-tenant-b/provider-b-tenant-b from 00-backends.yaml. Its
+# AITenant is applied before the remaining resources during provisioning.
+#
+# Qualification role: Proves tenant-B model/provider discovery and routing are
+# isolated from tenant A. The credential is a dummy test value and must never
+# be treated as a production secret.
+
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: AITenant
+metadata:
+  name: tenant-b
+  namespace: ai-tenants
+  annotations:
+    maas.opendatahub.io/payload-processing-type: praxis
+spec:
+  gateway:
+    name: maas-tenant-b-gateway
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: provider-credentials
+  namespace: ai-tenant-tenant-b
+stringData:
+  api-key: tenant-b-controller-only-reference
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata: {name: provider-a, namespace: ai-tenant-tenant-b}
+spec:
+  provider: openai
+  endpoint: provider-a-tenant-b.maas-system.svc.cluster.local
+  auth: {type: apikey, secretRef: {name: provider-credentials}}
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata: {name: provider-b, namespace: ai-tenant-tenant-b}
+spec:
+  provider: openai
+  endpoint: provider-b-tenant-b.maas-system.svc.cluster.local
+  auth: {type: apikey, secretRef: {name: provider-credentials}}
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata: {name: demo-model, namespace: ai-tenant-tenant-b}
+spec:
+  modelName: demo
+  externalProviderRefs:
+  - ref: {name: provider-a}
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions
+  - ref: {name: provider-b}
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions

@@ -1,0 +1,147 @@
+# Purpose: Configures the separate IPP-to-Praxis transition/rollback tenant,
+# including its AITenant, service account, credential, ExternalProvider, and
+# ExternalModel resources.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+# This fixture belongs to the transition/rollback qualification, not the main
+# routing suite.
+#
+# Dependencies: Requires ai-tenant-transition, maas-transition-gateway from
+# 30-gateway.yaml, the transition backend compatibility Service from
+# 00-backends.yaml, and the MaaS controller/IPP handoff resources.
+#
+# Qualification role: Keeps the annotation-absent transition path explicit so
+# IPP ownership, Praxis cutover, and rollback can be tested independently.
+# The credential is a dummy test value and must never be treated as a
+# production secret.
+
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: AITenant
+metadata:
+  name: transition
+  namespace: ai-tenants
+spec:
+  gateway:
+    name: maas-transition-gateway
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payload-processing-transition
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    maas.opendatahub.io/tenant-namespace: ai-tenant-transition
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: payload-processing-ipp-reader-transition
+  namespace: ai-tenant-transition
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    maas.opendatahub.io/tenant-namespace: ai-tenant-transition
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs: [get, list, watch]
+- apiGroups:
+  - inference.opendatahub.io
+  resources:
+  - externalproviders
+  - externalmodels
+  verbs: [get, list, watch, create, update]
+- apiGroups:
+  - maas.opendatahub.io
+  resources:
+  - externalmodels
+  verbs: [get, list, watch]
+- apiGroups:
+  - inference.opendatahub.io
+  resources:
+  - externalproviders/status
+  - externalmodels/status
+  verbs: [get, update, patch]
+- apiGroups:
+  - inference.opendatahub.io
+  resources:
+  - externalproviders/finalizers
+  - externalmodels/finalizers
+  verbs: [update]
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs: [get, list, watch, create, update, delete]
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs: [get, list, watch, create, update, delete]
+- apiGroups:
+  - networking.istio.io
+  resources:
+  - serviceentries
+  - destinationrules
+  verbs: [get, list, watch, create, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: payload-processing-ipp-reader-transition
+  namespace: ai-tenant-transition
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    maas.opendatahub.io/tenant-namespace: ai-tenant-transition
+subjects:
+- kind: ServiceAccount
+  name: payload-processing-transition
+  namespace: maas-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: payload-processing-ipp-reader-transition
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: transition-provider-credentials
+  namespace: ai-tenant-transition
+type: Opaque
+stringData:
+  api-key: transition-provider-key
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: transition-provider
+  namespace: ai-tenant-transition
+  labels:
+    inference.llm-d.ai/ipp-managed: "true"
+spec:
+  provider: openai
+  # IPP's legacy route uses the ExternalModel's HTTPS-shaped port 443. The
+  # local compatibility Service maps that port to Katan's HTTP :8000.
+  endpoint: provider-a-legacy.maas-system.svc.cluster.local
+  auth:
+    type: apikey
+    secretRef:
+      name: transition-provider-credentials
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: transition-model
+  namespace: ai-tenant-transition
+  labels:
+    inference.llm-d.ai/ipp-managed: "true"
+spec:
+  modelName: transition-model
+  externalProviderRefs:
+    - ref:
+        name: transition-provider
+      targetModel: demo
+      apiFormat: openai-chat
+      path: /v1/chat/completions

@@ -1,0 +1,40 @@
+# Purpose: Grants the run-owned MaaS API ServiceAccount read-only ConfigMap
+# access required by the Kind fixture.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the maas-api ServiceAccount in maas-system. The base
+# MaaS API RBAC is applied separately; this additional RoleBinding is applied
+# by run.sh after the controller/API resources are installed.
+#
+# Qualification role: Supplies the extra Kind-specific permission needed by
+# the API's local certificate/configuration path, without changing the
+# production/OpenShift RBAC contract.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maas-api-kind-configmaps
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: maas-api-kind-configmaps
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: maas-api-kind-configmaps
+subjects:
+  - kind: ServiceAccount
+    name: maas-api
+    namespace: maas-system

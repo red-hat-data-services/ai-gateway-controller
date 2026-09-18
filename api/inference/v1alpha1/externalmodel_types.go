@@ -125,6 +125,19 @@ type ExternalModelStatus struct {
 	// +optional
 	HTTPRouteName string `json:"httpRouteName,omitempty"`
 
+	// ObservedGeneration is the latest spec generation processed by the controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// OverlayDigest is the content digest distributed to Praxis. It attests to
+	// distribution, not to request-time serving.
+	// +optional
+	OverlayDigest string `json:"overlayDigest,omitempty"`
+
+	// OverlayGeneration is the monotonic source generation distributed to Praxis.
+	// +optional
+	OverlayGeneration uint64 `json:"overlayGeneration,omitempty"`
+
 	// Conditions represent the latest available observations of the model's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

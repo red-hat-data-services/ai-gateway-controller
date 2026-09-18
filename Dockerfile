@@ -14,6 +14,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY cmd/ cmd/
+COPY api/ api/
 COPY pkg/ pkg/
 
 USER root

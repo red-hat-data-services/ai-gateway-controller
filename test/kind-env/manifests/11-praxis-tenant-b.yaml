@@ -1,0 +1,88 @@
+# Purpose: Defines the tenant-B standalone Praxis configuration, Deployment,
+# and Service for ai-tenant-tenant-b.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the ai-tenant-tenant-b namespace, its routing-overlay
+# ConfigMap and provider-credentials Secret, and the maas-system provider
+# Services from 00-backends.yaml. The main run may skip direct application
+# because the controller materializes the equivalent tenant-local resources.
+#
+# Qualification role: Proves tenant-B routing and credential state remain
+# isolated while tenant A is configured or mutated. Credentials are dummy
+# test values and must never be treated as production secrets.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-config-tenant-b
+  namespace: ai-tenant-tenant-b
+data:
+  config.yaml: |
+    listeners:
+      - name: proxy
+        address: "0.0.0.0:8080"
+        filter_chains: [main]
+    filter_chains:
+      - name: main
+        filters:
+          - filter: json_body_field
+            field: model
+            header: X-Model
+          - filter: intelligent_route
+            overlay_file: /etc/praxis/routing/routing-overlay.json
+            model_header: X-Model
+            reload: {enabled: true, debounce_ms: 500}
+          - filter: credential_inject
+            credentials:
+              - name: provider-credentials
+                namespace: ai-tenant-tenant-b
+                key: api-key
+                file: /etc/praxis/credentials/provider-credentials/api-key
+          - filter: load_balancer
+            clusters:
+              - name: provider-provider-a
+                endpoints: ["provider-a-tenant-b.maas-system.svc.cluster.local:8000"]
+              - name: provider-provider-b
+                endpoints: ["provider-b-tenant-b.maas-system.svc.cluster.local:8000"]
+    admin: {address: "127.0.0.1:9901"}
+    insecure_options: {allow_private_endpoints: true}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: praxis-tenant-b, namespace: ai-tenant-tenant-b}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: praxis-tenant-b}}
+  template:
+    metadata: {labels: {app: praxis-tenant-b}}
+    spec:
+      containers:
+      - name: praxis
+        image: praxis-ai:overlay-e2e
+        imagePullPolicy: Never
+        command: [praxis-ai]
+        args: [-c, /etc/praxis/config.yaml]
+        ports: [{name: http, containerPort: 8080}, {name: admin, containerPort: 9901}]
+        volumeMounts:
+        - {name: config, mountPath: /etc/praxis/config.yaml, subPath: config.yaml, readOnly: true}
+        - {name: routing, mountPath: /etc/praxis/routing, readOnly: true}
+        - {name: credentials, mountPath: /etc/praxis/credentials, readOnly: true}
+      volumes:
+      - {name: config, configMap: {name: praxis-config-tenant-b}}
+      - {name: routing, configMap: {name: routing-overlay}}
+      - name: credentials
+        secret:
+          secretName: provider-credentials
+          items:
+          - key: api-key
+            path: provider-credentials/api-key
+---
+apiVersion: v1
+kind: Service
+metadata: {name: praxis, namespace: ai-tenant-tenant-b}
+spec:
+  selector: {app: praxis-tenant-b}
+  ports:
+  - {name: http, port: 8080, targetPort: http}
+  - {name: admin, port: 9901, targetPort: admin}

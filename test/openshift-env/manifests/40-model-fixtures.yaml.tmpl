@@ -1,0 +1,20 @@
+# Creates the run-owned ExternalModel reference. Provider A/B identities are
+# rendered from test/external-model/providers.yaml.tmpl.
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: demo-model
+  namespace: ${OPENSHIFT_E2E_TENANT_NAMESPACE}
+  labels: {external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}, app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e}
+spec:
+  modelName: demo
+  externalProviderRefs:
+  - ref: {name: provider-a}
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions
+  - ref: {name: provider-b}
+    weight: 0
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions

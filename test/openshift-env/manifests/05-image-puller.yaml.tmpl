@@ -1,0 +1,22 @@
+# Creates the run-owned image-puller binding for stable namespace groups; exact discovered ServiceAccounts are bound in shell.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: image-puller-controller
+  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  labels:
+    external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: system:image-puller}
+subjects:
+- kind: Group
+  name: system:serviceaccounts:${OPENSHIFT_E2E_CONTROLLER_NAMESPACE}
+- kind: Group
+  name: system:serviceaccounts:${OPENSHIFT_E2E_TENANT_NAMESPACE}
+- kind: Group
+  name: system:serviceaccounts:${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+- kind: Group
+  name: system:serviceaccounts:openshift-ingress
+- kind: ServiceAccount
+  name: maas-api
+  namespace: maas-system

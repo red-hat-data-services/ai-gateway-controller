@@ -74,6 +74,10 @@ type ExternalProviderStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
+	// ObservedGeneration is the latest spec generation processed by the controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// Conditions represent the latest available observations of the provider's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

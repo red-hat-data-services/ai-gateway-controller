@@ -1,0 +1,22 @@
+# Creates the run-owned HTTPS Gateway. Its address, certificate, and Secret are discovered or generated in shell.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ${OPENSHIFT_E2E_GATEWAY_NAME}
+  namespace: ${OPENSHIFT_E2E_GATEWAY_NAMESPACE}
+  labels:
+    external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
+spec:
+  gatewayClassName: ${OPENSHIFT_E2E_GATEWAY_CLASS}
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 443
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - kind: Secret
+        name: ${OPENSHIFT_E2E_GATEWAY_TLS_SECRET}
+    allowedRoutes:
+      namespaces: {from: All}

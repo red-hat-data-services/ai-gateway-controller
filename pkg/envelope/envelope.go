@@ -125,10 +125,11 @@ type Overlay struct {
 // Frozen error surface (port plan §6): each maps to a Ready=False condition
 // with a stable reason, and is what E2E failure-injection asserts against.
 var (
-	ErrWeightUnsupported    = errors.New("envelope: non-uniform (proportional) weights are not supported in 3.6; use uniform weights or a single provider (proportional canaries: known 3.6 limitation, see ADR 0001 D5)")
-	ErrUnknownCluster       = errors.New("envelope: candidate references cluster absent from load_balancer config")
-	ErrScopeMismatch        = errors.New("envelope: scope fields must be non-empty")
-	ErrGenerationRegression = errors.New("envelope: source_generation must strictly increase on content change")
+	ErrWeightUnsupported     = errors.New("envelope: non-uniform (proportional) weights are not supported in 3.6; use uniform weights or a single provider (proportional canaries: known 3.6 limitation, see ADR 0001 D5)")
+	ErrUnknownCluster        = errors.New("envelope: candidate references cluster absent from load_balancer config")
+	ErrScopeMismatch         = errors.New("envelope: scope fields must be non-empty")
+	ErrGenerationRegression  = errors.New("envelope: source_generation must strictly increase on content change")
+	ErrUnsupportedCredential = errors.New("envelope: provider credential semantics are not supported")
 )
 
 // Options carries the non-derivable inputs so Render stays pure.
@@ -180,14 +181,21 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 			if len(known) > 0 && !known[r.Cluster] {
 				return Envelope{}, fmt.Errorf("%w: %s (model %s)", ErrUnknownCluster, r.Cluster, r.Model)
 			}
+			// Candidate names are the client-visible model identity.  This must
+			// match resolver.Route.ClientName and the HTTPRoute body/header
+			// matches; the ExternalModel object name is control-plane identity.
 			cand := Candidate{
 				Cluster: r.Cluster,
 				Kind:    "inference_model",
-				Name:    r.Model,
+				Name:    r.ClientName,
 				Site:    scope.LocalSite,
 				Fresh:   true,
 			}
-			if strategy, ok := strategyFor(r.AuthType); ok {
+			strategy, err := strategyFor(r)
+			if err != nil {
+				return Envelope{}, fmt.Errorf("model %s provider %s: %w", r.Model, r.Provider, err)
+			}
+			if strategy != "" {
 				cand.Credential = &Credential{
 					Strategy: strategy,
 					SecretRef: SecretRef{
@@ -241,24 +249,24 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 }
 
 // checkUniformWeights enforces the R1 guard for one model group.
-// strategyFor maps the CRD auth-type vocabulary (auth.type:
-// apikey|sigv4|oauth2) onto the overlay wire vocabulary. The praxis #540
-// consumer rejects every strategy except "bearer_token"
-// (validate_credential in praxis-ai filters/src/routing/descriptor.rs), and
-// none of the CRD types faithfully mean "bearer": an api key travels in a
-// provider-specific header (x-api-key, Authorization), sigv4 and oauth2 are
-// entirely different schemes. Emitting bearer_token for those would be a
-// wire-level lie the gateway's credential_inject filter would act on, so
-// unrepresentable types render no credential at all (accepted; routing
-// still works — the overlay credential is a reference, and the credential
-// injection config lives on the provider gateway). The mapping question is
-// an open §6 item for the interface freeze: either praxis widens the
-// strategy enum or the credential moves out of the envelope entirely.
-func strategyFor(authType string) (string, bool) {
-	if authType == "bearer_token" {
-		return "bearer_token", true
+// strategyFor maps only the currently qualified OpenAI chat API-key contract
+// to Praxis's bearer_token strategy. Provider API keys are not interchangeable:
+// other provider/API-format combinations fail closed until their header
+// semantics are explicitly supported.
+func strategyFor(route resolver.Route) (string, error) {
+	switch route.AuthType {
+	case "":
+		return "", nil
+	case "apikey":
+		if route.ProviderType == "openai" && route.APIFormat == "openai-chat" {
+			return "bearer_token", nil
+		}
+		return "", fmt.Errorf("%w: auth.type apikey for provider %q and API format %q", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)
+	case "sigv4", "oauth2":
+		return "", fmt.Errorf("%w: auth.type %q", ErrUnsupportedCredential, route.AuthType)
+	default:
+		return "", fmt.Errorf("envelope: unknown auth.type %q", route.AuthType)
 	}
-	return "", false
 }
 
 func checkUniformWeights(m resolver.ModelRoutes) error {

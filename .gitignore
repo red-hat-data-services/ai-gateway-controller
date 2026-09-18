@@ -23,3 +23,6 @@ coverage.html
 .DS_Store
 .idea/
 .vscode/
+
+# Local Kind qualification evidence and image-input cache
+evidence/

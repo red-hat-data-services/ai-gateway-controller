@@ -1,0 +1,36 @@
+# Purpose: Defines the shared Provider A and Provider B ExternalProvider identities.
+#
+# Scope: Kind and OpenShift E2E resources only. This is not a production manifest.
+#
+# Dependencies: Requires the target tenant namespace and the platform-specific
+# Katan Services at the supplied endpoints. The referenced Secret is created by
+# each platform harness and contains test-only credentials.
+#
+# Qualification role: Keeps provider identity, OpenAI API format, and credential
+# reference consistent while each platform retains its own Katan transport.
+
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: provider-a
+  namespace: ${EXTERNAL_MODEL_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: external-model-e2e
+    external-model-e2e/run-id: ${EXTERNAL_MODEL_RUN_ID}
+spec:
+  provider: openai
+  endpoint: ${EXTERNAL_MODEL_PROVIDER_A_ENDPOINT}
+  auth: {type: apikey, secretRef: {name: provider-credentials}}
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: provider-b
+  namespace: ${EXTERNAL_MODEL_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: external-model-e2e
+    external-model-e2e/run-id: ${EXTERNAL_MODEL_RUN_ID}
+spec:
+  provider: openai
+  endpoint: ${EXTERNAL_MODEL_PROVIDER_B_ENDPOINT}
+  auth: {type: apikey, secretRef: {name: provider-credentials}}

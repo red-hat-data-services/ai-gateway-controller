@@ -1,0 +1,39 @@
+# Purpose: Configures tenant A (`models-as-a-service`) and its ExternalProvider
+# and ExternalModel resources for the main Praxis routing suite.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the ai-tenants and models-as-a-service namespaces and
+# the maas-default-gateway from 30-gateway.yaml. Provider A/B resources are
+# rendered from test/external-model/providers.yaml.tmpl; the AITenant is
+# applied first and the remaining resources are applied after MaaS handoff.
+#
+# Qualification role: Defines the tenant-local provider topology that the
+# controller converts into transport resources, routing overlay, and Praxis
+# serving state.
+
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: AITenant
+metadata:
+  name: models-as-a-service
+  namespace: ai-tenants
+  annotations:
+    maas.opendatahub.io/payload-processing-type: praxis
+spec:
+  gateway:
+    name: maas-default-gateway
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata: {name: demo-model, namespace: models-as-a-service}
+spec:
+  modelName: demo
+  externalProviderRefs:
+  - ref: {name: provider-a}
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions
+  - ref: {name: provider-b}
+    targetModel: demo
+    apiFormat: openai-chat
+    path: /v1/chat/completions
