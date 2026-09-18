@@ -73,8 +73,8 @@ func nestedMapAt(t *testing.T, values []any, index int) map[string]any {
 }
 
 func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
-	route := resolver.Route{Model: "model", ClientName: "client-model"}
-	obj := modelHTTPRoute(route, "tenant-a", "gateway", "maas-system", "praxis")
+	route := resolver.Route{Model: "model", ClientName: "client-model", Provider: "openai"}
+	obj := modelHTTPRoute(route, "tenant-a", "gateway", "maas-system")
 	parentRefs := nestedSlice(t, obj.Object, "spec", "parentRefs")
 	parent := nestedMapAt(t, parentRefs, 0)
 	if nestedString(t, parent, "namespace") != "maas-system" {
@@ -96,6 +96,12 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 	}
 	backendRefs := nestedSlice(t, nestedMapAt(t, rules, 0), "backendRefs")
 	backend := nestedMapAt(t, backendRefs, 0)
+	if nestedString(t, backend, "name") != "provider-openai" {
+		t.Fatalf("backend name = %q, want provider-openai", nestedString(t, backend, "name"))
+	}
+	if port, _, _ := unstructured.NestedInt64(backend, "port"); port != 443 {
+		t.Fatalf("backend port = %d, want 443", port)
+	}
 	if _, found, err := unstructured.NestedString(backend, "namespace"); err != nil || found {
 		t.Fatal("route backend must remain in the tenant namespace; unexpected cross-namespace backend reference")
 	}
@@ -126,7 +132,7 @@ func TestCandidateIdentityUsesClientModelName(t *testing.T) {
 	if len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].Name != "client-visible-model" {
 		t.Fatalf("candidate identity = %#v, want client-visible-model", env.Overlay.Candidates)
 	}
-	obj := modelHTTPRoute(route, "tenant-a", "gateway", "tenant-a", "praxis")
+	obj := modelHTTPRoute(route, "tenant-a", "gateway", "tenant-a")
 	rules := nestedSlice(t, obj.Object, "spec", "rules")
 	path := nestedString(t, nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 0), "matches"), 0), "path", "value")
 	if path != "/tenant-a/client-visible-model" {

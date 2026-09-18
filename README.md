@@ -11,16 +11,12 @@ development setup.
 
 ## Production image contract
 
-The ODH operator and release packaging own the images used by an installed
-controller. They must provide `praxis-ai-image` as an immutable digest through
+The ODH operator and release packaging own the ExtProc dataplane image used by
+an installed controller. They provide `praxis-extproc-image` through
 `config/self/default/params.env`; the controller Deployment passes that value
-to `--praxis-image`. The corresponding Praxis AI image must also be declared as
-a related image so disconnected mirroring includes it.
-
-The controller intentionally has no mutable fallback for this value and fails
-startup when it is absent. Kind and OpenShift qualification harnesses may
-provide explicit run-specific image overrides, but those inputs are not a
-substitute for operator wiring in a production installation.
+to `--image`. There is no standalone `praxis-ai` hop: Gateway → ExtProc is the
+dataplane, and ExternalModel HTTPRoutes backend to provider ExternalName
+Services.
 
 ## Kind integration environment
 
