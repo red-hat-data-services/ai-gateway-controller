@@ -41,24 +41,21 @@ var setupLog = ctrl.Log.WithName("setup")
 
 func main() {
 	var (
-		metricsAddr           string
-		probeAddr             string
-		enableLeaderElection  bool
-		image                 string
-		praxisImage           string
-		praxisImagePullPolicy string
-		manifestPath          string
-		maasAPIRouteName      string
-		resyncInterval        time.Duration
-		deletionTimeout       time.Duration
-		externalNamespace     string
-		gatewayName           string
-		gatewayNamespace      string
-		network               string
-		localSite             string
-		knownClusters         []string
-		plaintextClusters     []string
-		skipNetworkPolicy     bool
+		metricsAddr          string
+		probeAddr            string
+		enableLeaderElection bool
+		image                string
+		manifestPath         string
+		maasAPIRouteName     string
+		resyncInterval       time.Duration
+		deletionTimeout      time.Duration
+		externalNamespace    string
+		gatewayName          string
+		gatewayNamespace     string
+		network              string
+		localSite            string
+		knownClusters        []string
+		skipNetworkPolicy    bool
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
@@ -67,10 +64,6 @@ func main() {
 		"Enable leader election for controller manager. Enable this when running multiple replicas.")
 	flag.StringVar(&image, "image", resolveExtprocImage(),
 		"Container image for the payload-processing and payload-pre-processing Deployments.")
-	flag.StringVar(&praxisImage, "praxis-image", "",
-		"Required container image for the tenant-scoped standalone Praxis Deployment; provide an immutable digest.")
-	flag.StringVar(&praxisImagePullPolicy, "praxis-image-pull-policy", "IfNotPresent",
-		"Image pull policy for the tenant-scoped standalone Praxis Deployment.")
 	flag.StringVar(&manifestPath, "manifest-path", "/config/manifests/praxis-extproc/overlays/odh",
 		"Path to the vendored praxis-extproc kustomize overlay.")
 	flag.StringVar(&maasAPIRouteName, "maas-api-route-name", "maas-api-route",
@@ -92,10 +85,6 @@ func main() {
 		knownClusters = append(knownClusters, value)
 		return nil
 	})
-	flag.Func("praxis-plaintext-cluster", "Test-only explicit plaintext Praxis cluster exception; repeat as needed. All omitted clusters use verified TLS.", func(value string) error {
-		plaintextClusters = append(plaintextClusters, value)
-		return nil
-	})
 	flag.BoolVar(&skipNetworkPolicy, "skip-network-policy", false,
 		"Omit controller-managed payload-processing NetworkPolicies when the installation supplies equivalent networking. Default false.")
 
@@ -105,18 +94,6 @@ func main() {
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
-	knownClusterSet := make(map[string]struct{}, len(knownClusters))
-	for _, cluster := range knownClusters {
-		knownClusterSet[cluster] = struct{}{}
-	}
-	plaintextClusterSet := make(map[string]struct{}, len(plaintextClusters))
-	for _, cluster := range plaintextClusters {
-		if _, ok := knownClusterSet[cluster]; !ok {
-			fmt.Fprintf(os.Stderr, "invalid transport configuration: plaintext Praxis cluster %q is not in --known-cluster\n", cluster)
-			os.Exit(1)
-		}
-		plaintextClusterSet[cluster] = struct{}{}
-	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	if err := inferencev1alpha1.AddToScheme(clientgoscheme.Scheme); err != nil {
@@ -126,10 +103,6 @@ func main() {
 
 	if image == "" {
 		setupLog.Error(errors.New("missing required flag"), "--image must be non-empty")
-		os.Exit(1)
-	}
-	if praxisImage == "" {
-		setupLog.Error(errors.New("missing required flag"), "--praxis-image must be non-empty and digest-pinned")
 		os.Exit(1)
 	}
 
@@ -157,17 +130,14 @@ func main() {
 	}
 
 	reconciler := &tenant.Reconciler{
-		Client:                  mgr.GetClient(),
-		ManifestPath:            manifestPath,
-		Image:                   image,
-		PraxisImage:             praxisImage,
-		PraxisImagePullPolicy:   praxisImagePullPolicy,
-		PraxisPlaintextClusters: plaintextClusterSet,
-		SkipNetworkPolicy:       skipNetworkPolicy,
-		MaaSAPIRouteNameBase:    maasAPIRouteName,
-		ResyncInterval:          resyncInterval,
-		DeletionTimeout:         deletionTimeout,
-		Log:                     ctrl.Log.WithName("tenant"),
+		Client:               mgr.GetClient(),
+		ManifestPath:         manifestPath,
+		Image:                image,
+		SkipNetworkPolicy:    skipNetworkPolicy,
+		MaaSAPIRouteNameBase: maasAPIRouteName,
+		ResyncInterval:       resyncInterval,
+		DeletionTimeout:      deletionTimeout,
+		Log:                  ctrl.Log.WithName("tenant"),
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up AITenant reconciler")
