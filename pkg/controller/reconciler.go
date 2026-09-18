@@ -45,7 +45,6 @@ const (
 	reasonClusterAllowlist      = "ClusterAllowlistMissing"
 	providerServicePrefix       = "provider-"
 	modelRoutePrefix            = "external-model-"
-	defaultPraxisService        = "praxis"
 	externalModelFinalizer      = "inference.opendatahub.io/external-model-cleanup"
 )
 
@@ -300,8 +299,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, errors.New(message)
 	}
 
-	praxisService := tenant.ResourceName(defaultPraxisService, tenant.ID(ait.GetName()))
-	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, gatewayName, gatewayNamespace, praxisService, modelOwners, providerOwners); err != nil {
+	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
 		for _, p := range validProviders {
 			if statusErr := r.updateProviderStatus(ctx, p, false, reasonReconcileFailed, err.Error()); statusErr != nil {
 				return reconcile.Result{}, statusErr
@@ -434,8 +432,7 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 	if selectedGateway, selectedNamespace, ok := tenant.GatewayRef(ait); ok {
 		gatewayName, gatewayNamespace = selectedGateway, selectedNamespace
 	}
-	praxisService := tenant.ResourceName(defaultPraxisService, tenant.ID(ait.GetName()))
-	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, gatewayName, gatewayNamespace, praxisService, modelOwners, providerOwners); err != nil {
+	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
 	if err := r.cleanupTransport(ctx, deleted.Namespace, set.Routes()); err != nil {
@@ -567,7 +564,7 @@ func (r *Reconciler) namespaceAllowed(namespace string) bool {
 }
 
 func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, gatewayName,
-	gatewayNamespace, praxisService string, modelOwners map[string]*v1alpha1.ExternalModel,
+	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel,
 	providerOwners map[string]*v1alpha1.ExternalProvider) error {
 	resources := make([]unstructured.Unstructured, 0, len(routes)*3+len(routes))
 	seen := map[string]bool{}
@@ -592,7 +589,7 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 		models[route.Model] = route
 	}
 	for _, route := range models {
-		obj := modelHTTPRoute(route, modelNamespace, gatewayName, gatewayNamespace, praxisService)
+		obj := modelHTTPRoute(route, modelNamespace, gatewayName, gatewayNamespace)
 		if owner := modelOwners[route.Model]; owner != nil {
 			setOwnerReference(&obj, owner)
 		}
@@ -761,12 +758,13 @@ func providerDestinationRule(route resolver.Route, ns string) unstructured.Unstr
 		},
 	}}
 }
-func modelHTTPRoute(route resolver.Route, ns, gateway, gatewayNS, praxisService string) unstructured.Unstructured {
+func modelHTTPRoute(route resolver.Route, ns, gateway, gatewayNS string) unstructured.Unstructured {
 	parent := map[string]any{"name": gateway}
 	if gatewayNS != "" && gatewayNS != ns {
 		parent["namespace"] = gatewayNS
 	}
 	path := "/" + ns + "/" + route.ClientName
+	backend := providerServicePrefix + route.Provider
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
 		"metadata": labelledMetadata(modelRouteName(route.Model), ns, "inference.opendatahub.io/external-model", route.Model),
@@ -775,7 +773,7 @@ func modelHTTPRoute(route resolver.Route, ns, gateway, gatewayNS, praxisService 
 			"rules": []any{
 				map[string]any{
 					"matches":     []any{map[string]any{"path": map[string]any{"type": "PathPrefix", "value": path}}},
-					"backendRefs": []any{map[string]any{"name": praxisService, "port": int64(8080)}},
+					"backendRefs": []any{map[string]any{"name": backend, "port": int64(443)}},
 					"filters":     []any{map[string]any{"type": "URLRewrite", "urlRewrite": map[string]any{"path": map[string]any{"type": "ReplacePrefixMatch", "replacePrefixMatch": "/"}}}},
 					"timeouts":    map[string]any{"request": "300s"},
 				},
@@ -785,7 +783,7 @@ func modelHTTPRoute(route resolver.Route, ns, gateway, gatewayNS, praxisService 
 					// from the request body/header, while the path rule above preserves
 					// the normal URL-based contract and rewrite.
 					"matches":     []any{map[string]any{"headers": []any{map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName}}}},
-					"backendRefs": []any{map[string]any{"name": praxisService, "port": int64(8080)}},
+					"backendRefs": []any{map[string]any{"name": backend, "port": int64(443)}},
 					"timeouts":    map[string]any{"request": "300s"},
 				},
 			},

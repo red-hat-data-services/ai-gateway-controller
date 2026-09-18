@@ -19,7 +19,6 @@ package tenant
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -66,14 +65,6 @@ type Reconciler struct {
 	ManifestPath string
 	// Image replaces the vendored overlay's placeholder container image.
 	Image string
-	// PraxisImage is the standalone Praxis AI image used for final-hop routing.
-	PraxisImage string
-	// PraxisImagePullPolicy controls image pulling for the standalone Praxis
-	// Deployment. Production defaults to IfNotPresent; local Kind can use Never.
-	PraxisImagePullPolicy string
-	// PraxisPlaintextClusters names test-only Praxis clusters that intentionally
-	// speak plaintext. All other provider clusters use verified TLS.
-	PraxisPlaintextClusters map[string]struct{}
 	// SkipNetworkPolicy omits the controller-managed payload-processing
 	// NetworkPolicy when an installation supplies equivalent networking and the
 	// target namespace disallows this controller from creating policies. It is
@@ -250,20 +241,6 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		labels[managedByLabel] = render.FieldOwner
 		resources[i].SetLabels(labels)
 	}
-	providers, requiredOverlayProviders, err := r.providersForTenant(ctx, tenantNamespace)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	praxisImage := r.PraxisImage
-	if strings.TrimSpace(praxisImage) == "" {
-		return ctrl.Result{}, errors.New("PraxisImage is required; configure --praxis-image through release packaging")
-	}
-	praxisResources, err := StandalonePraxisResourcesWithOptions(tenantID, tenantNamespace, praxisImage, r.PraxisImagePullPolicy, providers, PraxisTransportOptions{PlaintextClusters: r.PraxisPlaintextClusters})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("render standalone praxis: %w", err)
-	}
-	resources = append(resources, praxisResources...)
-
 	// MaaS and this controller intentionally use the same tenant-derived
 	// payload-processing names. During an IPP-to-Praxis handoff, MaaS may
 	// still be deleting its operands when the annotation watch reaches us.
@@ -276,39 +253,39 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
-	overlayReady, overlayReason, err := r.routingOverlayReady(ctx, tenantNamespace, requiredOverlayProviders)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	resourcesToApply := resources
-	if !overlayReady {
-		// Praxis exits if its optional routing volume is absent. Apply the
-		// static resources and credential projections first, but defer the
-		// standalone Praxis Deployment until the routing reconciler has
-		// published a controller-owned, digest-valid overlay. This keeps the
-		// overlay single-writer and preserves an existing ready Deployment
-		// when a new overlay is not yet available.
-		resourcesToApply = make([]unstructured.Unstructured, 0, len(resources))
-		praxisDeployment := ResourceName(praxisDeploymentName, tenantID)
-		for _, resource := range resources {
-			if resource.GetKind() == "Deployment" && resource.GetName() == praxisDeployment && resource.GetNamespace() == tenantNamespace {
-				continue
-			}
-			resourcesToApply = append(resourcesToApply, resource)
-		}
-	}
-	if err := render.Apply(ctx, r.Client, resourcesToApply); err != nil {
+	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		log.Error(err, "praxis-extproc apply failed for tenant; will retry")
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
 	}
-	if !overlayReady {
-		log.Info("deferring standalone Praxis Deployment until routing overlay is ready", "namespace", tenantNamespace, "reason", overlayReason)
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	// Drop any leftover tenant-scoped standalone Praxis hop from earlier
+	// releases. ExtProc is the dataplane; ExternalModel routes backend to
+	// provider ExternalName Services directly.
+	if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	log.Info("praxis-extproc install applied",
 		"tenantID", tenantID, "namespace", gatewayNamespace, "gatewayName", gatewayName)
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+}
+
+// deleteStandalonePraxis removes controller-owned standalone Praxis resources
+// left from releases that deployed a tenant-scoped praxis-ai hop.
+func (r *Reconciler) deleteStandalonePraxis(ctx context.Context, tenantID, tenantNamespace string) error {
+	for _, t := range []struct {
+		gvk  schema.GroupVersionKind
+		name string
+	}{
+		{gvkServiceAccount, ResourceName(praxisServiceAccount, tenantID)},
+		{gvkConfigMap, ResourceName(praxisConfigMapName, tenantID)},
+		{gvkService, ResourceName(praxisServiceName, tenantID)},
+		{gvkDeployment, ResourceName(praxisDeploymentName, tenantID)},
+	} {
+		if err := r.deleteResourceIfOwned(ctx, t.gvk, t.name, tenantNamespace); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // providersForTenant returns the providers referenced by the tenant's models
