@@ -49,14 +49,14 @@ func routeSetOne() *resolver.ResolvedRouteSet {
 	return &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{
 		ModelRef: "serving/model-a",
 		Routes: []resolver.Route{
-			{Model: "model-a", ClientName: "model-a", Namespace: "serving", Provider: "prov-1", //nolint:gosec // fixture: secret names/keys, not credential values
+			{Model: "model-a", ClientName: "model-a", Namespace: "serving", Provider: "prov-1", ProviderType: "openai", //nolint:gosec // fixture: secret names/keys, not credential values
 				Cluster: "provider-prov-1", Endpoint: "prov-1.example.com", TargetModel: "model-a",
-				APIFormat: "openai", Path: "/v1/chat/completions", Weight: 1, AuthType: "bearer_token",
+				APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: 1, AuthType: "apikey",
 				SecretName: "prov-1-creds",
 				SecretKey:  "api-key"},
-			{Model: "model-a", ClientName: "model-a", Namespace: "serving", Provider: "prov-2", //nolint:gosec // fixture: secret names/keys, not credential values
+			{Model: "model-a", ClientName: "model-a", Namespace: "serving", Provider: "prov-2", ProviderType: "openai", //nolint:gosec // fixture: secret names/keys, not credential values
 				Cluster: "provider-prov-2", Endpoint: "prov-2.example.com", TargetModel: "model-a",
-				APIFormat: "openai", Path: "/v1/chat/completions", Weight: 1, AuthType: "apikey",
+				APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: 1, AuthType: "apikey",
 				SecretName: "prov-2-creds",
 				SecretKey:  "api-key"},
 		},
@@ -69,9 +69,9 @@ func routeSetTwo() *resolver.ResolvedRouteSet {
 	set.Models = append(set.Models, resolver.ModelRoutes{
 		ModelRef: "serving/model-b",
 		Routes: []resolver.Route{{ //nolint:gosec // fixture: secret names/keys, not credential values
-			Model: "model-b", ClientName: "model-b", Namespace: "serving", Provider: "prov-3",
+			Model: "model-b", ClientName: "model-b", Namespace: "serving", Provider: "prov-3", ProviderType: "openai",
 			Cluster: "provider-prov-3", Endpoint: "prov-3.example.com", TargetModel: "model-b",
-			APIFormat: "openai", Path: "/v1/chat/completions", Weight: 1, AuthType: "bearer_token",
+			APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: 1, AuthType: "apikey",
 			SecretName: "prov-3-creds",
 			SecretKey:  "api-key",
 		}},
@@ -190,12 +190,11 @@ func TestPublishFirstCreatesEnvelope(t *testing.T) {
 	if len(env.Overlay.Candidates) != 2 {
 		t.Errorf("candidates = %d, want 2", len(env.Overlay.Candidates))
 	}
-	// bearer_token renders a credential reference; apikey renders none.
-	if env.Overlay.Candidates[0].Credential == nil {
-		t.Error("bearer_token route: expected credential reference, got nil")
-	}
-	if env.Overlay.Candidates[1].Credential != nil {
-		t.Errorf("apikey route: expected no credential, got %+v", env.Overlay.Candidates[1].Credential)
+	// Both supported bearer_token and CRD apikey routes render a reference.
+	for i, candidate := range env.Overlay.Candidates {
+		if candidate.Credential == nil {
+			t.Errorf("candidate %d: expected credential reference, got nil", i)
+		}
 	}
 }
 

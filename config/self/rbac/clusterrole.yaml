@@ -20,6 +20,10 @@ rules:
 - apiGroups: ["maas.opendatahub.io"]
   resources: ["aitenants/finalizers"]
   verbs: ["update"]
+# Observe MaaS's handoff boundary before claiming conflicting Praxis names.
+- apiGroups: ["maas.opendatahub.io"]
+  resources: ["maastenantconfigs"]
+  verbs: ["get", "list", "watch"]
 # Resources rendered from the vendored overlay, one set per praxis tenant.
 - apiGroups: [""]
   resources: ["services", "serviceaccounts", "configmaps"]
@@ -39,8 +43,9 @@ rules:
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["clusterroles", "clusterrolebindings"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-# Escalation-check mirror: ai-gateway-controller must hold every permission it
-# grants via payload-processing-reader.
+# The controller validates referenced provider Secrets and watches them to
+# requeue affected providers and tenant deployment configuration. ExtProc does
+# not receive this permission.
 - apiGroups: [""]
   resources: ["secrets"]
   verbs: ["get", "list", "watch"]
@@ -61,10 +66,10 @@ rules:
   verbs: ["update"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["httproutes"]
-  verbs: ["get", "list", "watch", "create", "update", "delete"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["networking.istio.io"]
   resources: ["serviceentries"]
-  verbs: ["get", "list", "watch", "create", "update", "delete"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 # destinationrules already covered above (full CRUD, needed for the
 # vendored overlay's own DestinationRule), so no separate mirror rule is
 # needed here.

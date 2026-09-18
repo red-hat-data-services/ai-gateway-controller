@@ -1,0 +1,166 @@
+# Purpose: Deploys the Katan provider backends and Services used by the
+# models-as-a-service and ai-tenant-tenant-b routing fixtures.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the maas-system namespace and the pinned public
+# llm-katan image loaded into Kind. The provider credentials Secret is tenant-local; these
+# backends serve the tenant-local Praxis instances through maas-system.
+#
+# Qualification role: Supplies independently addressable provider endpoints,
+# including the HTTPS transition compatibility Service, for routing,
+# attribution, and IPP-to-Praxis transition/rollback checks. Credentials here
+# are dummy test values and must never be treated as production secrets.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: provider-credentials
+  namespace: models-as-a-service
+stringData:
+  api-key: kind-only-dummy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-a
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-a}
+  template:
+    metadata: {labels: {app: katan-a}}
+    spec:
+      containers:
+      - name: katan
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=kind-only-dummy]
+        ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-a, namespace: maas-system}
+spec:
+  selector: {app: katan-a}
+  ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
+---
+# The existing IPP ExternalModel reconciler always renders HTTPS for its
+# external-provider transport. Keep this TLS endpoint run-owned and separate
+# from the explicitly plaintext Praxis endpoints above.
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-a-legacy
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    local-env.opendatahub.io/purpose: ipp-transition-backend
+spec:
+  selector: {app: katan-transition}
+  ports: [{name: https, port: 443, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-transition
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-transition}
+  template:
+    metadata: {labels: {app: katan-transition}}
+    spec:
+      containers:
+      - name: katan
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=transition-provider-key]
+        ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-b
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-b}
+  template:
+    metadata: {labels: {app: katan-b}}
+    spec:
+      containers:
+      - name: katan
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=kind-only-dummy]
+        ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-b, namespace: maas-system}
+spec:
+  selector: {app: katan-b}
+  ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-a-tenant-b
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-a-tenant-b}
+  template:
+    metadata:
+      labels: {app: katan-a-tenant-b}
+    spec:
+      containers:
+      - name: katan
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=tenant-b-controller-only-reference]
+        ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-a-tenant-b, namespace: maas-system}
+spec:
+  selector: {app: katan-a-tenant-b}
+  ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: katan-b-tenant-b
+  namespace: maas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: katan-b-tenant-b}
+  template:
+    metadata:
+      labels: {app: katan-b-tenant-b}
+    spec:
+      containers:
+      - name: katan
+        image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
+        imagePullPolicy: Never
+        command: [llm-katan]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=tenant-b-controller-only-reference]
+        ports: [{name: http, containerPort: 8000}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-b-tenant-b, namespace: maas-system}
+spec:
+  selector: {app: katan-b-tenant-b}
+  ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]

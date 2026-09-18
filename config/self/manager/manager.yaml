@@ -28,6 +28,7 @@ spec:
           - --leader-elect
           - --health-probe-bind-address=:8081
           - --image=$(RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE)
+          - --praxis-image=$(PRAXIS_IMAGE)
         env:
           - name: LOG_DEVELOPMENT
             value: "false"
@@ -41,6 +42,15 @@ spec:
                 key: praxis-extproc-image
                 name: ai-gateway-controller-parameters
                 optional: true
+          # The release/operator packaging must populate this parameter with
+          # an immutable Praxis image digest. An empty value is intentional:
+          # the controller fails closed instead of selecting a mutable image.
+          - name: PRAXIS_IMAGE
+            valueFrom:
+              configMapKeyRef:
+                key: praxis-ai-image
+                name: ai-gateway-controller-parameters
+                optional: false
         image: ai-gateway-controller
         name: manager
         imagePullPolicy: Always

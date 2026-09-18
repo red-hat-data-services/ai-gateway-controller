@@ -1,0 +1,46 @@
+# Creates the run-owned controller ServiceAccount, binding, and Deployment.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-gateway-controller
+  namespace: ${OPENSHIFT_E2E_CONTROLLER_NAMESPACE}
+  labels:
+    external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: xmp-controller-${OPENSHIFT_E2E_RUN_ID}
+  labels:
+    external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: ${ROLE_NAME}}
+subjects:
+- kind: ServiceAccount
+  name: ai-gateway-controller
+  namespace: ${OPENSHIFT_E2E_CONTROLLER_NAMESPACE}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-gateway-controller
+  namespace: ${OPENSHIFT_E2E_CONTROLLER_NAMESPACE}
+  labels:
+    external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: ai-gateway-controller, external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}}}
+  template:
+    metadata: {labels: {app: ai-gateway-controller, external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}}}
+    spec:
+      serviceAccountName: ai-gateway-controller
+      securityContext: {runAsNonRoot: true}
+      containers:
+      - name: manager
+        image: ${CONTROLLER_IMAGE}
+        imagePullPolicy: IfNotPresent
+        args: [--leader-elect=false, --skip-network-policy=true, --image=${EXTPROC_IMAGE}, --praxis-image=${PRAXIS_IMAGE}, --praxis-image-pull-policy=IfNotPresent, --external-model-namespace=${OPENSHIFT_E2E_TENANT_NAMESPACE}, --gateway-name=${OPENSHIFT_E2E_GATEWAY_NAME}, --gateway-namespace=${OPENSHIFT_E2E_GATEWAY_NAMESPACE}, --known-cluster=provider-provider-a, --known-cluster=provider-provider-b, --known-cluster=provider-openai, --health-probe-bind-address=:8081]
+        ports: [{name: health, containerPort: 8081}]
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}, seccompProfile: {type: RuntimeDefault}}

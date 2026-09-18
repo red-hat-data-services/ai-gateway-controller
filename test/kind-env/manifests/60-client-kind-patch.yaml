@@ -1,0 +1,24 @@
+# Purpose: Adds the numeric non-root identity required by Kind's kubelet for
+# the curl image used by the shared in-cluster client.
+#
+# Scope: Kind E2E overlay only. This is not a production deployment manifest.
+#
+# Dependencies: Merges into the rendered test/external-model/client.yaml.tmpl
+# Pod. OpenShift intentionally does not use this patch; its restricted SCC
+# assigns the namespace-scoped identity.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: openai-client
+spec:
+  securityContext:
+    runAsUser: 100
+    runAsGroup: 101
+    fsGroup: 101
+  containers:
+    - name: client
+      imagePullPolicy: Never
+      securityContext:
+        runAsUser: 100
+        runAsGroup: 101

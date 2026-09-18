@@ -65,6 +65,9 @@ type Route struct {
 	Namespace  string
 	// Provider is the ExternalProvider CR name.
 	Provider string
+	// ProviderType is ExternalProvider.spec.provider and is used for
+	// provider-specific credential semantics.
+	ProviderType string
 	// Cluster is the pre-provisioned extproc load_balancer cluster name
 	// for this provider (fixed convention: "provider-<crName>").
 	Cluster string
@@ -171,19 +174,20 @@ func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				auth = *ref.Auth
 			}
 			mr.Routes = append(mr.Routes, Route{
-				Model:       m.Name,
-				ClientName:  clientName,
-				Namespace:   m.Namespace,
-				Provider:    prov.Name,
-				Cluster:     "provider-" + prov.Name,
-				Endpoint:    prov.Spec.Endpoint,
-				TargetModel: ref.TargetModel,
-				APIFormat:   ref.APIFormat,
-				Path:        path,
-				Weight:      weight,
-				AuthType:    auth.Type,
-				SecretName:  auth.SecretRef.Name,
-				SecretKey:   "api-key",
+				Model:        m.Name,
+				ClientName:   clientName,
+				Namespace:    m.Namespace,
+				Provider:     prov.Name,
+				ProviderType: prov.Spec.Provider,
+				Cluster:      "provider-" + prov.Name,
+				Endpoint:     prov.Spec.Endpoint,
+				TargetModel:  ref.TargetModel,
+				APIFormat:    ref.APIFormat,
+				Path:         path,
+				Weight:       weight,
+				AuthType:     auth.Type,
+				SecretName:   auth.SecretRef.Name,
+				SecretKey:    "api-key",
 			})
 			resolved++
 		}
