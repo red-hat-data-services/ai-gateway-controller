@@ -22,9 +22,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// aitenantFixture builds an unstructured AITenant with
-// AnnotationPayloadProcessingType (empty payloadProcessingType omits the
-// annotation entirely, matching a real AITenant that never set it),
+// aitenantFixture builds an unstructured AITenant with MaaS's
+// payload-processing annotation (empty payloadProcessingType omits it),
 // status.phase, and status.gatewayRef.
 func aitenantFixture(payloadProcessingType, phase, gatewayName, gatewayNamespace string) *unstructured.Unstructured {
 	u := NewAITenant()
@@ -61,8 +60,8 @@ func TestPayloadProcessingTypeReadsAnnotation(t *testing.T) {
 	if got := PayloadProcessingType(u); got != "praxis" {
 		t.Fatalf("PayloadProcessingType = %q, want %q", got, "praxis")
 	}
-	if got, want := u.GetAnnotations()[AnnotationPayloadProcessingType], "praxis"; got != want {
-		t.Fatalf("fixture did not set the %s annotation: got %q, want %q", AnnotationPayloadProcessingType, got, want)
+	if got := u.GetAnnotations()[AnnotationPayloadProcessingType]; got != "praxis" {
+		t.Fatalf("fixture did not set selector annotation: got %q", got)
 	}
 }
 

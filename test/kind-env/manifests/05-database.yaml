@@ -1,0 +1,78 @@
+# Purpose: Deploys the run-owned PostgreSQL database and connection Secret for
+# the MaaS API/controller fixture.
+#
+# Scope: Kind E2E fixture only. This is not a production deployment manifest.
+#
+# Dependencies: Requires the maas-system namespace and is applied before the
+# Gateway, MaaS controller, and authenticated API resources.
+#
+# Qualification role: Provides the persistence boundary needed for MaaS API
+# key validation and subscription/authentication qualification. The database
+# credentials are dummy test values and must never be treated as production
+# secrets.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: maas-db-config
+  namespace: maas-system
+type: Opaque
+stringData:
+  DB_CONNECTION_URL: postgres://maas:maas@maas-postgres.maas-system.svc.cluster.local:5432/maas?sslmode=disable
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maas-postgres
+  namespace: maas-system
+  labels:
+    app: maas-postgres
+    app.kubernetes.io/managed-by: local-env
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: maas-postgres
+  template:
+    metadata:
+      labels:
+        app: maas-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: maas
+            - name: POSTGRES_PASSWORD
+              value: maas
+            - name: POSTGRES_DB
+              value: maas
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, maas, -d, maas]
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maas-postgres
+  namespace: maas-system
+spec:
+  selector:
+    app: maas-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

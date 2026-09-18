@@ -1,0 +1,35 @@
+# Purpose: Provides the shared persistent, restricted in-cluster HTTP client.
+#
+# Scope: Kind and OpenShift E2E resources only. This is not a production manifest.
+#
+# Dependencies: The platform harness supplies the namespace, run-owned name,
+# image, and optional CA volume. Requests are sent through the platform Gateway.
+#
+# Qualification role: Keeps request origin inside the cluster without putting
+# MaaS keys in command arguments, manifests, or evidence.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${EXTERNAL_MODEL_CLIENT_NAME}
+  namespace: ${EXTERNAL_MODEL_CLIENT_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: external-model-e2e
+    external-model-e2e/purpose: client
+    external-model-e2e/run-id: ${EXTERNAL_MODEL_RUN_ID}
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Always
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    - name: client
+      image: ${EXTERNAL_MODEL_CLIENT_IMAGE}
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-c", "sleep 86400"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: [ALL]}
+      volumeMounts: ${EXTERNAL_MODEL_CLIENT_VOLUME_MOUNTS}
+  volumes: ${EXTERNAL_MODEL_CLIENT_VOLUMES}
