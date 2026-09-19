@@ -24,5 +24,13 @@ coverage.html
 .idea/
 .vscode/
 
+# E2E local run artifacts (default ARTIFACTS_DIR; see test/.gitignore)
+test/e2e/reports/**
+!test/e2e/reports/.gitkeep
+!test/e2e/reports/.gitignore
+test/maas-e2e/
+test/e2e/**/__pycache__/
+test/e2e/.pytest_cache/
+test/e2e/.venv/
 # Local Kind qualification evidence and image-input cache
 evidence/
