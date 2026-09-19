@@ -19,28 +19,13 @@ package tenant
 import "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 // NewAITenant returns an empty unstructured object with the AITenant GVK
-// set, ready for Get/List or for use with the controller-runtime builder.
+// set, ready for Get. This controller only ever Gets a specific AITenant by
+// name/namespace (to resolve status.gatewayRef / status.phase for the
+// MaasTenantConfig it primarily watches).
 func NewAITenant() *unstructured.Unstructured {
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(AITenantGVK)
 	return u
-}
-
-// PayloadProcessingType reads MaaS's current annotation selector. Absent,
-// empty, or another value means the existing IPP path.
-func PayloadProcessingType(aitenant *unstructured.Unstructured) string {
-	return aitenant.GetAnnotations()[AnnotationPayloadProcessingType]
-}
-
-// UsesPraxis reports whether the AITenant opted into this controller.
-func UsesPraxis(aitenant *unstructured.Unstructured) bool {
-	return PayloadProcessingType(aitenant) == PayloadProcessingBackendPraxis
-}
-
-// IsIPPMigrationCleanupComplete reports whether maas-controller has finished
-// one-shot legacy IPP cleanup for this tenant (mirrors MaasTenantConfig marker).
-func IsIPPMigrationCleanupComplete(aitenant *unstructured.Unstructured) bool {
-	return aitenant.GetAnnotations()[AnnotationIPPMigrationCleanupComplete] == "true"
 }
 
 // IsActive reports whether maas-controller's AITenant reconciler has
@@ -62,13 +47,4 @@ func GatewayRef(aitenant *unstructured.Unstructured) (name, namespace string, ok
 	name, _, _ = unstructured.NestedString(aitenant.Object, "status", "gatewayRef", "name")
 	namespace, _, _ = unstructured.NestedString(aitenant.Object, "status", "gatewayRef", "namespace")
 	return name, namespace, name != "" && namespace != ""
-}
-
-// ResolvedNamespace returns MaaS's resolved tenant namespace. It is distinct
-// from GatewayRef's namespace: Gateway/ExtProc resources may live with the
-// Gateway, while standalone Praxis and ExternalModel resources are tenant
-// scoped. The empty result means MaaS has not published the resolution yet.
-func ResolvedNamespace(aitenant *unstructured.Unstructured) string {
-	namespace, _, _ := unstructured.NestedString(aitenant.Object, "status", "tenantNamespace")
-	return namespace
 }

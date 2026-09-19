@@ -18,47 +18,53 @@ package tenant
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
-	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 )
 
-// notReadyRequeueInterval is used when an AITenant has opted into praxis
-// but is not yet ready for it (see IsActive / GatewayRef). This is a "come
+// notReadyRequeueInterval is used when a MaasTenantConfig has opted into
+// praxis but is not yet ready for it (see IsActive / GatewayRef), or when a
+// transition-in is blocked on the IPP migration marker. This is a "come
 // back shortly" wait, distinct from ResyncInterval's steady-state resync.
 const notReadyRequeueInterval = 10 * time.Second
 
-// Reconciler watches AITenant CRs and, for every tenant whose
-// AnnotationPayloadProcessingType annotation is "praxis", renders and
-// SSA-applies a per-tenant copy of the vendored praxis-extproc manifests
-// into that tenant's Gateway namespace (from status.gatewayRef). Tenants
-// that don't opt into praxis (absent/empty/"ipp") are ignored:
+// Reconciler primarily watches MaasTenantConfig CRs (owned by
+// maas-controller) — mirroring maas-controller's own TenantReconciler — and,
+// for every tenant whose AnnotationPayloadProcessingType annotation is
+// "praxis", renders and SSA-applies a per-tenant copy of the vendored
+// praxis-extproc manifests into that tenant's Gateway namespace. Tenants
+// that don't opt into praxis (absent/empty/other) are ignored:
 // maas-controller's own TenantReconciler owns their IPP deployment.
 //
-// Reconciler does not write AITenant status. It does track, via
-// PraxisCleanupFinalizer, whether it has (or may have) applied resources
-// for a tenant, so it can delete them again when the tenant switches away
-// from praxis or the AITenant is deleted — SSA only ever upserts the
-// current render set, it never deletes what falls out of it.
+// Reconciler still Gets a tenant's owning AITenant (see
+// OwningAITenantRef / GatewayRef / IsActive) — status.gatewayRef and
+// status.phase live there, not on MaasTenantConfig — but no longer watches
+// AITenant as its primary trigger; it only watches AITenant secondarily, to
+// react to gatewayRef/phase changes that AnnotationPayloadProcessingType
+// alone would miss.
+//
+// Reconciler does not write AITenant at all (status or otherwise). It does
+// track, via PraxisCleanupFinalizer on MaasTenantConfig, whether it has (or
+// may have) applied resources for a tenant, so it can delete them again
+// when the tenant switches away from praxis or the MaasTenantConfig is
+// deleted — SSA only ever upserts the current render set, it never deletes
+// what falls out of it.
 type Reconciler struct {
-	// Client applies the rendered resources and reads/updates AITenant.
+	// Client applies the rendered resources and reads/updates MaasTenantConfig
+	// (and reads AITenant).
 	Client client.Client
 	// ManifestPath is the kustomize entrypoint, e.g.
 	// config/manifests/praxis-extproc/overlays/odh.
@@ -85,116 +91,148 @@ type Reconciler struct {
 	// cleanup succeeded (mirrors maas-controller's
 	// AITenantReconciler.DeletionTimeout / forceRemoveAITenantFinalizer):
 	// without this, a persistent cleanup failure (or this controller being
-	// down) would block AITenant deletion forever. Zero disables the
-	// timeout and retries indefinitely.
+	// down) would block MaasTenantConfig (and therefore AITenant) deletion
+	// forever. Zero disables the timeout and retries indefinitely.
 	DeletionTimeout time.Duration
 	// Log receives one entry per reconcile, plus any render/apply/cleanup
 	// error.
 	Log logr.Logger
 }
 
-// SetupWithManager registers the AITenant watch.
+// SetupWithManager registers the MaasTenantConfig watch (primary trigger)
+// and a secondary AITenant watch mapped back to the owning MaasTenantConfig,
+// mirroring maas-controller's own TenantReconciler.SetupWithManager shape.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(NewAITenant()).
-		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
-		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
-		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
-		Watches(maasTenantConfigObject(), handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
+		For(NewMaasTenantConfig()).
+		Watches(
+			NewAITenant(),
+			handler.EnqueueRequestsFromMapFunc(r.enqueueMaasTenantConfigForAITenant),
+		).
 		Complete(r)
 }
 
-func maasTenantConfigObject() *unstructured.Unstructured {
-	config := &unstructured.Unstructured{}
-	config.SetGroupVersionKind(MaasTenantConfigGVK)
-	return config
-}
-
-// tenantsForNamespace re-renders the standalone Praxis pod template when a
-// provider reference or referenced Secret changes. It maps only to AITenants
-// whose resolved tenant namespace is the changed object's namespace.
-func (r *Reconciler) tenantsForNamespace(ctx context.Context, obj client.Object) []reconcile.Request {
-	tenantList := &unstructured.UnstructuredList{}
-	tenantList.SetGroupVersionKind(AITenantGVK.GroupVersion().WithKind("AITenantList"))
-	if err := r.Client.List(ctx, tenantList); err != nil {
-		r.Log.Error(err, "list tenants for dataplane configuration event", "namespace", obj.GetNamespace())
+// enqueueMaasTenantConfigForAITenant maps an AITenant event to the
+// MaasTenantConfig it owns, via status.tenantNamespace (see
+// ConfigNamespace) — avoiding any need to duplicate maas-controller's
+// TenantNamespaceForAITenant naming convention, which depends on a
+// configurable default tenant namespace this controller does not know.
+func (r *Reconciler) enqueueMaasTenantConfigForAITenant(_ context.Context, obj client.Object) []reconcile.Request {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
 		return nil
 	}
-	requests := make([]reconcile.Request, 0)
-	for i := range tenantList.Items {
-		tenant := &tenantList.Items[i]
-		resolved, _, _ := unstructured.NestedString(tenant.Object, "status", "tenantNamespace")
-		if resolved == "" {
-			resolved = tenant.GetNamespace()
-		}
-		if resolved == obj.GetNamespace() {
-			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(tenant)})
-		}
+	namespace, ok := ConfigNamespace(u)
+	if !ok {
+		return nil
 	}
-	return requests
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{
+		Namespace: namespace,
+		Name:      MaasTenantConfigInstanceName,
+	}}}
 }
 
 // Reconcile implements the logic documented on Reconciler.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := r.Log.WithValues("aitenant", req.NamespacedName)
+	log := r.Log.WithValues("maastenantconfig", req.NamespacedName)
 
-	aitenant := NewAITenant()
-	if err := r.Client.Get(ctx, req.NamespacedName, aitenant); err != nil {
+	mtc := NewMaasTenantConfig()
+	if err := r.Client.Get(ctx, req.NamespacedName, mtc); err != nil {
 		if apierrors.IsNotFound(err) {
 			// Already fully gone: our finalizer (if we ever added one)
 			// must have already been cleared, or we never added one.
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, fmt.Errorf("get AITenant %s: %w", req.NamespacedName, err)
+		return ctrl.Result{}, fmt.Errorf("get MaasTenantConfig %s: %w", req.NamespacedName, err)
 	}
 
-	tenantID := ID(req.Name)
+	tenantID := IdentifierFor(mtc)
 
-	if !aitenant.GetDeletionTimestamp().IsZero() {
-		return r.reconcileDelete(ctx, log, aitenant, tenantID)
+	if !mtc.GetDeletionTimestamp().IsZero() {
+		return r.reconcileDelete(ctx, log, mtc, tenantID)
 	}
 
-	if !UsesPraxis(aitenant) {
-		return r.reconcileNotPraxis(ctx, log, aitenant, tenantID)
+	if !UsesPraxis(mtc) {
+		return r.reconcileNotPraxis(ctx, log, mtc, tenantID)
 	}
 
-	return r.reconcilePraxis(ctx, log, aitenant, tenantID)
+	return r.reconcilePraxis(ctx, log, mtc, tenantID)
+}
+
+// resolveOwnedAITenant Gets the AITenant named by OwningAITenantRef and
+// verifies status.tenantNamespace owns mtc. It does not require phase Active:
+// cleanup/delete must still use status.gatewayRef while the AITenant is
+// Terminating (otherwise PraxisCleanupFinalizer blocks MTC deletion until
+// DeletionTimeout). A nil aitenant with a nil error means annotations aren't
+// populated yet or the AITenant is gone — a normal transient state.
+func (r *Reconciler) resolveOwnedAITenant(ctx context.Context, mtc *unstructured.Unstructured) (aitenant *unstructured.Unstructured, err error) {
+	name, namespace, ok := OwningAITenantRef(mtc)
+	if !ok {
+		return nil, nil
+	}
+	aitenant = NewAITenant()
+	if err := r.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, aitenant); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get owning AITenant %s/%s: %w", namespace, name, err)
+	}
+	ownedNS, ownedOK := ConfigNamespace(aitenant)
+	if !ownedOK || ownedNS != mtc.GetNamespace() {
+		return nil, fmt.Errorf(
+			"AITenant %s/%s status.tenantNamespace %q does not own MaasTenantConfig in %q; refusing spoofed owning-AITenant annotations",
+			namespace, name, ownedNS, mtc.GetNamespace())
+	}
+	return aitenant, nil
+}
+
+// resolveOwningAITenant is resolveOwnedAITenant plus the Active readiness
+// gate used by the praxis apply path.
+func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructured.Unstructured) (aitenant *unstructured.Unstructured, ready bool, err error) {
+	aitenant, err = r.resolveOwnedAITenant(ctx, mtc)
+	if err != nil || aitenant == nil {
+		return aitenant, false, err
+	}
+	if !IsActive(aitenant) {
+		return aitenant, false, nil
+	}
+	return aitenant, true, nil
 }
 
 // reconcilePraxis is the steady-state path for a tenant that currently
 // opts into praxis: ensure the cleanup finalizer is present (before doing
 // anything else, so even a partially-applied tenant is guaranteed a
 // cleanup pass later), wait for readiness, then render/apply.
-func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aitenant *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
-	if err := r.ensureFinalizer(ctx, aitenant); err != nil {
+func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
+	if err := r.ensureFinalizer(ctx, mtc); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
 	}
 
-	if !IsActive(aitenant) {
-		log.Info("AITenant opted into praxis but is not Active yet; will retry")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	aitenant, ready, err := r.resolveOwningAITenant(ctx, mtc)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-
-	gatewayName, gatewayNamespace, ready := GatewayRef(aitenant)
 	if !ready {
-		log.Info("AITenant is Active but status.gatewayRef is not populated; will retry")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
-	}
-	tenantNamespace := ResolvedNamespace(aitenant)
-	if tenantNamespace == "" {
-		log.Info("AITenant is Active but status.tenantNamespace is not populated; will retry")
+		log.Info("MaasTenantConfig opted into praxis but owning AITenant is not Active yet; will retry")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
-	if !IsIPPMigrationCleanupComplete(aitenant) {
-		released, reason, err := r.ippResourcesReleased(ctx, tenantNamespace)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !released {
-			log.Info("AITenant is Praxis-enabled but MaaS has not released IPP resources; will retry", "reason", reason)
-			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
-		}
+	gatewayName, gatewayNamespace, gwReady := GatewayRef(aitenant)
+	if !gwReady {
+		log.Info("owning AITenant is Active but status.gatewayRef is not populated; will retry")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+
+	// Handshake: claim cleanup-complete → steady. Absent means wait (existing
+	// tenants are assumed to still run legacy IPP until they signal
+	// cleanup-complete). Status itself is the durable claim — no bundleExists gate.
+	ready, err = EnsurePraxisMayDeploy(ctx, r.Client, mtc)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("ensure praxis may deploy: %w", err)
+	}
+	if !ready {
+		log.Info("waiting for the legacy IPP cleanup to finish before applying praxis-extproc")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
 	rendered, err := render.Build(r.ManifestPath)
@@ -211,11 +249,10 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 
 	resources, err = Rename(resources, tenantID, gatewayNamespace)
 	if err != nil {
-		// Not retryable until the AITenant's name (spec) changes: don't
-		// requeue, or every resync would fail identically for the same
-		// reason. A future spec update re-triggers reconciliation via the
-		// watch.
-		log.Error(err, "cannot render praxis-extproc resources for this tenant name; will not retry until the AITenant changes")
+		// Not retryable until the tenant's name changes: don't requeue, or
+		// every resync would fail identically for the same reason. A future
+		// change re-triggers reconciliation via the watch.
+		log.Error(err, "cannot render praxis-extproc resources for this tenant name; will not retry until the tenant changes")
 		return ctrl.Result{}, nil
 	}
 	if r.SkipNetworkPolicy {
@@ -228,40 +265,19 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		resources = filtered
 		log.Info("omitting controller-managed NetworkPolicy by explicit configuration", "namespace", gatewayNamespace)
 	}
-	// The vendored ExtProc manifests intentionally carry no controller-specific
-	// ownership marker. Stamp the complete tenant render before the handoff
-	// check so resources successfully applied by this reconciler are recognized
-	// as ours on the next reconcile. This label is also the cleanup guard; the
-	// shared reader ClusterRole remains exempt from takeover/cleanup checks.
-	for i := range resources {
-		labels := resources[i].GetLabels()
-		if labels == nil {
-			labels = make(map[string]string)
-		}
-		labels[managedByLabel] = render.FieldOwner
-		resources[i].SetLabels(labels)
-	}
-	// MaaS and this controller intentionally use the same tenant-derived
-	// payload-processing names. During an IPP-to-Praxis handoff, MaaS may
-	// still be deleting its operands when the annotation watch reaches us.
-	// Never force-SSA over a foreign object: apart from violating the
-	// single-writer contract, merging two pod templates can produce an invalid
-	// Deployment (for example duplicate named ports). Wait for the owning
-	// controller's cleanup and let the next watch/reconcile apply our complete
-	// resource set.
-	if err := r.waitForForeignOwnership(ctx, resources); err != nil {
-		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
-	}
+
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		log.Error(err, "praxis-extproc apply failed for tenant; will retry")
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
 	}
+
 	// Drop any leftover tenant-scoped standalone Praxis hop from earlier
 	// releases. ExtProc is the dataplane; ExternalModel routes backend to
 	// provider ExternalName Services directly.
-	if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
-		return ctrl.Result{}, err
+	if tenantNamespace, ok := ConfigNamespace(aitenant); ok {
+		if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	log.Info("praxis-extproc install applied",
@@ -288,280 +304,116 @@ func (r *Reconciler) deleteStandalonePraxis(ctx context.Context, tenantID, tenan
 	return nil
 }
 
-// providersForTenant returns the providers referenced by the tenant's models
-// and the subset that must be present in the currently published overlay.
-// Disabled references remain in the static transport set but do not block the
-// Praxis rollout gate.
-func (r *Reconciler) providersForTenant(ctx context.Context, namespace string) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
-	providerList := &unstructured.UnstructuredList{}
-	providerList.SetGroupVersionKind(schema.GroupVersionKind{Group: "inference.opendatahub.io", Version: "v1alpha1", Kind: "ExternalProviderList"})
-	if err := r.Client.List(ctx, providerList, client.InNamespace(namespace)); err != nil {
-		return nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
-	}
-	modelList := &unstructured.UnstructuredList{}
-	modelList.SetGroupVersionKind(schema.GroupVersionKind{Group: "inference.opendatahub.io", Version: "v1alpha1", Kind: "ExternalModelList"})
-	if err := r.Client.List(ctx, modelList, client.InNamespace(namespace)); err != nil {
-		return nil, nil, fmt.Errorf("list tenant ExternalModels: %w", err)
-	}
-	referencedProviders := map[string]bool{}
-	requiredOverlayProviders := map[string]bool{}
-	for i := range modelList.Items {
-		refs, found, err := unstructured.NestedSlice(modelList.Items[i].Object, "spec", "externalProviderRefs")
-		if err != nil {
-			return nil, nil, fmt.Errorf("read provider refs for ExternalModel %s: %w", modelList.Items[i].GetName(), err)
-		}
-		if !found {
-			continue
-		}
-		for _, raw := range refs {
-			ref, ok := raw.(map[string]any)
-			if !ok {
-				return nil, nil, fmt.Errorf("invalid provider ref in ExternalModel %s", modelList.Items[i].GetName())
-			}
-			name, _, err := unstructured.NestedString(ref, "ref", "name")
-			if err != nil {
-				return nil, nil, fmt.Errorf("read provider ref in ExternalModel %s: %w", modelList.Items[i].GetName(), err)
-			}
-			if name == "" {
-				continue
-			}
-			referencedProviders[name] = true
-			weight, found, err := unstructured.NestedInt64(ref, "weight")
-			if err != nil {
-				return nil, nil, fmt.Errorf("read provider weight in ExternalModel %s: %w", modelList.Items[i].GetName(), err)
-			}
-			if !found || weight > 0 {
-				requiredOverlayProviders[name] = true
-			}
-		}
-	}
-	providers := make([]v1alpha1.ExternalProvider, 0, len(providerList.Items))
-	for i := range providerList.Items {
-		if !referencedProviders[providerList.Items[i].GetName()] {
-			continue
-		}
-		var provider v1alpha1.ExternalProvider
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(providerList.Items[i].Object, &provider); err != nil {
-			return nil, nil, fmt.Errorf("decode tenant ExternalProvider %s: %w", providerList.Items[i].GetName(), err)
-		}
-		providers = append(providers, provider)
-	}
-	return providers, requiredOverlayProviders, nil
-}
-
-// ippResourcesReleased reads MaaS's explicit handoff boundary. The
-// annotation is accepted for MaaS builds that publish the handoff marker but
-// predate the status condition; current builds publish both signals. A
-// missing or non-true signal always blocks creation of same-named Praxis
-// resources.
-func (r *Reconciler) ippResourcesReleased(ctx context.Context, namespace string) (bool, string, error) {
-	config := maasTenantConfigObject()
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: MaasTenantConfigName}, config); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, "MaaS tenant configuration is absent", nil
-		}
-		return false, "", fmt.Errorf("get MaaS tenant configuration %s/%s: %w", namespace, MaasTenantConfigName, err)
-	}
-	if config.GetAnnotations()[AnnotationIPPMigrationCleanupComplete] == "true" {
-		return true, "MaaS cleanup marker is true", nil
-	}
-	conditions, found, err := unstructured.NestedSlice(config.Object, "status", "conditions")
-	if err != nil {
-		return false, "MaaS handoff conditions are malformed", fmt.Errorf("read MaaS handoff conditions: %w", err)
-	}
-	if found {
-		for _, raw := range conditions {
-			condition, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			typeName, _, _ := unstructured.NestedString(condition, "type")
-			status, _, _ := unstructured.NestedString(condition, "status")
-			if typeName == IPPResourcesReleasedCondition && status == "True" {
-				return true, "MaaS IPPResourcesReleased condition is true", nil
-			}
-		}
-	}
-	return false, "MaaS IPPResourcesReleased condition is not true", nil
-}
-
-// routingOverlayReady accepts only the current controller's published
-// envelope. The overlay is the sole readiness gate for a new Praxis
-// Deployment: a missing, foreign, malformed, stale, or cross-namespace
-// envelope must not allow Praxis to start without its routing file.
-func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders map[string]bool) (bool, string, error) {
-	var configMap corev1.ConfigMap
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: praxisOverlayName}, &configMap); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, "routing overlay is absent", nil
-		}
-		return false, "", fmt.Errorf("get routing overlay %s/%s: %w", namespace, praxisOverlayName, err)
-	}
-	if configMap.GetLabels()[managedByLabel] != render.FieldOwner {
-		return false, "routing overlay is not owned by ai-gateway-controller", nil
-	}
-	raw, ok := configMap.Data[praxisOverlayDataKey]
-	if !ok || raw == "" {
-		return false, "routing overlay has no envelope data", nil
-	}
-	var env envelope.Envelope
-	if decodeErr := json.Unmarshal([]byte(raw), &env); decodeErr != nil {
-		return overlayNotReady("routing overlay is not valid JSON")
-	}
-	if env.SchemaVersion != envelope.SchemaVersion || env.Revision.Value == "" || env.ContentDigest.Value != env.Revision.Value || env.Scope.Namespace != namespace {
-		return false, "routing overlay envelope metadata is invalid", nil
-	}
-	digest, digestErr := envelope.ComputeDigestFromWire([]byte(raw))
-	if digestErr != nil {
-		return overlayNotReady("routing overlay digest cannot be computed")
-	}
-	if digest != env.Revision.Value {
-		return false, "routing overlay digest does not match its declared revision", nil
-	}
-	available := make(map[string]bool, len(env.Overlay.Candidates))
-	for _, candidate := range env.Overlay.Candidates {
-		available[candidate.Cluster] = true
-	}
-	for provider := range requiredProviders {
-		if !available["provider-"+provider] {
-			return false, fmt.Sprintf("routing overlay does not contain provider %s", provider), nil
-		}
-	}
-	return true, "routing overlay is controller-owned and digest-valid", nil
-}
-
-func overlayNotReady(reason string) (bool, string, error) {
-	return false, reason, nil
-}
-
-const managedByLabel = "app.kubernetes.io/managed-by"
-
-// waitForForeignOwnership prevents a forced SSA apply from taking over an
-// existing object while another controller still owns it. An object already
-// labeled by this controller is safe to update; an unlabeled object is also
-// treated as foreign because common names are not proof of ownership.
-func (r *Reconciler) waitForForeignOwnership(ctx context.Context, resources []unstructured.Unstructured) error {
-	for i := range resources {
-		desired := &resources[i]
-		// The reader ClusterRole is a shared, pre-existing RBAC primitive.
-		// This controller deliberately owns only each tenant's binding, not
-		// the shared role itself, so its absence of our managed-by label is
-		// not an ownership conflict.
-		if desired.GetKind() == "ClusterRole" && desired.GetName() == "payload-processing-reader" {
-			continue
-		}
-		current := &unstructured.Unstructured{}
-		current.SetGroupVersionKind(desired.GroupVersionKind())
-		if err := r.Client.Get(ctx, client.ObjectKey{Namespace: desired.GetNamespace(), Name: desired.GetName()}, current); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("inspect %s %s/%s: %w", desired.GetKind(), desired.GetNamespace(), desired.GetName(), err)
-		}
-		// MaaS marks this specific plugin ConfigMap unmanaged when it hands
-		// a tenant to Praxis. That marker is the explicit ownership boundary:
-		// allow the Praxis controller to publish its complete config and claim
-		// the object, while all other unlabeled/foreign objects remain blocked.
-		if isReleasedPluginConfigMap(desired) && current.GetAnnotations()["opendatahub.io/managed"] == "false" {
-			continue
-		}
-		if current.GetLabels()[managedByLabel] != render.FieldOwner {
-			return fmt.Errorf("%s %s/%s is managed by %q", desired.GetKind(), desired.GetNamespace(), desired.GetName(), current.GetLabels()[managedByLabel])
-		}
-	}
-	return nil
-}
-
-func isReleasedPluginConfigMap(obj *unstructured.Unstructured) bool {
-	name := obj.GetName()
-	return name == PayloadProcessingPluginsConfigMapName || strings.HasPrefix(name, PayloadProcessingPluginsConfigMapName+"-")
-}
-
 // reconcileNotPraxis handles a tenant that currently does not opt into
 // praxis. If our finalizer is present, this tenant previously opted in and
 // has since switched away (or dropped the annotation): clean up whatever
-// was applied before releasing the finalizer. Otherwise this tenant never
-// used praxis and there is nothing to do.
-func (r *Reconciler) reconcileNotPraxis(ctx context.Context, log logr.Logger, aitenant *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
-	if !controllerutil.ContainsFinalizer(aitenant, PraxisCleanupFinalizer) {
-		log.V(1).Info("AITenant does not use the praxis payload processing backend; nothing to do")
+// was applied, signal maas-controller that it may now (re)deploy legacy IPP
+// (see MarkPayloadProcessingCleanupComplete), then release the finalizer.
+// Otherwise this tenant never used praxis and there is nothing to do.
+func (r *Reconciler) reconcileNotPraxis(ctx context.Context, log logr.Logger, mtc *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(mtc, PraxisCleanupFinalizer) {
+		log.V(1).Info("MaasTenantConfig does not use the praxis payload processing backend; nothing to do")
 		return ctrl.Result{}, nil
 	}
 
-	if _, gatewayNamespace, ready := GatewayRef(aitenant); ready {
-		tenantNamespace := ResolvedNamespace(aitenant)
-		if tenantNamespace == "" {
-			tenantNamespace = gatewayNamespace
-		}
-		if err := r.cleanup(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
-			log.Error(err, "praxis-extproc cleanup failed after switching away from praxis; will retry", "namespace", gatewayNamespace)
-			return ctrl.Result{}, fmt.Errorf("cleanup: %w", err)
-		}
-		log.Info("praxis-extproc resources cleaned up after switching away from praxis", "tenantID", tenantID, "namespace", gatewayNamespace)
+	aitenant, err := r.resolveOwnedAITenant(ctx, mtc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if aitenant == nil {
+		log.Info("waiting for owning AITenant before praxis-extproc cleanup after switch-away")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+	_, gatewayNamespace, gwReady := GatewayRef(aitenant)
+	if !gwReady {
+		log.Info("waiting for status.gatewayRef before praxis-extproc cleanup after switch-away")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
-	if err := r.removeFinalizer(ctx, aitenant); err != nil {
+	if err := r.cleanup(ctx, tenantID, gatewayNamespace); err != nil {
+		log.Error(err, "praxis-extproc cleanup failed after switching away from praxis; will retry", "namespace", gatewayNamespace)
+		return ctrl.Result{}, fmt.Errorf("cleanup: %w", err)
+	}
+	if tenantNamespace, ok := ConfigNamespace(aitenant); ok {
+		if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cleanup standalone praxis: %w", err)
+		}
+	}
+	if err := MarkPayloadProcessingCleanupComplete(ctx, r.Client, mtc); err != nil {
+		return ctrl.Result{}, fmt.Errorf("mark payload-processing cleanup complete: %w", err)
+	}
+	log.Info("praxis-extproc resources cleaned up after switching away from praxis", "tenantID", tenantID, "namespace", gatewayNamespace)
+
+	if err := r.removeFinalizer(ctx, mtc); err != nil {
 		return ctrl.Result{}, fmt.Errorf("remove finalizer: %w", err)
 	}
 	return ctrl.Result{}, nil
 }
 
-// reconcileDelete handles a tenant whose AITenant is being deleted.
-func (r *Reconciler) reconcileDelete(ctx context.Context, log logr.Logger, aitenant *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
-	if !controllerutil.ContainsFinalizer(aitenant, PraxisCleanupFinalizer) {
+// reconcileDelete handles a tenant whose MaasTenantConfig is being deleted.
+func (r *Reconciler) reconcileDelete(ctx context.Context, log logr.Logger, mtc *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(mtc, PraxisCleanupFinalizer) {
 		// We never opted this tenant in (or already finished cleanup):
 		// nothing for us to do, and no finalizer of ours blocking deletion.
 		return ctrl.Result{}, nil
 	}
 
-	if r.DeletionTimeout > 0 && time.Since(aitenant.GetDeletionTimestamp().Time) >= r.DeletionTimeout {
+	if r.DeletionTimeout > 0 && time.Since(mtc.GetDeletionTimestamp().Time) >= r.DeletionTimeout {
 		log.Error(nil, "praxis-extproc cleanup exceeded deletion timeout; force-removing finalizer without confirming cleanup succeeded",
 			"tenantID", tenantID, "timeout", r.DeletionTimeout)
-		return ctrl.Result{}, r.removeFinalizer(ctx, aitenant)
+		return ctrl.Result{}, r.removeFinalizer(ctx, mtc)
 	}
 
-	_, gatewayNamespace, ready := GatewayRef(aitenant)
-	if !ready {
-		// Never got far enough to have a target namespace, so nothing was
-		// ever applied for this tenant.
-		log.Info("AITenant deleted before status.gatewayRef was ever populated; skipping cleanup")
-		return ctrl.Result{}, r.removeFinalizer(ctx, aitenant)
+	aitenant, err := r.resolveOwnedAITenant(ctx, mtc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if aitenant == nil {
+		log.Info("MaasTenantConfig deleting but owning AITenant is not resolvable yet; will retry cleanup")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
-	tenantNamespace := ResolvedNamespace(aitenant)
-	if tenantNamespace == "" {
-		tenantNamespace = gatewayNamespace
+	_, gatewayNamespace, gwReady := GatewayRef(aitenant)
+	if !gwReady {
+		log.Info("MaasTenantConfig deleting but status.gatewayRef is not populated; will retry cleanup")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
-	if err := r.cleanup(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
+
+	if err := r.cleanup(ctx, tenantID, gatewayNamespace); err != nil {
 		log.Error(err, "praxis-extproc cleanup failed for deleted tenant; will retry", "namespace", gatewayNamespace)
 		return ctrl.Result{}, fmt.Errorf("cleanup: %w", err)
 	}
+	if tenantNamespace, ok := ConfigNamespace(aitenant); ok {
+		if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cleanup standalone praxis: %w", err)
+		}
+	}
 
 	log.Info("praxis-extproc resources cleaned up for deleted tenant", "tenantID", tenantID, "namespace", gatewayNamespace)
-	return ctrl.Result{}, r.removeFinalizer(ctx, aitenant)
+	return ctrl.Result{}, r.removeFinalizer(ctx, mtc)
 }
 
 // ensureFinalizer adds PraxisCleanupFinalizer if not already present.
-func (r *Reconciler) ensureFinalizer(ctx context.Context, aitenant *unstructured.Unstructured) error {
-	if controllerutil.ContainsFinalizer(aitenant, PraxisCleanupFinalizer) {
+func (r *Reconciler) ensureFinalizer(ctx context.Context, mtc *unstructured.Unstructured) error {
+	if controllerutil.ContainsFinalizer(mtc, PraxisCleanupFinalizer) {
 		return nil
 	}
-	base := aitenant.DeepCopy()
-	controllerutil.AddFinalizer(aitenant, PraxisCleanupFinalizer)
-	if err := r.Client.Patch(ctx, aitenant, client.MergeFrom(base)); err != nil {
+	base := mtc.DeepCopy()
+	controllerutil.AddFinalizer(mtc, PraxisCleanupFinalizer)
+	if err := r.Client.Patch(ctx, mtc, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return err
 	}
 	return nil
 }
 
 // removeFinalizer removes PraxisCleanupFinalizer if present.
-func (r *Reconciler) removeFinalizer(ctx context.Context, aitenant *unstructured.Unstructured) error {
-	if !controllerutil.ContainsFinalizer(aitenant, PraxisCleanupFinalizer) {
+func (r *Reconciler) removeFinalizer(ctx context.Context, mtc *unstructured.Unstructured) error {
+	if !controllerutil.ContainsFinalizer(mtc, PraxisCleanupFinalizer) {
 		return nil
 	}
-	base := aitenant.DeepCopy()
-	controllerutil.RemoveFinalizer(aitenant, PraxisCleanupFinalizer)
-	if err := r.Client.Patch(ctx, aitenant, client.MergeFrom(base)); err != nil {
+	base := mtc.DeepCopy()
+	controllerutil.RemoveFinalizer(mtc, PraxisCleanupFinalizer)
+	if err := r.Client.Patch(ctx, mtc, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return err
 	}
 	return nil
@@ -575,7 +427,7 @@ func (r *Reconciler) removeFinalizer(ctx context.Context, aitenant *unstructured
 // ClusterRole is never deleted here: every tenant's ClusterRoleBinding
 // references that one role, so deleting it would break every other
 // praxis tenant sharing the cluster.
-func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, tenantNamespace string) error {
+func (r *Reconciler) cleanup(ctx context.Context, tenantID, namespace string) error {
 	type target struct {
 		gvk       schema.GroupVersionKind
 		name      string
@@ -583,23 +435,17 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, te
 	}
 
 	targets := []target{
-		{gvkServiceAccount, ResourceName(praxisServiceAccount, tenantID), tenantNamespace},
-		{gvkConfigMap, ResourceName(praxisConfigMapName, tenantID), tenantNamespace},
-		{gvkService, ResourceName(praxisServiceName, tenantID), tenantNamespace},
-		{gvkDeployment, ResourceName(praxisDeploymentName, tenantID), tenantNamespace},
-		{gvkDeployment, PayloadProcessingDeploymentName(tenantID), gatewayNamespace},
-		{gvkDeployment, PayloadPreProcessingDeploymentName(tenantID), gatewayNamespace},
-		{gvkService, PayloadProcessingServiceName(tenantID), gatewayNamespace},
-		{gvkService, PayloadPreProcessingServiceName(tenantID), gatewayNamespace},
-		{gvkConfigMap, PayloadProcessingPluginsConfigMapForTenant(tenantID), gatewayNamespace},
-		{gvkServiceAccount, PayloadProcessingServiceAccountName(tenantID), gatewayNamespace},
-		{gvkEnvoyFilter, PayloadProcessingEnvoyFilterName(tenantID), gatewayNamespace},
-		{gvkDestinationRule, PayloadProcessingServiceName(tenantID), gatewayNamespace},
-		{gvkDestinationRule, PayloadPreProcessingServiceName(tenantID), gatewayNamespace},
+		{gvkDeployment, PayloadProcessingDeploymentName(tenantID), namespace},
+		{gvkDeployment, PayloadPreProcessingDeploymentName(tenantID), namespace},
+		{gvkService, PayloadProcessingServiceName(tenantID), namespace},
+		{gvkService, PayloadPreProcessingServiceName(tenantID), namespace},
+		{gvkConfigMap, PayloadProcessingPluginsConfigMapForTenant(tenantID), namespace},
+		{gvkServiceAccount, PayloadProcessingServiceAccountName(tenantID), namespace},
+		{gvkNetworkPolicy, PayloadProcessingNetworkPolicyName(tenantID), namespace},
+		{gvkEnvoyFilter, PayloadProcessingEnvoyFilterName(tenantID), namespace},
+		{gvkDestinationRule, PayloadProcessingServiceName(tenantID), namespace},
+		{gvkDestinationRule, PayloadPreProcessingServiceName(tenantID), namespace},
 		{gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID), ""},
-		// SkipNetworkPolicy controls creation during reconciliation only. Cleanup
-		// must still inspect and remove a policy this controller previously owned.
-		{gvkNetworkPolicy, PayloadProcessingNetworkPolicyName(tenantID), gatewayNamespace},
 	}
 
 	for _, t := range targets {
