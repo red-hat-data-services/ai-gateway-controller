@@ -1,0 +1,4 @@
+# Local e2e / CI debug artifacts — keep directory only
+*
+!.gitignore
+!.gitkeep
