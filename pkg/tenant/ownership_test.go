@@ -60,11 +60,30 @@ func TestShouldDeletePraxisResource(t *testing.T) {
 			delete: false,
 		},
 		{
-			name: "managed false",
+			name: "managed false with praxis ownership",
 			obj: map[string]any{
 				"metadata": map[string]any{
 					"annotations":   map[string]any{AnnotationManaged: "false"},
 					"managedFields": []any{map[string]any{"manager": render.FieldOwner}},
+				},
+			},
+			delete: true,
+		},
+		{
+			name: "managed false leftover without ownership",
+			obj: map[string]any{
+				"metadata": map[string]any{
+					"annotations": map[string]any{AnnotationManaged: "false"},
+				},
+			},
+			delete: true,
+		},
+		{
+			name: "managed false does not override maas ownership",
+			obj: map[string]any{
+				"metadata": map[string]any{
+					"annotations":   map[string]any{AnnotationManaged: "false"},
+					"managedFields": []any{map[string]any{"manager": maasControllerFieldOwner}},
 				},
 			},
 			delete: false,

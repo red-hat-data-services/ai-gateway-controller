@@ -22,14 +22,12 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// aitenantFixture builds an unstructured AITenant with MaaS's
-// payload-processing annotation (empty payloadProcessingType omits it),
-// status.phase, and status.gatewayRef.
-func aitenantFixture(payloadProcessingType, phase, gatewayName, gatewayNamespace string) *unstructured.Unstructured {
+// aitenantFixture builds an unstructured AITenant with status.phase and
+// status.gatewayRef. AnnotationPayloadProcessingType is no longer read from
+// AITenant (see maastenantconfig_test.go for that), so this fixture no
+// longer sets it.
+func aitenantFixture(phase, gatewayName, gatewayNamespace string) *unstructured.Unstructured {
 	u := NewAITenant()
-	if payloadProcessingType != "" {
-		u.SetAnnotations(map[string]string{AnnotationPayloadProcessingType: payloadProcessingType})
-	}
 	status := map[string]any{}
 	if phase != "" {
 		status["phase"] = phase
@@ -48,42 +46,6 @@ func TestNewAITenantSetsGVK(t *testing.T) {
 	}
 }
 
-func TestPayloadProcessingTypeAbsentIsEmpty(t *testing.T) {
-	u := aitenantFixture("", "", "", "")
-	if got := PayloadProcessingType(u); got != "" {
-		t.Fatalf("PayloadProcessingType = %q, want empty", got)
-	}
-}
-
-func TestPayloadProcessingTypeReadsAnnotation(t *testing.T) {
-	u := aitenantFixture("praxis", "", "", "")
-	if got := PayloadProcessingType(u); got != "praxis" {
-		t.Fatalf("PayloadProcessingType = %q, want %q", got, "praxis")
-	}
-	if got := u.GetAnnotations()[AnnotationPayloadProcessingType]; got != "praxis" {
-		t.Fatalf("fixture did not set selector annotation: got %q", got)
-	}
-}
-
-func TestUsesPraxis(t *testing.T) {
-	cases := []struct {
-		name string
-		typ  string
-		want bool
-	}{
-		{"absent means IPP", "", false},
-		{"praxis", "praxis", true},
-		{"unexpected value", "ipp", false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := UsesPraxis(aitenantFixture(c.typ, "", "", "")); got != c.want {
-				t.Errorf("UsesPraxis(type=%q) = %v, want %v", c.typ, got, c.want)
-			}
-		})
-	}
-}
-
 func TestIsActive(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -97,7 +59,7 @@ func TestIsActive(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := IsActive(aitenantFixture("praxis", c.phase, "", "")); got != c.want {
+			if got := IsActive(aitenantFixture(c.phase, "", "")); got != c.want {
 				t.Errorf("IsActive(phase=%q) = %v, want %v", c.phase, got, c.want)
 			}
 		})
@@ -105,21 +67,21 @@ func TestIsActive(t *testing.T) {
 }
 
 func TestGatewayRefNotReadyWhenUnset(t *testing.T) {
-	u := aitenantFixture("praxis", "Active", "", "")
+	u := aitenantFixture("Active", "", "")
 	if _, _, ok := GatewayRef(u); ok {
 		t.Fatal("GatewayRef ok = true, want false when status.gatewayRef is unset")
 	}
 }
 
 func TestGatewayRefNotReadyWhenPartiallySet(t *testing.T) {
-	u := aitenantFixture("praxis", "Active", "my-gateway", "")
+	u := aitenantFixture("Active", "my-gateway", "")
 	if _, _, ok := GatewayRef(u); ok {
 		t.Fatal("GatewayRef ok = true, want false when namespace is missing")
 	}
 }
 
 func TestGatewayRefReady(t *testing.T) {
-	u := aitenantFixture("praxis", "Active", "my-gateway", "my-namespace")
+	u := aitenantFixture("Active", "my-gateway", "my-namespace")
 	name, namespace, ok := GatewayRef(u)
 	if !ok {
 		t.Fatal("GatewayRef ok = false, want true")
@@ -127,4 +89,26 @@ func TestGatewayRefReady(t *testing.T) {
 	if name != "my-gateway" || namespace != "my-namespace" {
 		t.Fatalf("GatewayRef = (%q, %q), want (%q, %q)", name, namespace, "my-gateway", "my-namespace")
 	}
+}
+
+func TestConfigNamespace(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		u := NewAITenant()
+		u.Object["status"] = map[string]any{}
+		if _, ok := ConfigNamespace(u); ok {
+			t.Fatal("ok = true, want false when status.tenantNamespace is unset")
+		}
+	})
+
+	t.Run("present", func(t *testing.T) {
+		u := NewAITenant()
+		u.Object["status"] = map[string]any{"tenantNamespace": "ai-tenant-redteam"}
+		ns, ok := ConfigNamespace(u)
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		if ns != "ai-tenant-redteam" {
+			t.Fatalf("namespace = %q, want %q", ns, "ai-tenant-redteam")
+		}
+	})
 }

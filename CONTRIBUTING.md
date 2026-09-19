@@ -100,7 +100,7 @@ vendored overlay's shape are caught here too.
 |---|---|
 | `cmd/manager/` | Flags, manager bootstrap, registers `pkg/tenant.Reconciler` |
 | `pkg/render/` | Kustomize build, placeholder post-render, SSA apply (tenant-agnostic primitives) |
-| `pkg/tenant/` | Watches `AITenant`; per opted-in (`maas.opendatahub.io/payload-processing-type: praxis` annotation) tenant, renames/patches and applies its own copy of the rendered resources, and cleans them up again via `PraxisCleanupFinalizer` on switch-away/deletion |
+| `pkg/tenant/` | Primarily watches `MaasTenantConfig` (mirroring maas-controller's own `TenantReconciler`); per opted-in (`maas.opendatahub.io/payload-processing-type: praxis` annotation) tenant, renames/patches and applies its own copy of the rendered resources, and cleans them up again via `PraxisCleanupFinalizer` (on `MaasTenantConfig`) on switch-away/deletion. Also Gets the tenant's owning `AITenant` for `status.gatewayRef`/`status.phase`. |
 | `config/self/` | This repo's own deploy manifest (SA/ClusterRole/ClusterRoleBinding/Deployment), vendored by `ai-gateway-operator` |
 | `config/manifests/praxis-extproc/` | Vendored (committed) `praxis-extproc` overlay this controller applies at runtime |
 | `hack/scripts/get-manifests.sh` | Pinned-commit vendoring for `config/manifests/praxis-extproc/` |
