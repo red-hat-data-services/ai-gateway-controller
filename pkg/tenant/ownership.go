@@ -53,19 +53,26 @@ func hasSSAFieldManager(obj *unstructured.Unstructured, manager string) bool {
 }
 
 // shouldDeletePraxisResource reports whether cleanup may delete an existing
-// object at a payload-processing name. Skips operator-opt-out resources and
-// legacy IPP objects owned by maas-controller (symmetric with maas one-shot
-// cleanup skipping ai-gateway-controller-owned resources).
+// object at a payload-processing name. Skips legacy IPP objects owned by
+// maas-controller (symmetric with maas one-shot cleanup skipping
+// ai-gateway-controller-owned resources).
+//
+// opendatahub.io/managed=false does NOT block cleanup: that annotation only
+// opts a resource out of steady-state reconcile elsewhere. On backend
+// switch-off this controller must remove its whole name set — including any
+// unmanaged leftover (e.g. a plugins ConfigMap stamped managed=false by
+// maas-controller) — so the peer controller can recreate the shared names in
+// its own schema.
 func shouldDeletePraxisResource(obj *unstructured.Unstructured) bool {
-	if isManagedFalse(obj) {
-		return false
-	}
 	labels := obj.GetLabels()
 	if labels[LabelManagedBy] == maasControllerFieldOwner {
 		return false
 	}
 	if hasSSAFieldManager(obj, maasControllerFieldOwner) && !hasSSAFieldManager(obj, render.FieldOwner) && labels[LabelManagedBy] != ManagedByAIGatewayController {
 		return false
+	}
+	if isManagedFalse(obj) {
+		return true
 	}
 	return labels[LabelManagedBy] == ManagedByAIGatewayController || hasSSAFieldManager(obj, render.FieldOwner)
 }

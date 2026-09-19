@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package tenant watches AITenant CRs (owned by maas-controller) and, for
-// every tenant whose payload-processing annotation is "praxis", renders and
+// every tenant whose spec.payloadProcessing.type is "praxis", renders and
 // SSA-applies a dedicated per-tenant copy of the vendored praxis-extproc
 // manifests into that tenant's Gateway namespace.
 //
@@ -31,17 +31,21 @@ package tenant
 import "k8s.io/apimachinery/pkg/runtime/schema"
 
 // AITenantGVK identifies the AITenant CRD (maas-controller
-// api/maas/v1alpha1.AITenant), used to build unstructured objects for Get
-// and to register the watch in SetupWithManager.
+// api/maas/v1alpha1.AITenant). This controller only Gets a tenant's owning
+// AITenant by name/namespace to read status.gatewayRef and status.phase,
+// neither of which live on MaasTenantConfig.
 var AITenantGVK = schema.GroupVersionKind{
 	Group:   "maas.opendatahub.io",
 	Version: "v1alpha1",
 	Kind:    "AITenant",
 }
 
-// MaasTenantConfigGVK identifies MaaS's namespace-scoped tenant configuration
-// object. Its IPPResourcesReleased condition is the handoff boundary for
-// same-named Praxis payload-processing resources.
+// MaasTenantConfigGVK identifies the MaasTenantConfig CRD (maas-controller
+// api/maas/v1alpha1.MaasTenantConfig). This is this controller's primary
+// watch target, mirroring maas-controller's own TenantReconciler: both
+// controllers react to the same object, so a payload-processing backend
+// swap (see AnnotationPayloadProcessingType) is a single write both sides
+// observe from the same watch stream, with no cross-object propagation lag.
 var MaasTenantConfigGVK = schema.GroupVersionKind{
 	Group:   "maas.opendatahub.io",
 	Version: "v1alpha1",
@@ -49,14 +53,59 @@ var MaasTenantConfigGVK = schema.GroupVersionKind{
 }
 
 const (
-	// AnnotationPayloadProcessingType is MaaS's current public selector for
-	// the payload-processing backend. It is intentionally annotation-based;
-	// introducing a typed API field requires a separate API proposal.
+	// MaasTenantConfigInstanceName is the singleton resource name enforced by
+	// the MaasTenantConfig CRD (mirrors maasv1alpha1.MaasTenantConfigInstanceName).
+	MaasTenantConfigInstanceName = "default-tenant"
+
+	// AnnotationPayloadProcessingType selects a tenant's payload-processing
+	// dataplane. Both this controller and maas-controller always read the
+	// same single source of truth (mirrors maas-controller's
+	// tenantreconcile.AnnotationPayloadProcessingType). Absent, empty, or any
+	// value other than PayloadProcessingBackendPraxis means IPP
+	// (maas-controller), out of scope for this controller.
 	AnnotationPayloadProcessingType = "maas.opendatahub.io/payload-processing-type"
 
-	// AnnotationIPPMigrationCleanupComplete is set on AITenant by maas-controller
-	// when one-shot legacy IPP cleanup finishes. Praxis apply waits for this signal.
-	AnnotationIPPMigrationCleanupComplete = "maas.opendatahub.io/ipp-migration-cleanup-complete"
+	// AnnotationPayloadProcessingStatus coordinates the payload-processing
+	// backend swap handshake with maas-controller. It lives only on
+	// MaasTenantConfig (mirrors maas-controller's tenantreconcile.
+	// AnnotationPayloadProcessingStatus). Semantics:
+	//
+	//   - PayloadProcessingStatusCleanupComplete ("cleanup-complete"): clear
+	//     to claim. The party currently selected by AnnotationPayloadProcessingType
+	//     may CAS-claim and start deploying.
+	//   - PayloadProcessingStatusSteady ("steady"): praxis owns / may resume
+	//     apply. Legacy must wait until praxis switch-off writes cleanup-complete.
+	//   - absent: legacy steady when legacy is selected (existing tenants are
+	//     assumed to run legacy IPP); blocked when praxis is selected (wait
+	//     for legacy cleanup to write cleanup-complete). New MaasTenantConfigs
+	//     are seeded with cleanup-complete at creation time by maas-controller
+	//     so a brand-new tenant's first deploy is never blocked by absent.
+	AnnotationPayloadProcessingStatus = "maas.opendatahub.io/payload-processing-status"
+
+	// PayloadProcessingStatusCleanupComplete means peer cleanup finished; the
+	// selected party may claim.
+	PayloadProcessingStatusCleanupComplete = "cleanup-complete"
+
+	// PayloadProcessingStatusSteady means praxis has claimed and may
+	// deploy/resume. Legacy treats this as blocked.
+	PayloadProcessingStatusSteady = "steady"
+
+	// AnnotationAITenantName and AnnotationAITenantNamespace identify the
+	// AITenant that owns a MaasTenantConfig (mirrors maas-controller's
+	// tenantreconcile.AnnotationAITenantName / AnnotationAITenantNamespace,
+	// set by AITenantReconciler.applyAITenantMetadata). Used to resolve the
+	// owning AITenant for status.gatewayRef / status.phase, neither of which
+	// live on MaasTenantConfig itself.
+	AnnotationAITenantName      = "maas.opendatahub.io/aitenant-name"
+	AnnotationAITenantNamespace = "maas.opendatahub.io/aitenant-namespace"
+
+	// LabelManagedByAITenant and LabelTenantName mirror maas-controller's
+	// tenantreconcile.LabelManagedByAITenant / LabelTenantName, set by
+	// AITenantReconciler.applyAITenantMetadata. Used to derive the per-tenant
+	// resource-naming identifier the same way maas-controller's
+	// TenantIdentifierFor does.
+	LabelManagedByAITenant = "maas.opendatahub.io/managed-by-aitenant"
+	LabelTenantName        = "maas.opendatahub.io/tenant-name"
 
 	// PayloadProcessingBackendPraxis is the only AnnotationPayloadProcessingType
 	// value that opts a tenant into this controller (mirrors
@@ -71,16 +120,10 @@ const (
 	// optimistically (from spec, unvalidated) before that work happens.
 	AITenantPhaseActive = "Active"
 
-	// MaasTenantConfigName is the singleton configuration created for each
-	// AITenant by MaaS.
-	MaasTenantConfigName = "default-tenant"
-	// IPPResourcesReleasedCondition is the explicit MaaS handoff condition.
-	IPPResourcesReleasedCondition = "IPPResourcesReleased"
-
-	// PraxisCleanupFinalizer is added to every AITenant this controller has
-	// applied praxis-extproc resources for, so it can clean them up when
-	// the tenant switches away from praxis or the AITenant is deleted (SSA
-	// alone never deletes resources that fall out of the render set).
+	// PraxisCleanupFinalizer is added to every MaasTenantConfig this controller
+	// has applied praxis-extproc resources for, so it can clean them up when
+	// the tenant switches away from praxis or the MaasTenantConfig is deleted
+	// (SSA alone never deletes resources that fall out of the render set).
 	PraxisCleanupFinalizer = "ai-gateway-controller.opendatahub.io/praxis-cleanup"
 
 	// DefaultAITenantName is the AITenant that represents the legacy/default
