@@ -1,7 +1,9 @@
 [files]
 # Vendored from praxis-extproc (hack/scripts/get-manifests.sh). Includes an
 # intentional Istio <=1.25 filter name misspelling (extenstions).
-extend-exclude = ["config/manifests/**"]
+# Fetched from models-as-a-service at runtime (test/maas-e2e/ checkout).
+# Uses Envoy/Istio terms (INSERT_BEFORE, otel_als_cluster / ALS) that typos flags.
+extend-exclude = ["config/manifests/**", "deployment/**"]
 
 [default]
 # "Noy" is a contributor name in the ADR stakeholder table, not a typo for "Not".

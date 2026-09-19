@@ -1,0 +1,16 @@
+# Pinned models-as-a-service commit for ai-gateway-controller e2e.
+#
+# Policy: CI and local prow runs fetch THIS commit (not rolling main).
+# Pin: ryancham715/models-as-a-service @ 5c36d49 (branch rq-95503 /
+# opendatahub-io PR #1508 — harden IPP backend swap with
+# ipp-migration-cleanup-complete).
+#
+# Bump pin deliberately after validating e2e on the new MaaS revision:
+#   MAAS_REPO=https://github.com/ryancham715/models-as-a-service \
+#   MAAS_REF=rq-95503 MAAS_UPDATE_LOCK=true bash test/e2e/scripts/fetch-maas-e2e.sh
+# Override for one-off runs without editing this file:
+#   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
+maas_repo=https://github.com/ryancham715/models-as-a-service
+maas_commit=5c36d49a5c1bcd668e9f5bb995a7599bceb6125a
+maas_ref=rq-95503
+updated_at=2026-09-18T11:08:32Z
