@@ -37,8 +37,10 @@ spec:
         image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=kind-only-dummy]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=kind-only-dummy, --chunk-delay-ms, "250", --ttft-ms, "100", --itl-ms, "250", --tls-cert, /etc/katan/tls/tls.crt, --tls-key, /etc/katan/tls/tls.key]
         ports: [{name: http, containerPort: 8000}]
+        volumeMounts: [{name: provider-a-tls, mountPath: /etc/katan/tls, readOnly: true}]
+      volumes: [{name: provider-a-tls, secret: {secretName: provider-a-tls}}]
 ---
 apiVersion: v1
 kind: Service
@@ -46,6 +48,13 @@ metadata: {name: provider-a, namespace: maas-system}
 spec:
   selector: {app: katan-a}
   ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-a-ext, namespace: maas-system}
+spec:
+  selector: {app: katan-a}
+  ports: [{name: https, port: 443, targetPort: http}]
 ---
 # The existing IPP ExternalModel reconciler always renders HTTPS for its
 # external-provider transport. Keep this TLS endpoint run-owned and separate
@@ -79,8 +88,10 @@ spec:
         image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=transition-provider-key]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=transition-provider-key, --tls-cert, /etc/katan/tls/tls.crt, --tls-key, /etc/katan/tls/tls.key]
         ports: [{name: http, containerPort: 8000}]
+        volumeMounts: [{name: provider-transition-tls, mountPath: /etc/katan/tls, readOnly: true}]
+      volumes: [{name: provider-transition-tls, secret: {secretName: provider-transition-tls}}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -99,8 +110,10 @@ spec:
         image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=kind-only-dummy]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=kind-only-dummy, --chunk-delay-ms, "250", --ttft-ms, "100", --itl-ms, "250", --tls-cert, /etc/katan/tls/tls.crt, --tls-key, /etc/katan/tls/tls.key]
         ports: [{name: http, containerPort: 8000}]
+        volumeMounts: [{name: provider-b-tls, mountPath: /etc/katan/tls, readOnly: true}]
+      volumes: [{name: provider-b-tls, secret: {secretName: provider-b-tls}}]
 ---
 apiVersion: v1
 kind: Service
@@ -108,6 +121,13 @@ metadata: {name: provider-b, namespace: maas-system}
 spec:
   selector: {app: katan-b}
   ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider-b-ext, namespace: maas-system}
+spec:
+  selector: {app: katan-b}
+  ports: [{name: https, port: 443, targetPort: http}]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -127,8 +147,10 @@ spec:
         image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=tenant-b-controller-only-reference]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=tenant-b-controller-only-reference, --tls-cert, /etc/katan/tls/tls.crt, --tls-key, /etc/katan/tls/tls.key]
         ports: [{name: http, containerPort: 8000}]
+        volumeMounts: [{name: provider-a-tenant-b-tls, mountPath: /etc/katan/tls, readOnly: true}]
+      volumes: [{name: provider-a-tenant-b-tls, secret: {secretName: provider-a-tenant-b-tls}}]
 ---
 apiVersion: v1
 kind: Service
@@ -155,8 +177,10 @@ spec:
         image: ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
         imagePullPolicy: Never
         command: [llm-katan]
-        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=tenant-b-controller-only-reference]
+        args: [--model, demo, --backend, echo, --providers, openai, --validate-keys, --api-keys, openai=tenant-b-controller-only-reference, --tls-cert, /etc/katan/tls/tls.crt, --tls-key, /etc/katan/tls/tls.key]
         ports: [{name: http, containerPort: 8000}]
+        volumeMounts: [{name: provider-b-tenant-b-tls, mountPath: /etc/katan/tls, readOnly: true}]
+      volumes: [{name: provider-b-tenant-b-tls, secret: {secretName: provider-b-tenant-b-tls}}]
 ---
 apiVersion: v1
 kind: Service

@@ -1,4 +1,4 @@
-# Kind two-plane environment
+# Kind ExternalModel ExtProc environment
 
 This directory is the bounded entrypoint for the local Kind environment
 described by ADR 0001. It creates and uses only the named Kind context,
@@ -18,46 +18,16 @@ controller reads this annotation but does not write the AITenant or claim
 MaaS-owned IPP resources. A typed AITenant selector would require a separate
 approved API proposal.
 
-### IPP-to-Praxis cutover test
-
-The architecture documents describe a per-tenant IPP-to-Praxis cutover, but
-explicitly reject automatic object or namespace migration:
-
-- Existing ExternalModel and ExternalProvider objects must keep working with
-  no automatic migration and no mutation.
-- Tenants opt into Praxis individually through the MaaS annotation.
-- IPP and Praxis must not both actively own routing for the same tenant.
-- The documented cutover order is effectively: stop or disable IPP, then
-  enable the new controller/Praxis path.
-- Existing tenant namespace resolution and MaaS tenancy behavior remain
-  unchanged.
-
-The separate transition test environment attempts to demonstrate that order
-for one existing tenant. `e2e.sh --suite transition` intentionally changes
-only run-owned Kind resources: it reconfigures the transition IPP processing
-Deployments, creates the transition ExternalModel and ExternalProvider, and
-switches the transition AITenant annotation to `praxis`. The controller and
-MaaS reconciliation then produce the observed route, transport, overlay, and
-Praxis workload state. The test subsequently removes the opt-in to exercise
-rollback. These operations cause test Deployment rollouts; they do not
-represent automatic migration of Kubernetes objects or movement of a tenant
-between namespaces.
-
-The transition test is separate from the ordinary routing qualification. A
-failure in its initial IPP request means the cutover sequence has not been
-proven; it must not be presented as a failure of the already-Praxis-enabled
-base path.
-
 The controller watches ExternalModel and ExternalProvider, publishes transport
 resources before the content-addressed overlay, and the local manifests
-provide two Katan backends plus standalone Praxis. Istio, Kuadrant, and the
-MaaS platform remain explicit prerequisites for the full authenticated chain;
-the provisioner records a failure rather than silently substituting them.
+provide two Katan backends plus tenant-local ExternalModel ExtProc. The default
+qualification entrypoint is `e2e.sh`, which executes the ExtProc-only suite.
+The transition implementation is not part of this checkout's executable
+qualification. Istio, Kuadrant, and the MaaS platform remain
+explicit prerequisites for the full authenticated chain; the provisioner
+records a failure rather than silently substituting them.
 
-The executable qualification records numbered routing assertions plus
-separate transition follow-up assertions. The `routing` mode counts only
-functional routing assertions; `transition` records the separate transition
-fixture. In addition to the
+The executable qualification records numbered routing assertions. In addition to the
 core transport, routing, hot-reload, digest, and last-known-good checks, it
 proves semantic no-op stability after a real provider watch event and provider
 status-gate loss/recovery. An
@@ -68,11 +38,15 @@ for bootstrap so its transport resources can establish Ready.
 
 The local configuration now provisions two independently serving tenant
 stacks. Tenant A is `models-as-a-service`; tenant B is
-`ai-tenant-tenant-b`. Their Gateway, Praxis Service, overlay ConfigMap,
+`ai-tenant-tenant-b`. Their Gateway, ExtProc Service, overlay ConfigMap,
 ExternalModel, ExternalProvider, and transport resources are distinct. Katan
 backends remain in `maas-system`, and evidence records that backend namespace
-separately. The extended run sends positive tenant-B traffic and verifies it
-survives tenant-A mutation. A separate `ai-tenant-transition` fixture is
+separately. The extended run proves positive tenant-B traffic after a bounded
+tenant-B Gateway route/provider convergence gate; this is workload and route
+isolation evidence, not proof of multi-tenant MaaS authorization. Gateway-local
+provider `DestinationRule` objects are tenant-qualified when more than one
+tenant shares `maas-system`, so endpoint and SNI policy from one tenant cannot
+overwrite another tenant's policy. A separate `ai-tenant-transition` fixture is
 annotation absent and reserved for real MaaS IPP cutover/rollback qualification.
 
 ### Shared External Model resources
@@ -126,7 +100,7 @@ client -> Gateway/Envoy + Kuadrant + ExtProc       (maas-system)
                               v
                  HTTPRoute parent reference
                               |
-       tenant HTTPRoute -> standalone Praxis Service (tenant namespace)
+       tenant HTTPRoute -> tenant-local ExternalModel ExtProc (tenant namespace)
                               |
                               v
                  provider Service/mesh transport    (tenant namespace)
@@ -137,20 +111,22 @@ client -> Gateway/Envoy + Kuadrant + ExtProc       (maas-system)
 
 The HTTPRoute is created in the resolved tenant namespace and attaches to a
 Gateway in `maas-system`. Gateway listeners explicitly allow routes from the
-tenant namespaces. The route backend is the same-namespace Praxis Service, so
+tenant namespaces. The route backend is the same-namespace controller-owned
+transport Service, so
 the route does not need a `ReferenceGrant`; no broad cross-namespace backend
 grant is installed. If a future design sends a backendRef to another
 namespace, that design must add a ReferenceGrant in the backend namespace
 limited to this Gateway API Service reference.
 
 Provider backend fixtures are separate from tenant state: they live in
-`maas-system`, while the controller-created ExternalName Service, ServiceEntry,
-DestinationRule, HTTPRoute, overlay, and projected Secret volume live in the
-resolved tenant namespace. Kubernetes Secret projection is namespace-bound;
-each Praxis ServiceAccount has token automount disabled and no Secret API
+`maas-system`. The controller-created ExternalName Service, ServiceEntry,
+HTTPRoute, overlay, and projected Secret volume live in the resolved tenant
+namespace; Gateway-local `DestinationRule` resources live in `maas-system`
+and use tenant-qualified names when needed. Kubernetes Secret projection is namespace-bound;
+each ExternalModel ExtProc ServiceAccount has token automount disabled and no Secret API
 permission. The E2E captures route parent/backend namespaces, Gateway
 `allowedRoutes`, ReferenceGrant inventory, projected Secret identities, and
-`kubectl auth can-i` denial for Praxis cross-tenant Secret reads. Production
+`kubectl auth can-i` denial for ExtProc cross-tenant Secret reads. Production
 manifests contain no Kind-only certificate, callback identity, or image-policy
 adaptation.
 
@@ -173,7 +149,7 @@ fixture setup and is not counted as callback proof. No key or Authorization
 value is written to evidence.
 
 The current route-scoped Kind fixture observes API-key validation and the full
-authorized Praxis request. The generated AuthPolicy is inspected before
+authorized ExtProc request. The generated AuthPolicy is inspected before
 classifying subscription-selection callback evidence: if the policy requires
 `/internal/v1/subscriptions/select`, an absent callback fails the routing
 qualification; if it does not, the behavior is recorded separately as
@@ -183,7 +159,7 @@ canned response or synthetic MaaS service is used.
 This proves single-tenant MaaS authorization callback compatibility. It does
 not prove tenant-aware dispatch for multiple tenant-qualified MaaS APIs; that
 broader shared-URL behavior remains `NOT_DEMONSTRATED` and is a separate MaaS
-design issue affecting both the existing IPP path and Praxis mode. Production
+design issue affecting both the existing IPP path and ExtProc mode. Production
 manifests contain none of these Kind-only certificate or callback adaptations.
 
 The Kind certificate and CA fixture can be removed when the Kind deployment
@@ -206,22 +182,22 @@ source-build path.
 
 ### Kind-only security compatibility
 
-The production Praxis workload leaves pod UID, GID, and fsGroup unset so an
+The production ExtProc workload leaves pod UID, GID, and fsGroup unset so an
 OpenShift restricted SCC can assign the namespace-safe identity. Kind does not
 perform that admission mutation and rejects the image's named non-root user
-when `runAsNonRoot` is set. After the controller creates each tenant Praxis
+when `runAsNonRoot` is set. After the controller creates each tenant ExtProc
 Deployment, the Kind provisioner applies the fixture-only numeric identity
 `65532` and records that transformation in the provision evidence. This
 transform is not in production manifests and is not used by the OpenShift
 workflow.
-The run-owned Katan Services expose port 443 mapped to their plain HTTP 8000
-listener. The Kind controller invocation names those fixture clusters
-explicitly with repeated `--praxis-plaintext-cluster` flags. The controller
-defaults every omitted Praxis cluster to verified TLS; there is no implicit
-Service-DNS or hostname-based downgrade.
+The run-owned Katan Services expose verified TLS on port 443. The controller
+uses the declared provider endpoint and its TLS configuration; it does not
+infer plaintext from a Kubernetes Service name or silently downgrade an
+endpoint. Any plaintext fixture must be an explicit test-only configuration,
+not a production transport behavior.
 
 The Katan backends are credential-enforcing fixtures, not permissive traffic
-sinks. Praxis providers use the run-only `kind-only-dummy` value and the
+sinks. ExtProc providers use the run-only `kind-only-dummy` value and the
 annotation-absent IPP transition fixture uses its separate
 `transition-provider-key` value through the dedicated `katan-transition`
 Deployment. These values are qualification fixtures only and are never
@@ -229,7 +205,8 @@ production credentials. The E2E first proves direct requests without a
 credential or with the wrong credential receive HTTP 401. The authenticated
 Gateway request carries the MaaS API key in `Authorization`, while the backend
 accepts only the distinct projected provider credential; its attributed HTTP
-200 proves Praxis replaced the caller credential. A separate request proves a
+200 proves the ExtProc credential-injection chain replaced the caller
+credential. A separate request proves a
 client-supplied `x-api-key` cannot replace it either. Duplicate `Authorization`
 header ordering is outside this claim. The expected provider credential is kept
 out of logs and evidence.
@@ -257,16 +234,18 @@ fixture credentials and response bodies are not written to evidence. The
 Gateway qualification remains authoritative for proving that the MaaS caller
 credential is replaced by the projected provider credential.
 
-Credential rotation is implemented in Praxis AI's existing `credential_inject`
-filter: projected Secret files are revalidated by an event-driven watcher and
-swapped as complete `ArcSwap` snapshots, with invalid replacements failing
-closed. The controller renders the tenant-scoped standalone Praxis Deployment,
-its reference-only filter configuration, and a deduplicated projected provider
-Secret volume. The generated ServiceAccount has token automount disabled.
-The controller-owned ExtProc Deployment remains a separate Envoy processing
-component. Existing Secret content rotation does not alter the pod template;
-changing the referenced Secret set intentionally changes the template and may
-roll out the tenant Praxis pod.
+Credential injection is implemented in the ExtProc `credential_inject` filter.
+The controller renders a tenant-local ExternalModel ExtProc Deployment, its
+reference-only filter configuration, and a projected provider Secret volume.
+The generated ServiceAccount has token automount disabled. Existing Secret
+content rotation does not alter the pod template; changing the referenced
+Secret set intentionally changes the template and may roll out the tenant
+ExtProc pod.
+
+The shared MaaS/KServe post-auth ExtProc filter remains BUFFERED. The
+ExternalModel-only filter is a separate SEND/NONE chain, disabled by default
+and enabled only by controller-owned route patches. Ordinary KServe routes on
+the same Gateway therefore retain their upstream body-processing behavior.
 
 The transition fixture uses a real annotation-absent AITenant and MaaS model
 resources. It reached real IPP ownership in the fresh run, but the existing IPP
@@ -277,11 +256,17 @@ user-owned, or controller-owned routes remain untouched. The current annotation
 contract and controller-owned cleanup are
 preserved and must not be replaced by a typed AITenant field.
 
-The readiness assertions are intentionally limited: this controller currently
-uses the persisted ExternalProvider phase as a reconciliation gate, not as an
-independent endpoint-health observation. The runtime test therefore proves
-last-known-good serving and recovery around an explicit status transition. A
-separate provider-health producer and its contract remain unimplemented.
+The controller still uses the persisted ExternalProvider phase as its
+reconciliation gate. Before each live provider request, the Kind E2E also
+waits for the selected Envoy provider cluster to report a healthy Endpoint
+through the Envoy admin interface, with a bounded timeout. The semantic
+overlay gate additionally requires the published ConfigMap digest, a fresh
+recomputed digest, the mounted ExtProc file, and the ExtProc accepted and
+serving revisions to agree for two consecutive samples. It is used before
+initial Provider A traffic, the A-to-B switch, the Provider A reset, and the
+last-known-good request after an invalid overlay. This separates resource
+reconciliation from request-path endpoint convergence; it does not claim
+health-based provider selection or failover.
 
 The corrected qualification uses the run-owned CA with `curl --cacert`; TLS
 verification is enabled and no HTTP downgrade or insecure flag is used. Evidence
@@ -392,7 +377,7 @@ set +x
 ```
 
 Create a run-owned in-cluster curl client. Kind uses the HTTP Gateway listener;
-TLS remains mandatory on the Praxis-to-OpenAI connection. The client has no
+TLS remains mandatory on the ExtProc-to-OpenAI connection. The client has no
 ServiceAccount token and no embedded credentials:
 
 ```console
@@ -417,14 +402,15 @@ kubectl --context "$KUBECTX" -n models-as-a-service wait --for=condition=Ready p
 ```
 
 Before sending traffic, wait for `ExternalProvider`, `ExternalModel`,
-`MaaSModelRef`, subscription, `HTTPRoute`, and Praxis readiness. Inspect the
+`MaaSModelRef`, subscription, `HTTPRoute`, and ExtProc readiness. Inspect the
 controller-generated overlay and require exactly one OpenAI cluster with
 `api.openai.com:443`, `http.authority: api.openai.com`, TLS enabled,
 `tls.sni: api.openai.com`, certificate verification enabled, and no random
 selection policy. The overlay contains only the Secret reference. Plaintext is
-permitted only for the explicit Katan fixture cluster names passed through the
-controller's `--praxis-plaintext-cluster` option; public provider endpoints
-otherwise use verified TLS.
+permitted only for explicitly configured test-only Katan fixture endpoints;
+public provider endpoints otherwise use verified TLS. The qualified API
+contract is `openai-chat` with `/v1/chat/completions`; `/v1/responses` is not
+supported by this integration.
 
 Start a short-lived verified port-forward only for MaaS key administration;
 the OpenAI request itself is sent from the in-cluster client and never uses a

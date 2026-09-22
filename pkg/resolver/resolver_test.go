@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,6 +74,48 @@ func TestResolve_SingleHappyPath(t *testing.T) {
 	}
 	if r.AuthType != "apikey" {
 		t.Errorf("auth type: got %q", r.AuthType)
+	}
+}
+
+func TestResolveRejectsDuplicateActiveProviderBindings(t *testing.T) {
+	m := model("ns1", "my-model",
+		ref("prov-a", "gpt-4o-mini", "/v1/chat/completions"),
+		ref("prov-a", "gpt-4o", "/v1/responses"),
+	)
+	p := provider("ns1", "prov-a", PhaseReady, "api.openai.com", nil)
+
+	_, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	if err == nil || !strings.Contains(err.Error(), "multiple active references") {
+		t.Fatalf("Resolve() error = %v, want duplicate active provider rejection", err)
+	}
+}
+
+func TestResolveAllIncludesUnselectedProviderBindings(t *testing.T) {
+	m := model("ns1", "my-model",
+		withWeight(ref("prov-a", "a", "/v1"), 1),
+		withWeight(ref("prov-b", "b", "/v1"), 0),
+	)
+	provs := []*v1alpha1.ExternalProvider{
+		provider("ns1", "prov-a", PhaseReady, "a.example.com", nil),
+		provider("ns1", "prov-b", PhaseReady, "b.example.com", nil),
+	}
+	set, err := ResolveAll([]*v1alpha1.ExternalModel{m}, provs)
+	if err != nil {
+		t.Fatalf("ResolveAll: %v", err)
+	}
+	if got := len(set.Routes()); got != 2 {
+		t.Fatalf("ResolveAll routes = %d, want 2", got)
+	}
+	if set.Routes()[1].Provider != "prov-b" || set.Routes()[1].Weight != 0 {
+		t.Fatalf("ResolveAll did not preserve the unselected binding: %+v", set.Routes()[1])
+	}
+
+	selected, err := Resolve([]*v1alpha1.ExternalModel{m}, provs)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := len(selected.Routes()); got != 1 || selected.Routes()[0].Provider != "prov-a" {
+		t.Fatalf("Resolve serving routes = %+v, want only prov-a", selected.Routes())
 	}
 }
 
@@ -209,6 +252,28 @@ func TestResolve_MergedConfigAndPathTemplates(t *testing.T) {
 	want := "/v1/projects/ref-project/locations/us-central1/models/claude-x:raw"
 	if got := set.Routes()[0].Path; got != want {
 		t.Errorf("path:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestResolve_MergedConfigCarriesMountedTLSCAPath(t *testing.T) {
+	m := model("ns1", "m", ref("p", "target", "/v1"))
+	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{
+		"tls.caCertificates": "/etc/istio/provider-ca/ca.crt",
+	})
+	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := set.Routes()[0].TLSCACertificates; got != "/etc/istio/provider-ca/ca.crt" {
+		t.Fatalf("TLS CA path = %q", got)
+	}
+}
+
+func TestResolve_RejectsUnsafeTLSCAPath(t *testing.T) {
+	m := model("ns1", "m", ref("p", "target", "/v1"))
+	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{"tls.caCertificates": "../ca.crt"})
+	if _, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p}); err == nil {
+		t.Fatal("unsafe TLS CA path must be rejected")
 	}
 }
 

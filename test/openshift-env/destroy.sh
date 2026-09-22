@@ -25,7 +25,7 @@ fi
 if "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants -o json >"$STATE/destroy-aitenant.json" 2>/dev/null; then
     if [[ "$SHARED_AITENANT" == true ]]; then
     if ! jq -e --arg run "$OPENSHIFT_E2E_RUN_ID" '.metadata.labels["external-model-praxis.opendatahub.io/run-id"] == $run and .metadata.labels["app.kubernetes.io/managed-by"] == "external-model-praxis-openshift-e2e"' "$STATE/destroy-aitenant.json" >/dev/null; then
-      jq -e --slurpfile original "$STATE/aitenant-original.json" '(.metadata.labels // {}) == ($original[0].metadata.labels // {}) and (.metadata.annotations // {}) == ($original[0].metadata.annotations // {})' "$STATE/destroy-aitenant.json" >/dev/null || { echo "shared AITenant was not opted in by this run or was already restored" >&2; exit 1; }
+      jq -e --slurpfile original "$STATE/aitenant-original.json" '(.metadata.labels // {}) == ($original[0].metadata.labels // {}) and (.metadata.annotations // {}) == ($original[0].metadata.annotations // {}) and (.spec // {}) == ($original[0].spec // {})' "$STATE/destroy-aitenant.json" >/dev/null || { echo "shared AITenant was not opted in by this run or was already restored" >&2; exit 1; }
       SHARED_AITENANT_ALREADY_RESTORED=true
       AITENANT_RETAINED=true
     fi
@@ -65,13 +65,13 @@ if [[ "$SHARED_AITENANT" == true && "${SHARED_AITENANT_ALREADY_RESTORED:-false}"
   OUT="$OPENSHIFT_E2E_EVIDENCE_ROOT/cleanup-$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$OUT"
   "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants -o json >"$OUT/shared-aitenant-before-restore.json"
-  jq -n --slurpfile original "$original" '[{op:"replace",path:"/metadata/labels",value:$original[0].metadata.labels},{op:"replace",path:"/metadata/annotations",value:$original[0].metadata.annotations}]' >"$OUT/shared-aitenant-restore-patch.json"
+  jq -n --slurpfile original "$original" '[{op:"replace",path:"/metadata/labels",value:($original[0].metadata.labels // {})},{op:"replace",path:"/metadata/annotations",value:($original[0].metadata.annotations // {})},{op:"replace",path:"/spec",value:($original[0].spec // {})}]' >"$OUT/shared-aitenant-restore-patch.json"
   "${OC[@]}" patch aitenant "$AITENANT" -n ai-tenants --type=json --patch-file "$OUT/shared-aitenant-restore-patch.json" >"$OUT/shared-aitenant-restore.log"
   deadline=$((SECONDS + 180))
   restored=false
   while (( SECONDS < deadline )); do
     if "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants -o json 2>/dev/null |
-      jq -e --slurpfile original "$original" '(.metadata.labels // {}) == ($original[0].metadata.labels // {}) and (.metadata.annotations // {}) == ($original[0].metadata.annotations // {})' >/dev/null; then
+      jq -e --slurpfile original "$original" '(.metadata.labels // {}) == ($original[0].metadata.labels // {}) and (.metadata.annotations // {}) == ($original[0].metadata.annotations // {}) and (.spec // {}) == ($original[0].spec // {})' >/dev/null; then
       restored=true
       break
     fi
@@ -181,6 +181,14 @@ if "${OC[@]}" get configmap "xmp-service-ca-$OPENSHIFT_E2E_RUN_ID" -n kuadrant-s
   else
     cleanup_failed=1
     echo "Authorino CA ConfigMap ownership check failed" >>"$OUT/cleanup-errors.txt"
+  fi
+fi
+if "${OC[@]}" get configmap "xmp-provider-ca-$OPENSHIFT_E2E_RUN_ID" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o json >"$OUT/provider-ca-configmap.json" 2>/dev/null; then
+  if jq -e --arg run "$OPENSHIFT_E2E_RUN_ID" '.metadata.labels["external-model-praxis.opendatahub.io/run-id"] == $run and .metadata.labels["app.kubernetes.io/managed-by"] == "external-model-praxis-openshift-e2e"' "$OUT/provider-ca-configmap.json" >/dev/null; then
+    "${OC[@]}" delete configmap "xmp-provider-ca-$OPENSHIFT_E2E_RUN_ID" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" >/dev/null || cleanup_failed=1
+  else
+    cleanup_failed=1
+    echo "provider CA ConfigMap ownership check failed" >>"$OUT/cleanup-errors.txt"
   fi
 fi
 for resource in service/maas-api deployment/maas-api-callback-proxy configmap/maas-api-callback-proxy; do

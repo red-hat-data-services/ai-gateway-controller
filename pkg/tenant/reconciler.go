@@ -18,10 +18,13 @@ package tenant
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -32,7 +35,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
 
 // notReadyRequeueInterval is used when a MaasTenantConfig has opted into
@@ -66,8 +72,9 @@ type Reconciler struct {
 	// Client applies the rendered resources and reads/updates MaasTenantConfig
 	// (and reads AITenant).
 	Client client.Client
-	// ManifestPath is the kustomize entrypoint, e.g.
-	// config/manifests/praxis-extproc/overlays/odh.
+	// ManifestPath is the controller-owned kustomize entrypoint, e.g.
+	// config/manifests/external-model/overlays/odh. It composes the pinned
+	// upstream praxis-extproc tree with controller-specific patches.
 	ManifestPath string
 	// Image replaces the vendored overlay's placeholder container image.
 	Image string
@@ -109,7 +116,28 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 			NewAITenant(),
 			handler.EnqueueRequestsFromMapFunc(r.enqueueMaasTenantConfigForAITenant),
 		).
+		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
 		Complete(r)
+}
+
+func (r *Reconciler) maasTenantConfigForRoutingOverlay(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetName() != praxisOverlayName {
+		return nil
+	}
+	return r.maasTenantConfigForNamespace(ctx, obj)
+}
+
+func (r *Reconciler) maasTenantConfigForNamespace(_ context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetNamespace() == "" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{
+		Namespace: obj.GetNamespace(),
+		Name:      MaasTenantConfigInstanceName,
+	}}}
 }
 
 // enqueueMaasTenantConfigForAITenant maps an AITenant event to the
@@ -255,6 +283,44 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		log.Error(err, "cannot render praxis-extproc resources for this tenant name; will not retry until the tenant changes")
 		return ctrl.Result{}, nil
 	}
+	tenantNamespace := mtc.GetNamespace()
+	hasModels, err := r.hasActiveExternalModels(ctx, tenantNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	var runtimeCandidates []envelope.Candidate
+	if hasModels {
+		_, requiredProviders, providerErr := r.providersForTenant(ctx, tenantNamespace)
+		if providerErr != nil {
+			return ctrl.Result{}, providerErr
+		}
+		ready, reason, overlayErr := r.routingOverlayReady(ctx, tenantNamespace, requiredProviders)
+		if overlayErr != nil {
+			return ctrl.Result{}, fmt.Errorf("check routing overlay: %w", overlayErr)
+		}
+		if !ready {
+			log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
+			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		}
+		runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
+		return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
+	}
+
+	resources, err = SplitPostAuthResources(resources, tenantID, gatewayNamespace, tenantNamespace)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
+	}
+	if hasModels {
+		if err := configureExternalModelExtProc(resources, tenantNamespace, runtimeCandidates); err != nil {
+			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)
+		}
+	} else {
+		resources = RemoveExternalModelResources(resources, tenantID)
+	}
 	if r.SkipNetworkPolicy {
 		filtered := make([]unstructured.Unstructured, 0, len(resources))
 		for _, resource := range resources {
@@ -265,6 +331,18 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		resources = filtered
 		log.Info("omitting controller-managed NetworkPolicy by explicit configuration", "namespace", gatewayNamespace)
 	}
+	for i := range resources {
+		labels := resources[i].GetLabels()
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+		labels[managedByLabel] = render.FieldOwner
+		resources[i].SetLabels(labels)
+	}
+	if err := r.waitForForeignOwnership(ctx, resources); err != nil {
+		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
 
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		log.Error(err, "praxis-extproc apply failed for tenant; will retry")
@@ -274,10 +352,11 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	// Drop any leftover tenant-scoped standalone Praxis hop from earlier
 	// releases. ExtProc is the dataplane; ExternalModel routes backend to
 	// provider ExternalName Services directly.
-	if tenantNamespace, ok := ConfigNamespace(aitenant); ok {
-		if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
-			return ctrl.Result{}, err
-		}
+	if err := r.deleteStandalonePraxis(ctx, tenantID, tenantNamespace); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.deleteResourceIfOwned(ctx, gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingPostNameForTenant(tenantID), ""); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	log.Info("praxis-extproc install applied",
@@ -302,6 +381,188 @@ func (r *Reconciler) deleteStandalonePraxis(ctx context.Context, tenantID, tenan
 		}
 	}
 	return nil
+}
+
+func (r *Reconciler) hasActiveExternalModels(ctx context.Context, namespace string) (bool, error) {
+	models := &v1alpha1.ExternalModelList{}
+	if err := r.Client.List(ctx, models, client.InNamespace(namespace)); err != nil {
+		return false, fmt.Errorf("list ExternalModels for cleanup: %w", err)
+	}
+	for i := range models.Items {
+		if models.Items[i].GetDeletionTimestamp().IsZero() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *Reconciler) cleanupExternalModelResources(ctx context.Context, tenantID, gatewayNamespace, tenantNamespace string) error {
+	targets := []struct {
+		gvk             schema.GroupVersionKind
+		name, namespace string
+	}{
+		{gvkDeployment, PayloadProcessingExternalModelDeploymentName(tenantID), tenantNamespace},
+		{gvkService, PayloadProcessingExternalModelServiceName(tenantID), tenantNamespace},
+		{gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID), tenantNamespace},
+		{gvkServiceAccount, PayloadProcessingExternalModelServiceAccountName(tenantID), tenantNamespace},
+		{gvkDestinationRule, PayloadProcessingExternalModelServiceName(tenantID), tenantNamespace},
+		{gvkDestinationRule, PayloadProcessingExternalModelServiceName(tenantID), gatewayNamespace},
+		{gvkEnvoyFilter, PayloadProcessingExternalModelFilterNameForTenant(tenantID), gatewayNamespace},
+		{gvkEnvoyFilter, PayloadProcessingExternalModelEnvoyFilterName(tenantID), gatewayNamespace},
+	}
+	for _, target := range targets {
+		if err := r.deleteResourceIfOwned(ctx, target.gvk, target.name, target.namespace); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) providersForTenant(ctx context.Context, namespace string) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
+	var providers v1alpha1.ExternalProviderList
+	if err := r.Client.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
+		return nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
+	}
+	var models v1alpha1.ExternalModelList
+	if err := r.Client.List(ctx, &models, client.InNamespace(namespace)); err != nil {
+		return nil, nil, fmt.Errorf("list tenant ExternalModels: %w", err)
+	}
+	referenced := map[string]bool{}
+	required := map[string]bool{}
+	for i := range models.Items {
+		for _, ref := range models.Items[i].Spec.ExternalProviderRefs {
+			name := ref.Ref.Name
+			if name == "" {
+				continue
+			}
+			referenced[name] = true
+			if ref.Weight == nil || *ref.Weight > 0 {
+				required[name] = true
+			}
+		}
+	}
+	result := make([]v1alpha1.ExternalProvider, 0, len(providers.Items))
+	for i := range providers.Items {
+		if referenced[providers.Items[i].Name] {
+			result = append(result, providers.Items[i])
+		}
+	}
+	return result, required, nil
+}
+
+func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, error) {
+	var models v1alpha1.ExternalModelList
+	if err := r.Client.List(ctx, &models, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list ExternalModels for ExtProc runtime configuration: %w", err)
+	}
+	var providers v1alpha1.ExternalProviderList
+	if err := r.Client.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list ExternalProviders for ExtProc runtime configuration: %w", err)
+	}
+	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
+	for i := range models.Items {
+		modelPtrs = append(modelPtrs, &models.Items[i])
+	}
+	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
+	for i := range providers.Items {
+		providerPtrs = append(providerPtrs, &providers.Items[i])
+	}
+	runtimeSet, err := resolver.ResolveAll(modelPtrs, providerPtrs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
+	}
+	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
+	for _, route := range runtimeSet.Routes() {
+		strategy, err := envelope.CredentialStrategy(route)
+		if err != nil {
+			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
+		}
+		candidate := envelope.Candidate{
+			Cluster: route.Cluster, StableID: "provider-" + route.Provider,
+			Kind: "inference_model", Name: route.ClientName, Fresh: true,
+		}
+		if strategy != "" {
+			candidate.Credential = &envelope.Credential{
+				Strategy:  strategy,
+				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
+			}
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, nil
+}
+
+func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders map[string]bool) (bool, string, error) {
+	var configMap corev1.ConfigMap
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: praxisOverlayName}, &configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, "routing overlay is absent", nil
+		}
+		return false, "", fmt.Errorf("get routing overlay %s/%s: %w", namespace, praxisOverlayName, err)
+	}
+	if configMap.GetLabels()[managedByLabel] != render.FieldOwner {
+		return false, "routing overlay is not owned by ai-gateway-controller", nil
+	}
+	raw := configMap.Data[praxisOverlayDataKey]
+	if raw == "" {
+		return false, "routing overlay has no envelope data", nil
+	}
+	var env envelope.Envelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		return overlayNotReady("routing overlay is not valid JSON")
+	}
+	if env.SchemaVersion != envelope.SchemaVersion || env.Revision.Value == "" || env.ContentDigest.Value != env.Revision.Value || env.Scope.Namespace != namespace {
+		return false, "routing overlay envelope metadata is invalid", nil
+	}
+	digest, err := envelope.ComputeDigestFromWire([]byte(raw))
+	if err != nil || digest != env.Revision.Value {
+		return overlayNotReady("routing overlay digest does not match its declared revision")
+	}
+	available := make(map[string]bool, len(env.Overlay.Candidates))
+	for _, candidate := range env.Overlay.Candidates {
+		available[candidate.Cluster] = true
+	}
+	for provider := range requiredProviders {
+		if !available["provider-"+provider] {
+			return false, fmt.Sprintf("routing overlay does not contain provider %s", provider), nil
+		}
+	}
+	return true, "routing overlay is controller-owned and digest-valid", nil
+}
+
+func overlayNotReady(reason string) (bool, string, error) {
+	return false, reason, nil
+}
+
+const managedByLabel = "app.kubernetes.io/managed-by"
+
+func (r *Reconciler) waitForForeignOwnership(ctx context.Context, resources []unstructured.Unstructured) error {
+	for i := range resources {
+		desired := &resources[i]
+		if desired.GetKind() == "ClusterRole" && desired.GetName() == "payload-processing-reader" {
+			continue
+		}
+		current := &unstructured.Unstructured{}
+		current.SetGroupVersionKind(desired.GroupVersionKind())
+		if err := r.Client.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("inspect %s %s/%s: %w", desired.GetKind(), desired.GetNamespace(), desired.GetName(), err)
+		}
+		if isReleasedPluginConfigMap(desired) && current.GetAnnotations()["opendatahub.io/managed"] == "false" {
+			continue
+		}
+		if current.GetLabels()[managedByLabel] != render.FieldOwner {
+			return fmt.Errorf("%s %s/%s is managed by %q", desired.GetKind(), desired.GetNamespace(), desired.GetName(), current.GetLabels()[managedByLabel])
+		}
+	}
+	return nil
+}
+
+func isReleasedPluginConfigMap(obj *unstructured.Unstructured) bool {
+	name := obj.GetName()
+	return name == PayloadProcessingPluginsConfigMapName || strings.HasPrefix(name, PayloadProcessingPluginsConfigMapName+"-")
 }
 
 // reconcileNotPraxis handles a tenant that currently does not opt into
@@ -330,7 +591,7 @@ func (r *Reconciler) reconcileNotPraxis(ctx context.Context, log logr.Logger, mt
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
-	if err := r.cleanup(ctx, tenantID, gatewayNamespace); err != nil {
+	if err := r.cleanup(ctx, tenantID, gatewayNamespace, mtc.GetNamespace()); err != nil {
 		log.Error(err, "praxis-extproc cleanup failed after switching away from praxis; will retry", "namespace", gatewayNamespace)
 		return ctrl.Result{}, fmt.Errorf("cleanup: %w", err)
 	}
@@ -379,7 +640,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
-	if err := r.cleanup(ctx, tenantID, gatewayNamespace); err != nil {
+	if err := r.cleanup(ctx, tenantID, gatewayNamespace, mtc.GetNamespace()); err != nil {
 		log.Error(err, "praxis-extproc cleanup failed for deleted tenant; will retry", "namespace", gatewayNamespace)
 		return ctrl.Result{}, fmt.Errorf("cleanup: %w", err)
 	}
@@ -427,7 +688,7 @@ func (r *Reconciler) removeFinalizer(ctx context.Context, mtc *unstructured.Unst
 // ClusterRole is never deleted here: every tenant's ClusterRoleBinding
 // references that one role, so deleting it would break every other
 // praxis tenant sharing the cluster.
-func (r *Reconciler) cleanup(ctx context.Context, tenantID, namespace string) error {
+func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, tenantNamespace string) error {
 	type target struct {
 		gvk       schema.GroupVersionKind
 		name      string
@@ -435,17 +696,33 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, namespace string) er
 	}
 
 	targets := []target{
-		{gvkDeployment, PayloadProcessingDeploymentName(tenantID), namespace},
-		{gvkDeployment, PayloadPreProcessingDeploymentName(tenantID), namespace},
-		{gvkService, PayloadProcessingServiceName(tenantID), namespace},
-		{gvkService, PayloadPreProcessingServiceName(tenantID), namespace},
-		{gvkConfigMap, PayloadProcessingPluginsConfigMapForTenant(tenantID), namespace},
-		{gvkServiceAccount, PayloadProcessingServiceAccountName(tenantID), namespace},
-		{gvkNetworkPolicy, PayloadProcessingNetworkPolicyName(tenantID), namespace},
-		{gvkEnvoyFilter, PayloadProcessingEnvoyFilterName(tenantID), namespace},
-		{gvkDestinationRule, PayloadProcessingServiceName(tenantID), namespace},
-		{gvkDestinationRule, PayloadPreProcessingServiceName(tenantID), namespace},
+		{gvkDeployment, PayloadProcessingDeploymentName(tenantID), gatewayNamespace},
+		{gvkDeployment, PayloadPreProcessingDeploymentName(tenantID), gatewayNamespace},
+		{gvkDeployment, PayloadProcessingDeploymentName(tenantID), tenantNamespace},
+		{gvkDeployment, PayloadProcessingExternalModelDeploymentName(tenantID), tenantNamespace},
+		{gvkService, PayloadProcessingServiceName(tenantID), gatewayNamespace},
+		{gvkService, PayloadPreProcessingServiceName(tenantID), gatewayNamespace},
+		{gvkService, PayloadProcessingServiceName(tenantID), tenantNamespace},
+		{gvkService, PayloadProcessingExternalModelServiceName(tenantID), tenantNamespace},
+		{gvkConfigMap, PayloadProcessingPluginsConfigMapForTenant(tenantID), gatewayNamespace},
+		{gvkConfigMap, PayloadProcessingPluginsConfigMapForTenant(tenantID), tenantNamespace},
+		{gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID), tenantNamespace},
+		{gvkServiceAccount, PayloadProcessingServiceAccountName(tenantID), gatewayNamespace},
+		{gvkServiceAccount, PayloadProcessingServiceAccountName(tenantID), tenantNamespace},
+		{gvkServiceAccount, PayloadProcessingPostServiceAccountName(tenantID), tenantNamespace},
+		{gvkServiceAccount, PayloadProcessingExternalModelServiceAccountName(tenantID), tenantNamespace},
+		{gvkNetworkPolicy, PayloadProcessingNetworkPolicyName(tenantID), gatewayNamespace},
+		{gvkNetworkPolicy, PayloadProcessingNetworkPolicyName(tenantID), tenantNamespace},
+		{gvkEnvoyFilter, PayloadProcessingEnvoyFilterName(tenantID), gatewayNamespace},
+		{gvkEnvoyFilter, PayloadProcessingExternalModelFilterNameForTenant(tenantID), gatewayNamespace},
+		{gvkEnvoyFilter, PayloadProcessingExternalModelEnvoyFilterName(tenantID), gatewayNamespace},
+		{gvkDestinationRule, PayloadProcessingServiceName(tenantID), gatewayNamespace},
+		{gvkDestinationRule, PayloadPreProcessingServiceName(tenantID), gatewayNamespace},
+		{gvkDestinationRule, PayloadProcessingServiceName(tenantID), tenantNamespace},
+		{gvkDestinationRule, PayloadProcessingExternalModelServiceName(tenantID), gatewayNamespace},
+		{gvkDestinationRule, PayloadProcessingExternalModelServiceName(tenantID), tenantNamespace},
 		{gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID), ""},
+		{gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingPostNameForTenant(tenantID), ""},
 	}
 
 	for _, t := range targets {

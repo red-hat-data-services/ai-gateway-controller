@@ -41,6 +41,6 @@ spec:
       - name: manager
         image: ${CONTROLLER_IMAGE}
         imagePullPolicy: IfNotPresent
-        args: [--leader-elect=false, --skip-network-policy=true, --image=${EXTPROC_IMAGE}, --praxis-image=${PRAXIS_IMAGE}, --praxis-image-pull-policy=IfNotPresent, --external-model-namespace=${OPENSHIFT_E2E_TENANT_NAMESPACE}, --gateway-name=${OPENSHIFT_E2E_GATEWAY_NAME}, --gateway-namespace=${OPENSHIFT_E2E_GATEWAY_NAMESPACE}, --known-cluster=provider-provider-a, --known-cluster=provider-provider-b, --known-cluster=provider-openai, --health-probe-bind-address=:8081]
+        args: [--leader-elect=false, --skip-network-policy=true, --image=${EXTPROC_IMAGE}, --external-model-namespace=${OPENSHIFT_E2E_TENANT_NAMESPACE}, --gateway-name=${OPENSHIFT_E2E_GATEWAY_NAME}, --gateway-namespace=${OPENSHIFT_E2E_GATEWAY_NAMESPACE}, --known-cluster=provider-provider-a, --known-cluster=provider-provider-b, --known-cluster=provider-openai, --health-probe-bind-address=:8081]
         ports: [{name: health, containerPort: 8081}]
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}, seccompProfile: {type: RuntimeDefault}}

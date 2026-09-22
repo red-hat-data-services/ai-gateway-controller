@@ -1,9 +1,9 @@
-# Creates the run-owned image-puller binding for stable namespace groups; exact discovered ServiceAccounts are bound in shell.
+# Creates the run-owned image-puller binding in the image project for stable namespace groups; exact tenant ServiceAccounts are bound in shell.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: image-puller-controller
-  namespace: ${OPENSHIFT_E2E_BACKEND_NAMESPACE}
+  namespace: ${OPENSHIFT_E2E_IMAGE_PROJECT}
   labels:
     external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}
     app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e

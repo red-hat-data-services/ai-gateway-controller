@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,13 +35,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 )
 
-// manifestPath points at the vendored (committed) praxis-extproc overlay,
-// mirroring pkg/render's own tests. This package is a sibling of
-// pkg/render, so the relative depth to the repo root is the same.
-const manifestPath = "../../config/manifests/praxis-extproc/overlays/odh"
+// manifestPath points at the controller-owned composition of the pinned
+// praxis-extproc overlay and ExternalModel patches. This package is a sibling
+// of pkg/render, so the relative depth to the repo root is the same.
+const manifestPath = "../../config/manifests/external-model/overlays/odh"
 
 // mtcSchemeForTests registers MaasTenantConfigGVK and AITenantGVK (and their
 // List kinds) with a bare scheme so the fake client can Get/List/Patch/
@@ -50,11 +53,58 @@ const manifestPath = "../../config/manifests/praxis-extproc/overlays/odh"
 // operations without it.
 func mtcSchemeForTests() *runtime.Scheme {
 	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = v1alpha1.AddToScheme(scheme)
 	scheme.AddKnownTypeWithName(MaasTenantConfigGVK, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(MaasTenantConfigGVK.GroupVersion().WithKind("MaasTenantConfigList"), &unstructured.UnstructuredList{})
 	scheme.AddKnownTypeWithName(AITenantGVK, &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(AITenantGVK.GroupVersion().WithKind(AITenantGVK.Kind+"List"), &unstructured.UnstructuredList{})
 	return scheme
+}
+
+func TestMaasTenantConfigForNamespaceMapsExternalModelEvents(t *testing.T) {
+	r := &Reconciler{}
+	model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "tenant-a"}}
+	requests := r.maasTenantConfigForNamespace(context.Background(), model)
+	want := ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "tenant-a", Name: MaasTenantConfigInstanceName}}
+	if len(requests) != 1 || requests[0] != want {
+		t.Fatalf("ExternalModel event enqueued %#v, want %#v", requests, want)
+	}
+}
+
+func TestCleanupExternalModelResourcesRemovesCredentialWorkload(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	const tenantID = "redteam"
+	const tenantNamespace = "tenant-ns"
+	const gatewayNamespace = "gateway-system"
+	owned := func(gvk schema.GroupVersionKind, name, namespace string) client.Object {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvk)
+		u.SetName(name)
+		u.SetNamespace(namespace)
+		u.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController})
+		return u
+	}
+	objects := []client.Object{
+		owned(gvkDeployment, PayloadProcessingExternalModelDeploymentName(tenantID), tenantNamespace),
+		owned(gvkService, PayloadProcessingExternalModelServiceName(tenantID), tenantNamespace),
+		owned(gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID), tenantNamespace),
+		owned(gvkServiceAccount, PayloadProcessingExternalModelServiceAccountName(tenantID), tenantNamespace),
+		owned(gvkDestinationRule, PayloadProcessingExternalModelServiceName(tenantID), gatewayNamespace),
+		owned(gvkEnvoyFilter, PayloadProcessingExternalModelEnvoyFilterName(tenantID), gatewayNamespace),
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	r := &Reconciler{Client: fakeClient}
+	if err := r.cleanupExternalModelResources(context.Background(), tenantID, gatewayNamespace, tenantNamespace); err != nil {
+		t.Fatalf("cleanupExternalModelResources: %v", err)
+	}
+	for _, target := range objects {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(target.GetObjectKind().GroupVersionKind())
+		if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(target), got); !apierrors.IsNotFound(err) {
+			t.Fatalf("ExternalModel resource %s/%s remains: %v", target.GetNamespace(), target.GetName(), err)
+		}
+	}
 }
 
 // newMTC builds an unstructured MaasTenantConfig fixture in the shape
@@ -363,6 +413,7 @@ func TestReconcileSkipsMigrationMarkerCheckWhenBundleAlreadyExists(t *testing.T)
 	existingDeployment.SetGroupVersionKind(gvkDeployment)
 	existingDeployment.SetName(PayloadProcessingDeploymentName(""))
 	existingDeployment.SetNamespace(DefaultAITenantName)
+	existingDeployment.SetLabels(map[string]string{managedByLabel: render.FieldOwner})
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, existingDeployment).WithInterceptorFuncs(rec.funcs()).Build()
 

@@ -22,7 +22,6 @@ Re-enable when the **Requirement to re-introduce** is met. Update the allowlist 
 
 | Test module | Why excluded | Requirement to re-introduce |
 |-------------|--------------|------------------------------|
-| `test_external_models.py` | ai-gateway-controller has no ExternalModel reconciler yet | Implement ExternalModel/ExternalProvider in aigc; Konflux egress fixtures for simulator endpoints |
 | `test_external_oidc.py` | External OIDC gateway path not in aigc CI scope | Partner/OIDC gateway deployments + Keycloak fixtures in prow; `EXTERNAL_OIDC=true` path |
 | `test_x_api_key_auth.py` | Depends on IPP ExternalModel (`apiFormat=messages`) identity source | Praxis/IPP ExternalModel wiring in aigc; gateway AuthPolicy `api-keys-x-api-key` source |
 | `test_networkpolicy.py` | NetworkPolicy assertions assume full MaaS networkpolicy bundle | Confirm aigc deploy applies same NP manifests; no CNI conflicts on Konflux clusters |

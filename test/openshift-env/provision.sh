@@ -18,18 +18,46 @@ need docker
 need skopeo
 need sha256sum
 need envsubst
+
+content_hash_untracked() {
+  local repo=$1 path
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      .openshift-state/*|test/openshift-env/.state/*) continue ;;
+    esac
+    if [[ -f "$repo/$path" ]]; then
+      printf '%s ' "$path"
+      sha256sum "$repo/$path"
+    fi
+  done < <(git -C "$repo" ls-files --others --exclude-standard -z) | sha256sum | awk '{print $1}'
+}
+
+content_manifest_untracked() {
+  local repo=$1 path
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      .openshift-state/*|test/openshift-env/.state/*) continue ;;
+    esac
+    if [[ -f "$repo/$path" ]]; then
+      printf '%s ' "$path"
+      sha256sum "$repo/$path" | awk '{print $1}'
+    fi
+  done < <(git -C "$repo" ls-files --others --exclude-standard -z)
+}
 REQUESTED_CONTROLLER_IMAGE="${OPENSHIFT_E2E_CONTROLLER_IMAGE:-}"
-[[ -n "${PRAXIS_REPO:-}" && -n "${PRAXIS_EXTPROC_REPO:-}" && -n "${MAAS_CONTROLLER_REPO:-}" && -n "${KSERVE_REPO:-}" && -n "${KUADRANT_OPERATOR_REPO:-}" ]] || {
-  echo "PRAXIS_REPO, PRAXIS_EXTPROC_REPO, MAAS_CONTROLLER_REPO, KSERVE_REPO, and KUADRANT_OPERATOR_REPO must point to pinned clean checkouts" >&2
+[[ -n "${PRAXIS_EXTPROC_REPO:-}" && -n "${MAAS_CONTROLLER_REPO:-}" && -n "${KUADRANT_OPERATOR_REPO:-}" ]] || {
+  echo "PRAXIS_EXTPROC_REPO, MAAS_CONTROLLER_REPO, and KUADRANT_OPERATOR_REPO must point to pinned clean checkouts" >&2
   exit 1
 }
 repos=("$PRAXIS_EXTPROC_REPO")
 for repo in "${repos[@]}"; do
-  git -C "$repo" diff --quiet || { echo "refusing dirty dependency source: $repo" >&2; exit 1; }
-  git -C "$repo" diff --cached --quiet || { echo "refusing staged dependency source: $repo" >&2; exit 1; }
+  if ! git -C "$repo" diff --quiet || ! git -C "$repo" diff --cached --quiet; then
+    [[ "${OPENSHIFT_E2E_ALLOW_DIRTY_SOURCES:-false}" == true ]] || { echo "refusing dirty dependency source: $repo; set OPENSHIFT_E2E_ALLOW_DIRTY_SOURCES=true only after reviewing it" >&2; exit 1; }
+  fi
 done
-git -C "$MAAS_CONTROLLER_REPO" diff --quiet || { echo "refusing dirty MaaS source: $MAAS_CONTROLLER_REPO" >&2; exit 1; }
-git -C "$MAAS_CONTROLLER_REPO" diff --cached --quiet || { echo "refusing staged MaaS source: $MAAS_CONTROLLER_REPO" >&2; exit 1; }
+if ! git -C "$MAAS_CONTROLLER_REPO" diff --quiet || ! git -C "$MAAS_CONTROLLER_REPO" diff --cached --quiet; then
+  [[ "${OPENSHIFT_E2E_ALLOW_DIRTY_SOURCES:-false}" == true ]] || { echo "refusing dirty MaaS source: $MAAS_CONTROLLER_REPO; set OPENSHIFT_E2E_ALLOW_DIRTY_SOURCES=true only after reviewing it" >&2; exit 1; }
+fi
 RESOLVED_CONTROLLER_IMAGE=""
 if [[ -n "$REQUESTED_CONTROLLER_IMAGE" ]]; then
   if [[ "$REQUESTED_CONTROLLER_IMAGE" == *@sha256:* ]]; then
@@ -53,9 +81,18 @@ fi
 {
   printf 'controller_head '; git -C "$ROOT" rev-parse HEAD
   printf 'controller_worktree_diff '; git -C "$ROOT" diff HEAD --binary | sha256sum
-  printf 'praxis_head '; git -C "$PRAXIS_REPO" rev-parse HEAD
-  printf 'praxis_worktree_diff '; git -C "$PRAXIS_REPO" diff HEAD --binary | sha256sum
+  printf 'controller_untracked_content '; content_hash_untracked "$ROOT"
+  printf 'controller_untracked_manifest\n'; content_manifest_untracked "$ROOT"
+  printf 'extproc_remote '; git -C "$PRAXIS_EXTPROC_REPO" remote get-url origin
   printf 'extproc_head '; git -C "$PRAXIS_EXTPROC_REPO" rev-parse HEAD
+  printf 'extproc_worktree_diff '; git -C "$PRAXIS_EXTPROC_REPO" diff HEAD --binary | sha256sum
+  printf 'extproc_untracked_content '; content_hash_untracked "$PRAXIS_EXTPROC_REPO"
+  printf 'extproc_untracked_manifest\n'; content_manifest_untracked "$PRAXIS_EXTPROC_REPO"
+  printf 'maas_remote '; git -C "$MAAS_CONTROLLER_REPO" remote get-url origin
+  printf 'maas_head '; git -C "$MAAS_CONTROLLER_REPO" rev-parse HEAD
+  printf 'maas_worktree_diff '; git -C "$MAAS_CONTROLLER_REPO" diff HEAD --binary | sha256sum
+  printf 'maas_untracked_content '; content_hash_untracked "$MAAS_CONTROLLER_REPO"
+  printf 'maas_untracked_manifest\n'; content_manifest_untracked "$MAAS_CONTROLLER_REPO"
   printf 'katan_source_commit a5a47568ac6daf1d4bd8b356e7b350cce9ceca2a\n'
 } >"$OUT/source-shas.txt"
 
@@ -85,7 +122,14 @@ check_run_ns "$OPENSHIFT_E2E_BACKEND_NAMESPACE"
 ensure_shared_ns maas-system
 ensure_shared_ns ai-tenants
 RENDER_DIR="$OUT/rendered-manifests"
-export OPENSHIFT_E2E_RUN_ID OPENSHIFT_E2E_CONTROLLER_NAMESPACE OPENSHIFT_E2E_BACKEND_NAMESPACE
+IMAGE_PROJECT=${OPENSHIFT_E2E_IMAGE_PROJECT:-$OPENSHIFT_E2E_BACKEND_NAMESPACE}
+export OPENSHIFT_E2E_RUN_ID OPENSHIFT_E2E_CONTROLLER_NAMESPACE OPENSHIFT_E2E_BACKEND_NAMESPACE OPENSHIFT_E2E_IMAGE_PROJECT
+run_env_tmp="$STATE/run.env.tmp.$$"
+sed "s#^export OPENSHIFT_E2E_IMAGE_PROJECT=.*#export OPENSHIFT_E2E_IMAGE_PROJECT=$IMAGE_PROJECT#" "$STATE/run.env" >"$run_env_tmp"
+if ! grep -q '^export OPENSHIFT_E2E_IMAGE_PROJECT=' "$run_env_tmp"; then
+  printf 'export OPENSHIFT_E2E_IMAGE_PROJECT=%s\n' "$IMAGE_PROJECT" >>"$run_env_tmp"
+fi
+mv "$run_env_tmp" "$STATE/run.env"
 export OPENSHIFT_E2E_TENANT_NAMESPACE OPENSHIFT_E2E_GATEWAY_NAME OPENSHIFT_E2E_GATEWAY_NAMESPACE OPENSHIFT_E2E_GATEWAY_CLASS
 export OPENSHIFT_E2E_GATEWAY_TLS_SECRET
 # Install the controller's additive development/test CRD package before any
@@ -133,11 +177,9 @@ rm -rf "$TLS_DIR"
 REGISTRY=${OPENSHIFT_E2E_REGISTRY:-$(cat "$OUT/../bootstrap/registry-host.txt")}
 REGISTRY=${REGISTRY#https://}
 REGISTRY=${REGISTRY%/}
-IMAGE_PROJECT=${OPENSHIFT_E2E_IMAGE_PROJECT:-$OPENSHIFT_E2E_BACKEND_NAMESPACE}
 PULL_REGISTRY="image-registry.openshift-image-registry.svc:5000"
 PULL_SECRET="xmp-registry-pull-$OPENSHIFT_E2E_RUN_ID"
 CONTROLLER_IMAGE="${RESOLVED_CONTROLLER_IMAGE:-$PULL_REGISTRY/$IMAGE_PROJECT/ai-gateway-controller:$OPENSHIFT_E2E_RUN_ID}"
-PRAXIS_IMAGE="$PULL_REGISTRY/$IMAGE_PROJECT/praxis-ai:$OPENSHIFT_E2E_RUN_ID"
 EXTPROC_IMAGE="$PULL_REGISTRY/$IMAGE_PROJECT/praxis-extproc:$OPENSHIFT_E2E_RUN_ID"
 KATAN_IMAGE="${KATAN_IMAGE:-ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a}"
 MAAS_API_IMAGE="$PULL_REGISTRY/$IMAGE_PROJECT/maas-api:$OPENSHIFT_E2E_RUN_ID"
@@ -182,7 +224,7 @@ attach_pull_secret_to_sa() {
 rm -f "$PULL_AUTHFILE"
 unset TOKEN
 BUILD_FLAGS=(--platform linux/amd64 --provenance=false --sbom=false)
-BUILD_IMAGES=("$CONTROLLER_IMAGE" "$PRAXIS_IMAGE" "$EXTPROC_IMAGE" "$MAAS_API_IMAGE" "$MAAS_CONTROLLER_IMAGE")
+BUILD_IMAGES=("$CONTROLLER_IMAGE" "$EXTPROC_IMAGE" "$MAAS_API_IMAGE" "$MAAS_CONTROLLER_IMAGE")
 CONTROLLER_IMAGE_EXTERNAL=false
 [[ "$CONTROLLER_IMAGE" == *@sha256:* ]] && CONTROLLER_IMAGE_EXTERNAL=true
 if [[ -n "$REQUESTED_CONTROLLER_IMAGE" ]]; then
@@ -200,12 +242,11 @@ else
   else
     printf 'using externally supplied digest-pinned controller image: %s\n' "$CONTROLLER_IMAGE" >"$OUT/build-controller.log"
   fi
-  docker build "${BUILD_FLAGS[@]}" -t "$PRAXIS_IMAGE" -f "$PRAXIS_REPO/Containerfile" "$PRAXIS_REPO" >"$OUT/build-praxis.log" 2>&1
   docker build "${BUILD_FLAGS[@]}" -t "$EXTPROC_IMAGE" -f "$PRAXIS_EXTPROC_REPO/Containerfile" "$PRAXIS_EXTPROC_REPO" >"$OUT/build-extproc.log" 2>&1
   docker build "${BUILD_FLAGS[@]}" -t "$MAAS_API_IMAGE" -f "$MAAS_CONTROLLER_REPO/maas-api/Dockerfile" "$MAAS_CONTROLLER_REPO/maas-api" >"$OUT/build-maas-api.log" 2>&1
   docker build "${BUILD_FLAGS[@]}" -t "$MAAS_CONTROLLER_IMAGE" -f "$MAAS_CONTROLLER_REPO/maas-controller/Dockerfile" "$MAAS_CONTROLLER_REPO" >"$OUT/build-maas-controller.log" 2>&1
 fi
-for image in "$CONTROLLER_IMAGE" "$PRAXIS_IMAGE" "$EXTPROC_IMAGE" "$MAAS_API_IMAGE" "$MAAS_CONTROLLER_IMAGE"; do
+for image in "$CONTROLLER_IMAGE" "$EXTPROC_IMAGE" "$MAAS_API_IMAGE" "$MAAS_CONTROLLER_IMAGE"; do
   # A digest override is already an immutable deployment input. This covers
   # both public digests and a previously published run-owned internal digest;
   # never attempt docker save/push against a registry-only reference.
@@ -220,7 +261,7 @@ for image in "$CONTROLLER_IMAGE" "$PRAXIS_IMAGE" "$EXTPROC_IMAGE" "$MAAS_API_IMA
 done
 # Deploy registry images by their resolved manifest digests. Tags remain only
 # as push inputs; this prevents node pulls from changing after qualification.
-for image_var in CONTROLLER_IMAGE PRAXIS_IMAGE EXTPROC_IMAGE MAAS_API_IMAGE MAAS_CONTROLLER_IMAGE; do
+for image_var in CONTROLLER_IMAGE EXTPROC_IMAGE MAAS_API_IMAGE MAAS_CONTROLLER_IMAGE; do
   image_ref=${!image_var}
   if [[ "$image_ref" == *@sha256:* ]]; then
     printf '%s=%s\n' "$image_var" "$image_ref" >>"$OUT/image-digests.txt"
@@ -432,7 +473,11 @@ rm -f "$RESOLVED_PULL_AUTHFILE"
 # Persist MaaS's resolved namespace for inspect/destroy and subsequent
 # commands. The preflight value is only a provisional name.
 run_env_tmp="$STATE/run.env.tmp.$$"
-sed "s#^OPENSHIFT_E2E_TENANT_NAMESPACE=.*#OPENSHIFT_E2E_TENANT_NAMESPACE=$OPENSHIFT_E2E_TENANT_NAMESPACE#" "$STATE/run.env" >"$run_env_tmp"
+# preflight writes exported assignments. Preserve that form when replacing the
+# provisional namespace with MaaS's resolved tenant namespace; otherwise the
+# next script sources the stale generated namespace and waits forever on the
+# wrong namespace.
+sed "s#^export OPENSHIFT_E2E_TENANT_NAMESPACE=.*#export OPENSHIFT_E2E_TENANT_NAMESPACE=$OPENSHIFT_E2E_TENANT_NAMESPACE#" "$STATE/run.env" >"$run_env_tmp"
 mv "$run_env_tmp" "$STATE/run.env"
 
 # The source-matched shared MaaS AITenant provides the canonical callback
@@ -539,7 +584,7 @@ done
 
 ROLE_NAME="xmp-controller-role-$OPENSHIFT_E2E_RUN_ID"
 sed "0,/name: ai-gateway-controller-role/s//name: $ROLE_NAME/" "$ROOT/config/self/rbac/clusterrole.yaml" | sed "/^  name: $ROLE_NAME$/a\\  labels:\n    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID\n    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e" | "${OC[@]}" apply -f -
-export ROLE_NAME CONTROLLER_IMAGE EXTPROC_IMAGE PRAXIS_IMAGE OPENSHIFT_E2E_GATEWAY_NAME OPENSHIFT_E2E_GATEWAY_NAMESPACE
+export ROLE_NAME CONTROLLER_IMAGE EXTPROC_IMAGE OPENSHIFT_E2E_GATEWAY_NAME OPENSHIFT_E2E_GATEWAY_NAMESPACE
 "$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 20-controller.yaml.tmpl >"$OUT/render-manifests-controller.log"
 apply_rendered 20-controller.yaml
 attach_pull_secret_to_sa "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE" ai-gateway-controller
@@ -557,6 +602,54 @@ for provider in a b; do
   cert_keys=$("${OC[@]}" get secret "provider-$provider-tls" -n "$OPENSHIFT_E2E_BACKEND_NAMESPACE" -o json | jq -r '.data | keys | sort | join(",")')
   [[ "$cert_keys" == "tls.crt,tls.key" ]] || { echo "provider-$provider service-ca Secret is incomplete" >&2; exit 1; }
 done
+# Istio's Gateway proxy does not automatically trust OpenShift service-ca.
+# Inject the public service CA into a run-owned ConfigMap in the Gateway
+# namespace and mount it into only this run-owned Gateway deployment. The
+# ExternalModel reference supplies the same absolute path to the generated
+# provider DestinationRules; verification remains enabled and no provider
+# certificate or MaaS-owned workload is modified.
+PROVIDER_CA_CONFIGMAP="xmp-provider-ca-$OPENSHIFT_E2E_RUN_ID"
+PROVIDER_CA_MOUNT_PATH=/etc/external-model-e2e/provider-ca
+PROVIDER_CA_CONFIGMAP_EVIDENCE="$OUT/provider-ca-configmap.json"
+"${OC[@]}" apply -f - >"$OUT/provider-ca-configmap-apply.log" <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: $PROVIDER_CA_CONFIGMAP
+  namespace: $OPENSHIFT_E2E_GATEWAY_NAMESPACE
+  labels:
+    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
+    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
+  annotations:
+    service.beta.openshift.io/inject-cabundle: "true"
+EOF
+PROVIDER_CA_DEADLINE=$((SECONDS + 180))
+while :; do
+  PROVIDER_CA_SIZE=$("${OC[@]}" get configmap "$PROVIDER_CA_CONFIGMAP" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o jsonpath='{.data.service-ca\.crt}' 2>/dev/null | wc -c | tr -d ' ' || true)
+  [[ "$PROVIDER_CA_SIZE" -gt 0 ]] && break
+  if (( SECONDS >= PROVIDER_CA_DEADLINE )); then
+    "${OC[@]}" get configmap "$PROVIDER_CA_CONFIGMAP" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o json >"$OUT/provider-ca-configmap-timeout.json" 2>&1 || true
+    echo "OpenShift did not inject the Gateway provider CA bundle; diagnostics: $OUT/provider-ca-configmap-timeout.json" >&2
+    exit 1
+  fi
+  sleep 2
+done
+"${OC[@]}" get configmap "$PROVIDER_CA_CONFIGMAP" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o json >"$PROVIDER_CA_CONFIGMAP_EVIDENCE"
+mapfile -t PROVIDER_GATEWAY_DEPLOYMENTS < <("${OC[@]}" get deployment -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -l "gateway.networking.k8s.io/gateway-name=$OPENSHIFT_E2E_GATEWAY_NAME" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+[[ "${#PROVIDER_GATEWAY_DEPLOYMENTS[@]}" -eq 1 ]] || {
+  echo "expected exactly one run Gateway deployment for provider CA mount, found ${#PROVIDER_GATEWAY_DEPLOYMENTS[@]}" >&2
+  exit 1
+}
+PROVIDER_GATEWAY_DEPLOYMENT=${PROVIDER_GATEWAY_DEPLOYMENTS[0]}
+"${OC[@]}" get deployment "$PROVIDER_GATEWAY_DEPLOYMENT" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o json >"$OUT/gateway-deployment-before-provider-ca.json"
+jq -e --arg run "$OPENSHIFT_E2E_RUN_ID" '.metadata.labels["external-model-praxis.opendatahub.io/run-id"] == $run' "$OUT/gateway-deployment-before-provider-ca.json" >/dev/null || {
+  echo "refusing to patch a Gateway deployment not owned by this run" >&2
+  exit 1
+}
+PROVIDER_GATEWAY_PATCH=$(jq -cn --arg cm "$PROVIDER_CA_CONFIGMAP" --arg mount "$PROVIDER_CA_MOUNT_PATH" '{spec:{template:{spec:{volumes:[{name:"external-model-provider-ca",configMap:{name:$cm}}],containers:[{name:"istio-proxy",volumeMounts:[{name:"external-model-provider-ca",mountPath:$mount,readOnly:true}]}]}}}}')
+"${OC[@]}" patch deployment "$PROVIDER_GATEWAY_DEPLOYMENT" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" --type=strategic -p "$PROVIDER_GATEWAY_PATCH" >"$OUT/gateway-provider-ca-patch.log"
+"${OC[@]}" rollout status deployment/"$PROVIDER_GATEWAY_DEPLOYMENT" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" --timeout=180s >"$OUT/gateway-provider-ca-rollout.log"
+printf 'configmap=%s\nnamespace=%s\nmount_path=%s\ndeployment=%s\nbytes=%s\n' "$PROVIDER_CA_CONFIGMAP" "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" "$PROVIDER_CA_MOUNT_PATH" "$PROVIDER_GATEWAY_DEPLOYMENT" "$PROVIDER_CA_SIZE" >"$OUT/provider-ca-mount.txt"
 "${OC[@]}" apply -f - <<EOF
 apiVersion: v1
 kind: Secret
@@ -604,18 +697,18 @@ while :; do
   sleep 3
 done
 for _ in $(seq 1 60); do
-  praxis_sa=$("${OC[@]}" get serviceaccount -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app.kubernetes.io/managed-by=ai-gateway-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-  [[ -n "$praxis_sa" ]] && break
+  external_model_sa=$("${OC[@]}" get serviceaccount payload-processing-external-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.metadata.name}' 2>/dev/null || true)
+  [[ -n "$external_model_sa" ]] && break
   sleep 2
 done
-[[ -n "${praxis_sa:-}" ]] || { echo "controller did not create a tenant Praxis ServiceAccount" >&2; exit 1; }
-attach_pull_secret_to_sa "$OPENSHIFT_E2E_TENANT_NAMESPACE" "$praxis_sa"
-"${OC[@]}" apply -f - >"$OUT/image-puller-resolved-tenant.log" <<EOF
+[[ -n "${external_model_sa:-}" ]] || { echo "controller did not create the tenant-local ExternalModel ExtProc ServiceAccount" >&2; exit 1; }
+attach_pull_secret_to_sa "$OPENSHIFT_E2E_TENANT_NAMESPACE" "$external_model_sa"
+"${OC[@]}" apply -f - >>"$OUT/image-puller-resolved-tenant.log" <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: image-puller-resolved-tenant-$OPENSHIFT_E2E_RUN_ID
-  namespace: $OPENSHIFT_E2E_BACKEND_NAMESPACE
+  name: image-puller-$external_model_sa-$OPENSHIFT_E2E_RUN_ID
+  namespace: $IMAGE_PROJECT
   labels:
     external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID
     app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
@@ -625,48 +718,30 @@ roleRef:
   name: system:image-puller
 subjects:
 - kind: ServiceAccount
-  name: $praxis_sa
+  name: $external_model_sa
   namespace: $OPENSHIFT_E2E_TENANT_NAMESPACE
 EOF
-# The Praxis Deployment may have been created before the resolved-tenant
-# image-puller binding existed.  Restart it through its normal Deployment
-# lifecycle after the exact ServiceAccount authorization is in place; this is
-# required for an idempotent retry of an ImagePullBackOff, before qualification
-# records workload identity.
-if "${OC[@]}" get deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o name 2>/dev/null | grep -q .; then
-  # Katan's service-ca certificate is valid but is not part of Praxis's base
-  # image trust store. Build a combined run-owned bundle rather than replacing
-  # the image's public CA bundle: external providers such as api.openai.com
-  # must continue to use normal public certificate verification. This is
-  # fixture plumbing only; it does not change controller-rendered TLS or
-  # disable certificate verification.
-  PROVIDER_CA_CONFIGMAP="xmp-provider-ca-$OPENSHIFT_E2E_RUN_ID"
-  PROVIDER_CA_BUNDLE=$(mktemp "$STATE/.provider-ca-bundle.XXXXXX")
-  PROVIDER_CA_SERVICE=$(mktemp "$STATE/.provider-service-ca.XXXXXX")
-  praxis_pod=""
-  PROVIDER_CA_COLLECTION_LOG="$OUT/provider-ca-collection.log"
-  : >"$PROVIDER_CA_COLLECTION_LOG"
-  provider_ca_ready=false
-  for _ in $(seq 1 120); do
-    praxis_pod=$("${OC[@]}" get pod -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-    if [[ -n "$praxis_pod" ]] && "${OC[@]}" exec "$praxis_pod" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- \
-      sh -c 'cat /etc/ssl/certs/ca-certificates.crt' >"$PROVIDER_CA_BUNDLE" 2>>"$PROVIDER_CA_COLLECTION_LOG" && [[ -s "$PROVIDER_CA_BUNDLE" ]]; then
-      provider_ca_ready=true
-      break
-    fi
-    sleep 2
-  done
-  [[ "$provider_ca_ready" == true ]] || { echo "Praxis container was not ready to collect the base CA bundle; diagnostics: $PROVIDER_CA_COLLECTION_LOG" >&2; exit 1; }
-  "${OC[@]}" get configmap openshift-service-ca.crt -n "$OPENSHIFT_E2E_BACKEND_NAMESPACE" \
-    -o jsonpath='{.data.service-ca\.crt}' >"$PROVIDER_CA_SERVICE"
-  cat "$PROVIDER_CA_SERVICE" >>"$PROVIDER_CA_BUNDLE"
-  "${OC[@]}" create configmap "$PROVIDER_CA_CONFIGMAP" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" \
-    --from-file=ca-bundle.crt="$PROVIDER_CA_BUNDLE" \
-    --dry-run=client -o yaml | "${OC[@]}" apply -f - >"$OUT/provider-ca-configmap.log"
-  PROVIDER_CA_PATCH=$(jq -cn --arg cm "$PROVIDER_CA_CONFIGMAP" '{spec:{template:{spec:{containers:[{name:"praxis",env:[{name:"SSL_CERT_FILE",value:"/etc/praxis/provider-ca/ca-bundle.crt"}],volumeMounts:[{name:"provider-ca",mountPath:"/etc/praxis/provider-ca",readOnly:true}]}],volumes:[{name:"provider-ca",configMap:{name:$cm}}]}}}}')
-  "${OC[@]}" patch deployment praxis -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --type=strategic -p "$PROVIDER_CA_PATCH" >"$OUT/provider-ca-patch.log"
-  "${OC[@]}" rollout restart deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis >"$OUT/praxis-rollout-retry.log"
-  "${OC[@]}" rollout status deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis --timeout=300s >>"$OUT/praxis-rollout-retry.log"
+# Pods copy imagePullSecrets from their ServiceAccount only at creation time.
+# Restart only the run-owned ExternalModel ExtProc workload after its exact
+# binding and pull secret are present. The shared MaaS/KServe workload is not
+# restarted or mutated by this harness.
+"${OC[@]}" rollout restart deployment/payload-processing-external-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" >>"$OUT/restart-tenant-extproc.log"
+# ExtProc-only dataplane: the shared MaaS/KServe pre-auth workload remains in
+# the Gateway namespace, while the controller-owned ExternalModel workload
+# and its routing/credential mounts live in the resolved tenant namespace.
+# There is intentionally no standalone dataplane image, Deployment, Service,
+# or trust-bundle patch in
+# this workflow.
+for _ in $(seq 1 150); do
+  pre_ready=$("${OC[@]}" get deployment payload-pre-processing -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o json 2>/dev/null | jq -r '.status.availableReplicas == 1' || true)
+  external_model_ready=$("${OC[@]}" get deployment payload-processing-external-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json 2>/dev/null | jq -r '.status.availableReplicas == 1' || true)
+  [[ "$pre_ready" == true && "$external_model_ready" == true ]] && break
+  sleep 2
+done
+[[ "${pre_ready:-false}" == true && "${external_model_ready:-false}" == true ]] || { echo "shared pre-auth and ExternalModel ExtProc workloads did not become Ready" >&2; exit 1; }
+if "${OC[@]}" get deployment praxis -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o name 2>/dev/null | grep -q .; then
+  echo "legacy standalone dataplane Deployment exists in an ExtProc-only run" >&2
+  exit 1
 fi
 "${OC[@]}" get deployment,service,externalmodel,externalprovider -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json >"$OUT/tenant-after-fixtures.json"
 
@@ -684,6 +759,7 @@ export CLIENT_CA_CONFIGMAP
 export EXTERNAL_MODEL_CLIENT_NAME="xmp-client-$OPENSHIFT_E2E_RUN_ID"
 export EXTERNAL_MODEL_CLIENT_NAMESPACE="$OPENSHIFT_E2E_TENANT_NAMESPACE"
 export EXTERNAL_MODEL_CLIENT_IMAGE='curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b'
+export EXTERNAL_MODEL_CLIENT_RUN_AS_NON_ROOT=true
 export EXTERNAL_MODEL_CLIENT_VOLUME_MOUNTS='[{name: gateway-ca, mountPath: /etc/xmp/ca, readOnly: true}]'
 export EXTERNAL_MODEL_CLIENT_VOLUMES="[{name: gateway-ca, configMap: {name: $CLIENT_CA_CONFIGMAP}}]"
 "$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" client.yaml.tmpl >"$OUT/render-manifests-client.log"

@@ -75,7 +75,11 @@ type Credential struct {
 // wire vocabulary cannot yet express every CRD auth type (see strategyFor),
 // so mislabeling would be a lie the digest happily hashes.
 type Candidate struct {
-	Cluster    string      `json:"cluster"`
+	Cluster string `json:"cluster"`
+	// StableID is the trusted provider-handoff value emitted by ExtProc.
+	// It is explicit so the Envoy route match and the overlay use one
+	// content-addressed identity rather than separate derivations.
+	StableID   string      `json:"stable_id,omitempty"`
 	Kind       string      `json:"kind"` // inference_model | mcp_tool
 	Name       string      `json:"name"`
 	Site       string      `json:"site"`
@@ -134,9 +138,9 @@ var (
 
 // Options carries the non-derivable inputs so Render stays pure.
 type Options struct {
-	// KnownClusters is the declared load_balancer cluster allowlist
-	// (renderer validation mode, port plan R2). Empty disables the check
-	// — the reconciler must pass the real list in production.
+	// KnownClusters is an optional administrative load_balancer cluster
+	// allowlist. Empty derives the cluster set from the resolved provider
+	// routes; when supplied, it remains an upper-bound validation check.
 	KnownClusters []string
 	// SourceUID uniquely identifies the source of truth (e.g. cluster+ns).
 	SourceUID string
@@ -185,11 +189,12 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 			// match resolver.Route.ClientName and the HTTPRoute body/header
 			// matches; the ExternalModel object name is control-plane identity.
 			cand := Candidate{
-				Cluster: r.Cluster,
-				Kind:    "inference_model",
-				Name:    r.ClientName,
-				Site:    scope.LocalSite,
-				Fresh:   true,
+				Cluster:  r.Cluster,
+				StableID: "provider-" + r.Provider,
+				Kind:     "inference_model",
+				Name:     r.ClientName,
+				Site:     scope.LocalSite,
+				Fresh:    true,
 			}
 			strategy, err := strategyFor(r)
 			if err != nil {
@@ -267,6 +272,13 @@ func strategyFor(route resolver.Route) (string, error) {
 	default:
 		return "", fmt.Errorf("envelope: unknown auth.type %q", route.AuthType)
 	}
+}
+
+// CredentialStrategy exposes the same provider/API-format credential mapping
+// used by Render to the tenant reconciler when it preloads unselected
+// bindings into the ExtProc runtime configuration.
+func CredentialStrategy(route resolver.Route) (string, error) {
+	return strategyFor(route)
 }
 
 func checkUniformWeights(m resolver.ModelRoutes) error {

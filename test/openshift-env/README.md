@@ -1,7 +1,7 @@
-# OpenShift External Model and Praxis validation
+# OpenShift ExternalModel ExtProc validation
 
 This directory provides a controller-owned OpenShift test environment for the
-External Model to Praxis integration. It installs the required test stack,
+ExternalModel-to-ExtProc integration. It installs the required test stack,
 deploys source-matched components, exercises the real Gateway request path, and
 records evidence without changing production manifests.
 
@@ -9,7 +9,8 @@ The intended request path is:
 
 ```text
 client -> OpenShift load balancer -> Gateway/Envoy -> Kuadrant/Authorino
-       -> Praxis ExtProc -> tenant-local Praxis -> external provider fixture
+       -> pre-auth ExtProc -> MaaS/Authorino -> post-auth ExtProc
+       -> selected provider Service/external provider
 ```
 
 The scripts are for disposable OpenShift qualification environments. They do
@@ -21,18 +22,18 @@ a shared or production cluster.
 The executable suite validates the following behavior with real requests and
 state-based checks:
 
-- controller, tenant, ExternalProvider, ExternalModel, HTTPRoute, ExtProc, and
-  Praxis readiness;
+- controller, tenant, ExternalProvider, ExternalModel, HTTPRoute, and
+  namespace-split pre-auth/post-auth ExtProc readiness;
 - verified TLS at the public Gateway;
 - unauthenticated requests are rejected;
 - MaaS API-key creation, use, and revocation;
 - authenticated routing to two credential-enforcing provider fixtures;
-- provider selection changes without restarting Praxis;
+- provider selection changes without restarting post-auth ExtProc;
 - unknown-model handling;
 - semantic configuration no-op behavior;
 - invalid-overlay last-known-good behavior;
 - declared, recomputed, and mounted overlay convergence;
-- tenant Praxis ServiceAccount denial of Secret API access;
+- tenant post-auth ExtProc ServiceAccount denial of Secret API access;
 - credential-pattern scans over functional evidence; and
 - reset to the first provider after validation.
 
@@ -55,7 +56,7 @@ resources, and evidence. These resources carry the run identifier and may be
 removed only after their ownership is verified.
 
 Shared resources include platform CRDs, the shared MaaS AITenant, platform
-namespaces, Istio, Kuadrant, Authorino, Limitador, KServe, and other installed
+namespaces, Istio, Kuadrant, Authorino, Limitador, and other installed
 operators. The harness may configure a documented shared resource when required
 for qualification, but it must first record its identity and original state.
 Cleanup restores that state instead of deleting the shared resource.
@@ -94,9 +95,7 @@ The scripts expect sibling source checkouts for:
 
 - ai-gateway-controller;
 - models-as-a-service;
-- Praxis AI;
 - Praxis ExtProc;
-- KServe;
 - Kuadrant Operator; and
 - LLM-Katan source provenance.
 
@@ -131,18 +130,16 @@ stored as evidence.
 Set source roots to pinned checkouts:
 
 ```sh
-export PRAXIS_REPO=/path/to/praxis-ai
 export PRAXIS_EXTPROC_REPO=/path/to/praxis-extproc
 export MAAS_CONTROLLER_REPO=/path/to/models-as-a-service
-export KSERVE_REPO=/path/to/kserve
 export KUADRANT_OPERATOR_REPO=/path/to/kuadrant-operator
 ```
 
 For current qualification, `MAAS_CONTROLLER_REPO` must be a clean checkout
-of the merged `main` branch. Praxis AI and Praxis ExtProc are built from their
+of the merged `main` branch. Praxis ExtProc is built from its
 checked-out integration sources; record the intended branch or detached
-revision before provisioning. KServe and Kuadrant remain pinned dependency
-checkouts selected by the bootstrap workflow. The harness checks dependency
+revision before provisioning. Kuadrant remains a pinned dependency checkout
+selected by the bootstrap workflow. The harness checks dependency
 cleanliness and records source identity, but it does not silently switch a
 dirty checkout or infer that a branch name is equivalent to a source pin.
 
@@ -154,8 +151,9 @@ mutable tag is never qualification evidence. A cold-fetch workflow must select
 the configured branch or revision directly and repeat the same provenance
 capture.
 
-The Praxis ExtProc and MaaS checkouts must be clean. The controller and Praxis
-worktree hashes are recorded when local changes are intentionally qualified.
+The Praxis ExtProc and MaaS checkouts must be clean. The controller worktree
+hash is recorded when local changes are intentionally qualified. Standalone
+Praxis AI is not built or deployed by this ExtProc-only workflow.
 
 The supported controller image override must be an immutable digest:
 
@@ -165,14 +163,14 @@ export KATAN_IMAGE='ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c
 ```
 
 When the controller override is omitted, provisioning builds it from the
-current checkout. Praxis, ExtProc, MaaS API, and MaaS controller are built from
+current checkout. ExtProc, MaaS API, and MaaS controller are built from
 their configured source checkouts. Provisioning publishes these images to a
 run-owned registry project, resolves their pushed digests, and deploys those
 digests.
 
 ## MaaS compatibility proof
 
-OpenShift qualification requires a MaaS controller that implements the Praxis
+OpenShift qualification requires a MaaS controller that implements the ExtProc
 opt-in contract. `preflight.sh` requires immutable proof for:
 
 - the `maas.opendatahub.io/payload-processing-type: praxis` selection;
@@ -218,7 +216,7 @@ operator and operand provenance.
 
 `provision.sh` builds or resolves images, configures registry access, applies
 controller CRDs before fixtures, deploys the source-matched MaaS and controller
-components, prepares the shared MaaS AITenant for Praxis, and creates the provider and
+components, prepares the shared MaaS AITenant for the ExtProc dataplane, and creates the provider and
 authorization fixtures.
 
 The MaaS overlay merges the run-specific immutable image inputs into the
@@ -229,15 +227,15 @@ failure. If a future MaaS revision removes the source generator, update the
 overlay against that source revision and record the change before provisioning;
 do not repair this with an untracked live ConfigMap.
 
-### Praxis handoff and protected gateway namespaces
+### ExtProc handoff and protected gateway namespaces
 
-For a controlled handoff, keep the Praxis annotation on the existing AITenant
+For a controlled handoff, keep the ExtProc dataplane annotation on the existing AITenant
 and start a MaaS build that publishes
 `status.conditions[type=IPPResourcesReleased].status=True` after its
 ownership-gated IPP writers and conflicting routes are gone. The AI Gateway
 controller waits for that condition (and understands the existing cleanup
-marker published by earlier MaaS builds) before creating same-named Praxis
-payload-processing resources. Do not first restore IPP from saved YAML, add
+marker published by earlier MaaS builds) before creating tenant-local ExtProc
+resources. Do not first restore IPP from saved YAML, add
 ownership metadata by hand, or run two routing-state writers at once.
 
 Managed OpenShift installations may reject a controller-created
@@ -262,9 +260,24 @@ never displayed.
 The narrative follows the real request path:
 
 ```text
-client -> Gateway/Envoy -> Kuadrant/Authorino -> Praxis ExtProc
-       -> tenant-local Praxis -> credential-enforcing provider fixture
+client -> Gateway/Envoy -> pre-auth ExtProc -> Kuadrant/Authorino
+       -> tenant-local post-auth ExtProc -> credential-enforcing provider fixture
 ```
+
+The ExternalModel post-auth ExtProc runs in the resolved tenant namespace as
+the tenant-local `payload-processing-external-model` Deployment and
+ServiceAccount. This is deliberately different from MaaS's shared
+`payload-processing` workload: MaaS's IPP reader binding may grant that shared
+account Secret-read permissions. The ExternalModel ServiceAccount has no
+Kubernetes Secret API binding; provider credentials are available only as
+kubelet-projected files from the explicitly referenced tenant Secret. The
+pre-auth ExtProc retains its Gateway-side ServiceAccount and resources. The
+shared `payload-processing` Deployment, Service, plugin ConfigMap,
+DestinationRule, and EnvoyFilter remain in the namespace and TLS identity
+rendered by MaaS; the controller does not retarget that KServe/MaaS chain when
+it creates the tenant-local ExternalModel copy. The E2E checks the exact
+ExternalModel post-auth ServiceAccount with `oc auth
+can-i`; a failure at that boundary stops qualification.
 
 Provider A and Provider B are controlled test endpoints used to demonstrate a
 declared routing update. They are not a load-balancing or automatic-failover
@@ -300,10 +313,24 @@ endpoint as the authoritative HTTP authority, uses its hostname only for TLS
 SNI, and preserves an explicit port in the dial endpoint (the OpenShift
 fixtures use `:443`). The OpenShift E2E captures and checks the mounted
 `praxis-config` before requests. TLS verification is never disabled. Katan
-listens on unprivileged container port `8443`; its Service exposes port `443`,
-and the service-ca certificate is mounted into the fixture and the run-owned
-Praxis trust bundle. Direct credential probes therefore use the same
-hostname-verified HTTPS path as routed requests.
+listens on unprivileged container port `8443`; its Service exposes port `443`.
+
+The OpenShift service-ca handoff is performed by `provision.sh` after both
+provider serving certificates exist:
+
+1. a run-owned ConfigMap in the Gateway namespace receives the injected
+   OpenShift service CA;
+2. the uniquely run-labeled Gateway deployment is ownership-checked and the
+   CA is mounted into its `istio-proxy` container;
+3. each run-owned ExternalModel provider reference declares the absolute CA
+   path, so the controller renders it into the provider DestinationRule; and
+4. the Envoy config dump is checked for the provider FQDN, hostname-only SNI,
+   and file-root validation context before E2E requests.
+
+The resulting path is verified TLS from Gateway Envoy to Katan. Cleanup
+deletes the ConfigMap only after checking its run labels. This is fixture
+plumbing for service-ca-issued test certificates, not a production trust-path
+change.
 
 Katan is a test-only OpenAI Chat Completions fixture. It receives its
 fixture credential through the run-owned tenant Secret/configuration path;
@@ -327,7 +354,7 @@ Render the narrative from the finalized qualification evidence after the
 qualification completes:
 
 ```sh
-source "$OPENSHIFT_E2E_STATE/run.env"
+set -a; source "$OPENSHIFT_E2E_STATE/run.env"; set +a
 LATEST_EVIDENCE=$(find "$OPENSHIFT_E2E_EVIDENCE_ROOT" -mindepth 1 -maxdepth 1 \
   -type d -name 'e2e-*' -print | sort | tail -n 1)
 ./test/openshift-env/demo.sh --non-interactive --evidence "$LATEST_EVIDENCE"
@@ -337,7 +364,7 @@ To intentionally run a new qualification and render it in one command:
 
 ```sh
 ./test/openshift-env/e2e.sh
-source "$OPENSHIFT_E2E_STATE/run.env"
+set -a; source "$OPENSHIFT_E2E_STATE/run.env"; set +a
 LATEST_EVIDENCE=$(find "$OPENSHIFT_E2E_EVIDENCE_ROOT" -mindepth 1 -maxdepth 1 \
   -type d -name 'e2e-*' -print | sort | tail -n 1)
 ./test/openshift-env/demo.sh --non-interactive --evidence "$LATEST_EVIDENCE" \
@@ -384,8 +411,8 @@ The automated install order is intentional:
 3. Install exactly one supported Istio control plane and verify admission TLS.
 4. Install the pinned Kuadrant catalog without a Sail-created Istio instance.
 5. Verify Kuadrant, Authorino, and Limitador operator and runtime provenance.
-6. Install or verify KServe and the MaaS CRDs and RBAC.
-7. Build and publish source-matched MaaS, controller, Praxis, and ExtProc images.
+6. Install or verify the MaaS CRDs and RBAC.
+7. Build and publish source-matched MaaS, controller, and ExtProc images.
 8. Grant exact ServiceAccounts access to the run-owned registry project.
 9. Deploy images by resolved digest and wait for rollouts.
 10. Apply controller-owned CRDs before creating ExternalProvider or
@@ -394,8 +421,10 @@ The automated install order is intentional:
 12. Apply the Praxis opt-in and wait for the resolved tenant namespace.
 13. Create provider, subscription, policy, Gateway, and TLS fixtures.
 14. Wait for policies, routes, overlays, mounts, and workloads to converge.
-15. Run functional qualification and the narrative demo.
-16. Reset routing, inspect evidence, and perform ownership-checked cleanup.
+15. Confirm the post-auth ExtProc ServiceAccount has no Secret API access and
+    that no owned stale binding to the shared MaaS reader role remains.
+16. Run functional qualification and the narrative demo.
+17. Reset routing, inspect evidence, and perform ownership-checked cleanup.
 
 ## External Model resources and rendering
 
@@ -489,14 +518,18 @@ not manufacture authorization responses, disable verification, redirect calls
 between tenants, or conceal a failed MaaS callback.
 
 This adapter does not prove multi-tenant callback dispatch. That remains a
-separate MaaS integration concern shared by IPP and Praxis paths.
+separate MaaS integration concern shared by IPP and ExtProc paths.
 
 ## Registry authorization
 
 Attaching a pull Secret to a ServiceAccount does not by itself grant access to
 an OpenShift image stream. Provisioning creates a run-specific pull Secret and
-an exact `system:image-puller` RoleBinding in the image project for each
-ServiceAccount that needs an image.
+an exact `system:image-puller` RoleBinding in the run-owned image project for
+each ServiceAccount that needs an image. The image project is
+`OPENSHIFT_E2E_IMAGE_PROJECT` when supplied; otherwise the harness uses the
+run-owned backend namespace. The tenant post-auth and ExternalModel
+ServiceAccounts are both bound after the controller creates them, before their
+Deployments are accepted as Ready.
 
 Before accepting a rollout, the harness records:
 
@@ -519,7 +552,7 @@ Provider A and Provider B exist to prove a routing change, not load balancing
 or latency behavior. Both providers are declared before the baseline request.
 The ExternalModel initially selects Provider A, then changes to Provider B. The
 suite verifies overlay convergence, Provider B attribution, and an unchanged
-Praxis pod identity and restart count.
+ExternalModel ExtProc pod identity and restart count.
 
 The qualified credential mapping is deliberately narrow:
 
@@ -527,31 +560,52 @@ The qualified credential mapping is deliberately narrow:
 provider type: openai
 API format:    openai-chat
 CRD auth type: apikey
-Praxis action: inject the projected token as a bearer credential
+ExtProc action: inject the projected token as a bearer credential
 ```
 
-The overlay contains only a Secret reference. Secret bytes reach Praxis through
-a tenant-local projected volume. Unsupported provider/API combinations, SigV4,
+The overlay contains only a Secret reference. Secret bytes reach the tenant-local
+ExtProc workload through a projected volume. Unsupported provider/API combinations, SigV4,
 OAuth2, and unknown authentication types fail closed.
 
 ## Overlay convergence
 
-Before sending a request after a provider change, the suite requires two stable
+Before sending a request after provisioning, a provider change, a reset, a
+semantic no-op, or invalid-overlay recovery, the suite requires two stable
 observations of all of the following:
 
 - the expected provider in the controller ConfigMap;
 - the expected overlay generation and declared digest;
 - semantic digest recomputation using the controller implementation;
-- the same digest and provider in the file mounted by Praxis; and
-- stable Praxis pod identity and restart count.
+- the same digest and provider in the file mounted by ExternalModel ExtProc; and
+- the accepted and serving overlay revisions reported by the live ExtProc
+  process, when that signal is available; and
+- stable ExternalModel ExtProc pod identity and restart count.
 
-This prevents a request from racing ahead of the projected ConfigMap update.
+This prevents a request from racing ahead of either the projected ConfigMap
+update or the ExtProc overlay watcher. The revision observation is saved as
+`extproc-overlay-revision.txt` in the assertion evidence.
 Raw file hashes are not equivalent to the controller's semantic digest and must
 not be substituted.
 
 ## Evidence and result rules
 
 Each run writes to a unique evidence directory under `OPENSHIFT_E2E_STATE`.
+
+This vanilla OpenShift harness qualifies the ExternalModel ExtProc dataplane
+only. Other workload coexistence and platform-operator qualification are
+outside this harness's scope.
+
+The optional `--known-cluster` values are an administrative upper bound for
+overlay validation. The controller derives provider cluster names from the
+resolved ExternalProvider routes, so normal CR-driven installation does not
+require an operator to predeclare every provider cluster.
+
+The default MaaS tenant may resolve to a namespace different from the
+provisional namespace generated during preflight. `provision.sh` persists the
+observed `.status.tenantNamespace` back into `run.env` before rendering tenant
+resources; always source that updated file before running `e2e.sh`, `demo.sh`,
+`inspect.sh`, or `destroy.sh`. The E2E preflight also fails closed if the
+persisted namespace does not match the live AITenant.
 Evidence should include:
 
 - source revisions and dirty-content hashes;
@@ -560,7 +614,7 @@ Evidence should include:
 - readiness and route conditions;
 - sanitized HTTP status and provider attribution;
 - overlay generations and digests;
-- Praxis UID and restart counts;
+- ExternalModel ExtProc UID and restart counts;
 - cleanup results; and
 - a machine-readable assertion result.
 
@@ -568,6 +622,8 @@ An assertion may pass only from an observed result. A received HTTP response is
 never retried. Transport status `000` may be retried only within a bounded
 Gateway readiness probe. Missing functionality must be recorded as
 `NOT_DEMONSTRATED` or a failure, never inferred from another assertion.
+`e2e.sh` exits nonzero for both `FAIL` and `PARTIAL` results; callers must
+inspect `results.json` rather than treating a completed process as a pass.
 
 The exit and signal traps convert an unfinished `RUNNING` result into `FAIL`,
 preserve the active assertion, revoke any active key, and leave existing failed
@@ -600,14 +656,14 @@ For authorization failures, distinguish the stages:
 2. API-key validation callback;
 3. subscription or policy evaluation;
 4. ExtProc processing;
-5. Praxis provider selection and credential injection; and
+5. ExtProc provider selection and credential injection; and
 6. provider response.
 
 Record sanitized status and identity metadata only. Do not print the API key or
 Authorization header while diagnosing a request.
 
 For overlay failures, compare the controller ConfigMap, declared semantic
-digest, recomputed digest, mounted Praxis file, expected provider, pod UID, and
+digest, recomputed digest, mounted ExtProc file, expected provider, pod UID, and
 restart count. Wait for stable convergence rather than adding request retries.
 
 ## Static validation

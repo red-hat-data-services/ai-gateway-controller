@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Controller-owned overlay: combines the pinned upstream ExtProc manifests
+# with the ExternalModel-only Envoy filter. The upstream tree remains fully
+# reproducible under config/manifests/praxis-extproc/.
+resources:
+  - ../../../praxis-extproc/overlays/odh
+  - external-model-envoy-filter.yaml

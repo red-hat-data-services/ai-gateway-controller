@@ -39,7 +39,10 @@ this file only covers process (PR/CI conventions), not design decisions.
 - `make build` — full local build: `tidy`, `lint`, `test`, `binary`.
 - `make run` — build and run the manager locally (see `cmd/manager/main.go` for flags).
 - `make get-manifests` — re-vendor the `praxis-extproc` overlay pinned in
-  `hack/scripts/get-manifests.sh` into `config/manifests/praxis-extproc/`.
+  `hack/scripts/get-manifests.sh` into the exact upstream tree at
+  `config/manifests/praxis-extproc/`. Controller-owned ExternalModel patches
+  live separately under `config/manifests/external-model/` and are not part
+  of the generated tree.
   Run this and commit the diff whenever you bump `PRAXIS_EXTPROC_COMMIT`.
 - `make install` / `make uninstall` — apply or remove `config/self/default`
   (SA, RBAC, Deployment) standalone, namespace `opendatahub`, for local testing
@@ -102,7 +105,8 @@ vendored overlay's shape are caught here too.
 | `pkg/render/` | Kustomize build, placeholder post-render, SSA apply (tenant-agnostic primitives) |
 | `pkg/tenant/` | Primarily watches `MaasTenantConfig` (mirroring maas-controller's own `TenantReconciler`); per opted-in (`maas.opendatahub.io/payload-processing-type: praxis` annotation) tenant, renames/patches and applies its own copy of the rendered resources, and cleans them up again via `PraxisCleanupFinalizer` (on `MaasTenantConfig`) on switch-away/deletion. Also Gets the tenant's owning `AITenant` for `status.gatewayRef`/`status.phase`. |
 | `config/self/` | This repo's own deploy manifest (SA/ClusterRole/ClusterRoleBinding/Deployment), vendored by `ai-gateway-operator` |
-| `config/manifests/praxis-extproc/` | Vendored (committed) `praxis-extproc` overlay this controller applies at runtime |
+| `config/manifests/praxis-extproc/` | Exact pinned `praxis-extproc` manifests; never add controller-specific patches here |
+| `config/manifests/external-model/` | Controller-owned Kustomize composition and ExternalModel EnvoyFilter patches |
 | `hack/scripts/get-manifests.sh` | Pinned-commit vendoring for `config/manifests/praxis-extproc/` |
 | `Makefile`, `tools.mk` | Build/test/lint/tidy/get-manifests/build-image targets |
 

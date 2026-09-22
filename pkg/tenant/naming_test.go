@@ -53,6 +53,7 @@ func TestPerResourceNamingFunctions(t *testing.T) {
 		{"PayloadProcessingDeploymentName", PayloadProcessingDeploymentName(tenantID), "payload-processing-redteam"},
 		{"PayloadPreProcessingDeploymentName", PayloadPreProcessingDeploymentName(tenantID), "payload-pre-processing-redteam"},
 		{"PayloadProcessingServiceName", PayloadProcessingServiceName(tenantID), "payload-processing-redteam"},
+		{"PayloadProcessingPostServiceAccountName", PayloadProcessingPostServiceAccountName(tenantID), "payload-processing-post-redteam"},
 		{"PayloadPreProcessingServiceName", PayloadPreProcessingServiceName(tenantID), "payload-pre-processing-redteam"},
 		{"PayloadProcessingServiceAccountName", PayloadProcessingServiceAccountName(tenantID), "payload-processing-redteam"},
 		{"PayloadProcessingNetworkPolicyName", PayloadProcessingNetworkPolicyName(tenantID), "payload-processing-redteam"},
@@ -81,6 +82,7 @@ func TestPerResourceNamingFunctionsDefaultTenantAreUnsuffixed(t *testing.T) {
 		{"PayloadProcessingDeploymentName", PayloadProcessingDeploymentName(""), "payload-processing"},
 		{"PayloadPreProcessingDeploymentName", PayloadPreProcessingDeploymentName(""), "payload-pre-processing"},
 		{"PayloadProcessingPluginsConfigMapForTenant", PayloadProcessingPluginsConfigMapForTenant(""), "payload-processing-plugins"},
+		{"PayloadProcessingPostServiceAccountName", PayloadProcessingPostServiceAccountName(""), "payload-processing-post"},
 		{
 			"PayloadProcessingReaderClusterRoleBindingNameForTenant",
 			PayloadProcessingReaderClusterRoleBindingNameForTenant(""),

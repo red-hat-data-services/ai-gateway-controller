@@ -12,7 +12,6 @@ mkdir -p "$OUT"
 
 need() { command -v "$1" >/dev/null || { echo "$1 is required" >&2; exit 1; }; }
 need oc; need helm; need kustomize; need yq; need curl; need tar
-[[ -n "${KSERVE_REPO:-}" && -d "$KSERVE_REPO" ]] || { echo 'KSERVE_REPO must point to the pinned KServe checkout' >&2; exit 1; }
 [[ -n "${KUADRANT_OPERATOR_REPO:-}" && -d "$KUADRANT_OPERATOR_REPO" ]] || { echo 'KUADRANT_OPERATOR_REPO must point to the pinned Kuadrant checkout' >&2; exit 1; }
 
 # MaaS v0.1.x requires the Kuadrant v1.4.2 bundle, which provides the
@@ -469,21 +468,6 @@ while :; do
   fi
   sleep 3
 done
-
-KSERVE_CRD_NAMES=$(kustomize build "$KSERVE_REPO/config/crd/minimal" | yq eval-all -r 'select(.kind == "CustomResourceDefinition") | .metadata.name' - | sed '/^---$/d')
-KSERVE_MISSING=()
-for crd_name in $KSERVE_CRD_NAMES; do
-  "${OC[@]}" get crd "$crd_name" >/dev/null 2>&1 || KSERVE_MISSING+=("$crd_name")
-done
-if ((${#KSERVE_MISSING[@]} == 0)); then
-  printf 'reused complete ODH-managed KServe CRD set (%s CRDs); no server-side ownership changes\n' "$(wc -w <<<"$KSERVE_CRD_NAMES" | tr -d ' ')" >"$OUT/kserve-crds-shared.txt"
-elif ((${#KSERVE_MISSING[@]} == $(wc -w <<<"$KSERVE_CRD_NAMES" | tr -d ' '))); then
-  kustomize build "$KSERVE_REPO/config/crd/minimal" | "${OC_LONG[@]}" apply --server-side -f - >"$OUT/kserve-crds.log" 2>&1
-else
-  printf '%s\n' "${KSERVE_MISSING[@]}" >"$OUT/kserve-crds-partial.txt"
-  echo "KServe CRD set is partially present; refusing to adopt or modify shared CRDs: $OUT/kserve-crds-partial.txt" >&2
-  exit 1
-fi
 
 # The fresh CI cluster does not expose the internal registry by default. This
 # route is run-owned and is removed by destroy.sh; it is not a production

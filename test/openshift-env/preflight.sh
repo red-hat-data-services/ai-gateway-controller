@@ -13,6 +13,11 @@ RUN_ID=$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9
 EVIDENCE="$STATE/evidence/$RUN_ID/baseline"
 mkdir -p "$EVIDENCE"
 
+# A rerun after provisioning may already have a MaaS-resolved tenant
+# namespace. Preserve it only when the live AITenant reports the same value;
+# never carry an arbitrary or foreign namespace forward from stale state.
+TENANT_NAMESPACE="xmp-tenant-$RUN_ID"
+
 command -v oc >/dev/null || { echo "oc is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 [[ -s "$KUBECONFIG_FILE" ]] || { echo "isolated kubeconfig not found: $KUBECONFIG_FILE" >&2; exit 1; }
@@ -31,6 +36,16 @@ export KUBECONFIG="$KUBECONFIG_FILE"
 "${OC[@]}" get deployment -A -o json >"$EVIDENCE/deployments.json"
 "${OC[@]}" get scc -o json >"$EVIDENCE/scc.json" 2>/dev/null || :
 "${OC[@]}" get namespace -o json >"$EVIDENCE/namespaces.json"
+
+if [[ -s "$STATE/run.env" ]]; then
+  previous_tenant_namespace=$(sed -n 's/^export OPENSHIFT_E2E_TENANT_NAMESPACE=//p' "$STATE/run.env" | tail -n 1)
+  resolved_tenant_namespace=$("${OC[@]}" get aitenant "${OPENSHIFT_E2E_AITENANT_NAME:-models-as-a-service}" -n ai-tenants -o jsonpath='{.status.tenantNamespace}' 2>/dev/null || true)
+  if [[ -n "$resolved_tenant_namespace" && ( "$previous_tenant_namespace" == "$TENANT_NAMESPACE" || "$previous_tenant_namespace" == "$resolved_tenant_namespace" ) ]]; then
+    TENANT_NAMESPACE="$resolved_tenant_namespace"
+  elif [[ -n "$previous_tenant_namespace" && "$previous_tenant_namespace" != "$TENANT_NAMESPACE" && "$previous_tenant_namespace" == "$resolved_tenant_namespace" ]]; then
+    TENANT_NAMESPACE="$previous_tenant_namespace"
+  fi
+fi
 
 # A healthy MaaS deployment is not sufficient evidence of Praxis opt-in
 # support.  Require an explicit provenance record for the exact deployed image
@@ -62,18 +77,18 @@ fi
 
 umask 077
 cat >"$STATE/run.env" <<EOF
-OPENSHIFT_E2E_RUN_ID=$RUN_ID
-OPENSHIFT_E2E_STATE=$STATE
-OPENSHIFT_E2E_EVIDENCE_ROOT=$STATE/evidence/$RUN_ID
-OPENSHIFT_E2E_CONTROLLER_NAMESPACE=xmp-controller-$RUN_ID
-OPENSHIFT_E2E_TENANT_NAMESPACE=xmp-tenant-$RUN_ID
-OPENSHIFT_E2E_BACKEND_NAMESPACE=xmp-provider-$RUN_ID
-OPENSHIFT_E2E_GATEWAY_NAMESPACE=openshift-ingress
-OPENSHIFT_E2E_GATEWAY_NAME=xmp-gateway-$RUN_ID
+export OPENSHIFT_E2E_RUN_ID=$RUN_ID
+export OPENSHIFT_E2E_STATE=$STATE
+export OPENSHIFT_E2E_EVIDENCE_ROOT=$STATE/evidence/$RUN_ID
+export OPENSHIFT_E2E_CONTROLLER_NAMESPACE=xmp-controller-$RUN_ID
+export OPENSHIFT_E2E_TENANT_NAMESPACE=$TENANT_NAMESPACE
+export OPENSHIFT_E2E_BACKEND_NAMESPACE=xmp-provider-$RUN_ID
+export OPENSHIFT_E2E_GATEWAY_NAMESPACE=openshift-ingress
+export OPENSHIFT_E2E_GATEWAY_NAME=xmp-gateway-$RUN_ID
 # The default OpenShift Route host appends the ingress service name to the
 # route name. Keep that first DNS label within 63 characters even on clusters
 # with long run identifiers; the full run ID remains the ownership label.
-OPENSHIFT_E2E_REGISTRY_ROUTE=xmp-registry-${RUN_ID:0:24}
-OPENSHIFT_E2E_AITENANT_NAME=${OPENSHIFT_E2E_AITENANT_NAME:-models-as-a-service}
+export OPENSHIFT_E2E_REGISTRY_ROUTE=xmp-registry-${RUN_ID:0:24}
+export OPENSHIFT_E2E_AITENANT_NAME=${OPENSHIFT_E2E_AITENANT_NAME:-models-as-a-service}
 EOF
 printf '%s\n' "$EVIDENCE"

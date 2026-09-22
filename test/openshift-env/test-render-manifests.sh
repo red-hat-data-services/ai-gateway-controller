@@ -9,6 +9,7 @@ trap 'rm -rf "$TEST_STATE"' EXIT
 
 export OPENSHIFT_E2E_CONTROLLER_NAMESPACE=xmp-controller-test
 export OPENSHIFT_E2E_BACKEND_NAMESPACE=xmp-backend-test
+export OPENSHIFT_E2E_IMAGE_PROJECT=xmp-images-test
 export OPENSHIFT_E2E_TENANT_NAMESPACE=xmp-tenant-test
 export OPENSHIFT_E2E_RUN_ID=render-test-123
 export OPENSHIFT_E2E_GATEWAY_NAME=xmp-gateway
@@ -18,7 +19,6 @@ export OPENSHIFT_E2E_GATEWAY_CLASS=istio
 export ROLE_NAME=xmp-controller-role-render-test-123
 export CONTROLLER_IMAGE=registry.example.test/controller@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export EXTPROC_IMAGE=registry.example.test/extproc@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-export PRAXIS_IMAGE=registry.example.test/praxis@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 export KATAN_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
 export OPENSHIFT_E2E_USER=render-user
 export CLIENT_CA_CONFIGMAP=xmp-gateway-ca-render-test
@@ -33,6 +33,7 @@ export EXTERNAL_MODEL_OPENAI_USER=render-user
 export EXTERNAL_MODEL_CLIENT_NAME=xmp-client-render-test
 export EXTERNAL_MODEL_CLIENT_NAMESPACE=xmp-tenant-test
 export EXTERNAL_MODEL_CLIENT_IMAGE='curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b'
+export EXTERNAL_MODEL_CLIENT_RUN_AS_NON_ROOT=true
 export EXTERNAL_MODEL_CLIENT_VOLUME_MOUNTS='[{name: gateway-ca, mountPath: /etc/xmp/ca, readOnly: true}]'
 export EXTERNAL_MODEL_CLIENT_VOLUMES='[{name: gateway-ca, configMap: {name: xmp-gateway-ca-render-test}}]'
 
@@ -68,7 +69,11 @@ if grep -q '^  labels:.*app: provider-[ab]' "$OUTPUT/30-provider-fixtures.yaml";
   exit 1
 fi
 grep -R -q 'registry.example.test/controller@sha256:' "$OUTPUT/20-controller.yaml"
-grep -R -q 'registry.example.test/praxis@sha256:' "$OUTPUT/20-controller.yaml"
+grep -R -q 'registry.example.test/extproc@sha256:' "$OUTPUT/20-controller.yaml"
+if grep -R -q -- '--praxis-image\|registry.example.test/praxis@sha256:' "$OUTPUT/20-controller.yaml"; then
+  echo 'ExtProc-only controller manifest still contains standalone dataplane image configuration' >&2
+  exit 1
+fi
 grep -R -q 'xmp-gateway' "$OUTPUT/20-controller.yaml"
 if grep -En 'name: (provider-a|provider-b|demo-model|xmp-client-)|endpoint: provider-' "$ROOT/test/openshift-env/provision.sh"; then
   echo "stable fixture remains inline in provision.sh" >&2

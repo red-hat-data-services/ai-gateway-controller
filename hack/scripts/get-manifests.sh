@@ -15,8 +15,9 @@ PRAXIS_EXTPROC_COMMIT="d030ea0b2e4d775df4c7485652a48198d1a364ec"
 # The "odh" overlay references "../../base/..." paths that resolve relative to
 # deploy/, so we vendor deploy/base and deploy/overlays/odh together, preserving
 # their relative layout (minus the "deploy/" prefix) so those references still
-# resolve. The kustomize entrypoint after vendoring is
-# config/manifests/praxis-extproc/overlays/odh.
+# resolve. The controller-owned kustomize entrypoint is
+# config/manifests/external-model/overlays/odh; it composes this exact upstream
+# tree with controller-specific ExternalModel patches.
 DST_ROOT="${PROJECT_ROOT}/config/manifests/praxis-extproc"
 
 fetch_praxis_extproc() {
@@ -52,7 +53,7 @@ fetch_praxis_extproc() {
 
 # The vendored ExtProc workload reads routing ConfigMaps and inference CRs but
 # does not consume provider Secrets. Credentials are projected only into the
-# tenant-local standalone Praxis workload. Keep this downstream least-privilege
+# tenant-local credential-bearing ExtProc workload. Keep this downstream least-privilege
 # adjustment structural and fail closed so regeneration cannot silently restore
 # Secret API access to ExtProc.
 normalize_extproc_cluster_role() {

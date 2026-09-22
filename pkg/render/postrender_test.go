@@ -257,7 +257,7 @@ func TestPostRenderDoesNotMutateInputSlice(t *testing.T) {
 // praxis-extproc manifest revision introduces a placeholder this package
 // does not yet know how to rewrite.
 func TestPostRenderLeavesNoKnownPlaceholders(t *testing.T) {
-	const manifestPath = "../../config/manifests/praxis-extproc/overlays/odh"
+	const manifestPath = "../../config/manifests/external-model/overlays/odh"
 
 	rendered, err := Build(manifestPath)
 	if err != nil {

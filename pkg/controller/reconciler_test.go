@@ -36,10 +36,133 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	if err := v1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}, &unstructured.Unstructured{})
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
 		WithObjects(objects...).Build()
 	return &Reconciler{Client: fakeClient, APIReader: fakeClient}
+}
+
+func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *testing.T) {
+	filter := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.istio.io/v1alpha3",
+		"kind":       "EnvoyFilter",
+		"metadata":   map[string]any{"name": "payload-processing-tenant-a", "namespace": "gateway-system"},
+		"spec": map[string]any{"configPatches": []any{
+			map[string]any{
+				"applyTo": "VIRTUAL_HOST",
+				"patch": map[string]any{"value": map[string]any{"typed_per_filter_config": map[string]any{
+					externalModelExtProcFilter: map[string]any{"disabled": true},
+				}}},
+			},
+			map[string]any{
+				"applyTo": "HTTP_ROUTE",
+				"patch": map[string]any{"value": map[string]any{"typed_per_filter_config": map[string]any{
+					externalModelExtProcFilter: map[string]any{"overrides": map[string]any{"processing_mode": map[string]any{"request_header_mode": "SEND", "request_body_mode": "NONE"}}},
+				}}},
+			},
+		}},
+	}}
+	r := controllerTestClient(t, filter)
+	var applied unstructured.Unstructured
+	r.ApplyResource = func(_ context.Context, _ client.Client, object unstructured.Unstructured) error {
+		applied = *object.DeepCopy()
+		return nil
+	}
+	routes := []resolver.Route{{Model: "demo-model", ClientName: "demo", Provider: "provider-a"}}
+	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
+		t.Fatal(err)
+	}
+	if applied.GetName() != tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant-a") {
+		t.Fatalf("route EnvoyFilter name = %q, want %q", applied.GetName(), tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant-a"))
+	}
+	if applied.GetLabels()["app.kubernetes.io/managed-by"] != "ai-gateway-controller" {
+		t.Fatalf("route EnvoyFilter labels = %#v, want controller ownership", applied.GetLabels())
+	}
+	selector, found, err := unstructured.NestedStringMap(applied.Object, "spec", "workloadSelector", "labels")
+	if err != nil || !found || selector["gateway.networking.k8s.io/gateway-name"] != "test-gateway" {
+		t.Fatalf("route EnvoyFilter workloadSelector = %#v found=%t err=%v, want selected Gateway", selector, found, err)
+	}
+	patches := nestedSlice(t, applied.Object, "spec", "configPatches")
+	for _, raw := range patches {
+		patch, ok := raw.(map[string]any)
+		if !ok || patch["applyTo"] != "HTTP_ROUTE" {
+			continue
+		}
+		match, _, _ := unstructured.NestedString(patch, "match", "routeConfiguration", "vhost", "route", "name")
+		if match == "" {
+			continue
+		}
+		if match != "tenant-a.external-model-demo-model.0" && match != "tenant-a.external-model-demo-model.1" && match != "tenant-a.external-model-demo-model.2" && match != "tenant-a.external-model-demo-model.3" {
+			t.Fatalf("unexpected ExternalModel route patch name %q", match)
+		}
+		overrides, found, err := unstructured.NestedMap(patch, "patch", "value", "typed_per_filter_config", externalModelExtProcFilter, "overrides")
+		if err != nil || !found {
+			t.Fatalf("route %q overrides=%#v found=%t err=%v, want supported enable override", match, overrides, found, err)
+		}
+		mode, found, err := unstructured.NestedMap(overrides, "processing_mode")
+		if err != nil || !found || mode["request_header_mode"] != "SEND" ||
+			mode["request_body_mode"] != "NONE" || mode["response_body_mode"] != "NONE" {
+			t.Fatalf("route %q processing mode=%#v found=%t err=%v, want SEND/NONE", match, mode, found, err)
+		}
+		sharedDisabled, found, err := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp", "disabled")
+		if err != nil || !found || !sharedDisabled {
+			t.Fatalf("route %q shared ipp disabled=%t found=%t err=%v, want disabled", match, sharedDisabled, found, err)
+		}
+		preOverrides, found, err := unstructured.NestedMap(patch, "patch", "value", "typed_per_filter_config", externalModelPreExtProcFilter, "overrides")
+		if err != nil || !found {
+			t.Fatalf("route %q pre-auth overrides=%#v found=%t err=%v, want fail-closed ExternalModel pre-auth", match, preOverrides, found, err)
+		}
+		preMode, found, err := unstructured.NestedMap(preOverrides, "processing_mode")
+		if err != nil || !found || preMode["request_body_mode"] != "BUFFERED" {
+			t.Fatalf("route %q pre-auth processing mode=%#v found=%t err=%v, want BUFFERED", match, preMode, found, err)
+		}
+		preDisabled, found, err := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp-pre", "disabled")
+		if err != nil || !found || !preDisabled {
+			t.Fatalf("route %q shared pre-auth disabled=%t found=%t err=%v, want disabled", match, preDisabled, found, err)
+		}
+	}
+	// A stale route-level enablement is removed before new route patches are
+	// added; otherwise a deleted ExternalModel could leave the header-phase
+	// filter active on an unrelated route.
+	for _, raw := range patches {
+		patch, ok := raw.(map[string]any)
+		if !ok || patch["applyTo"] != "HTTP_ROUTE" {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(patch, "match", "routeConfiguration", "vhost", "route", "name")
+		if name == "stale.route.0" {
+			t.Fatal("stale ExternalModel route patch was retained")
+		}
+	}
+}
+
+func TestEnableExternalModelRoutesDeletesOnlyOwnedRouteFilterWhenEmpty(t *testing.T) {
+	owned := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.istio.io/v1alpha3",
+		"kind":       "EnvoyFilter",
+		"metadata": map[string]any{
+			"name":      tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant-a"),
+			"namespace": "gateway-system",
+			"labels":    map[string]any{"app.kubernetes.io/managed-by": "ai-gateway-controller"},
+		},
+	}}
+	foreign := owned.DeepCopy()
+	foreign.SetName("foreign-routes")
+	foreign.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "other-controller"})
+	r := controllerTestClient(t, owned, foreign)
+
+	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", nil); err != nil {
+		t.Fatal(err)
+	}
+	var got unstructured.Unstructured
+	got.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"})
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "gateway-system", Name: owned.GetName()}, &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned route EnvoyFilter lookup = %v, want NotFound", err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "gateway-system", Name: foreign.GetName()}, &got); err != nil {
+		t.Fatalf("foreign route EnvoyFilter was removed: %v", err)
+	}
 }
 
 func nestedSlice(t *testing.T, object map[string]any, fields ...string) []any {
@@ -73,7 +196,7 @@ func nestedMapAt(t *testing.T, values []any, index int) map[string]any {
 }
 
 func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
-	route := resolver.Route{Model: "model", ClientName: "client-model", Provider: "openai"}
+	route := resolver.Route{Model: "model", ClientName: "client-model", Provider: "openai", Endpoint: "api.example.com"}
 	obj := modelHTTPRoute(route, "tenant-a", "gateway", "maas-system")
 	parentRefs := nestedSlice(t, obj.Object, "spec", "parentRefs")
 	parent := nestedMapAt(t, parentRefs, 0)
@@ -81,23 +204,23 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 		t.Fatalf("route parent namespace = %q, want maas-system", nestedString(t, parent, "namespace"))
 	}
 	rules, found, err := unstructured.NestedSlice(obj.Object, "spec", "rules")
-	if err != nil || !found || len(rules) != 2 {
-		t.Fatalf("expected path and body routing rules, got found=%v len=%d err=%v", found, len(rules), err)
+	if err != nil || !found || len(rules) != 4 {
+		t.Fatalf("expected trusted canonical/body rules and fail-closed fallbacks, got found=%v len=%d err=%v", found, len(rules), err)
 	}
-	pathMatches := nestedSlice(t, nestedMapAt(t, rules, 0), "matches")
+	selectedMatches := nestedSlice(t, nestedMapAt(t, rules, 0), "matches")
+	selectedHeader := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, selectedMatches, 0), "headers"), 0)
+	if nestedString(t, selectedHeader, "name") != "X-AI-Routing-Candidate" || nestedString(t, selectedHeader, "value") != "provider-openai" {
+		t.Fatalf("trusted provider header = %q=%q", nestedString(t, selectedHeader, "name"), nestedString(t, selectedHeader, "value"))
+	}
+	pathMatches := nestedSlice(t, nestedMapAt(t, rules, 2), "matches")
 	path := nestedString(t, nestedMapAt(t, pathMatches, 0), "path", "value")
 	if path != "/tenant-a/client-model" {
 		t.Fatalf("path route = %q", path)
 	}
-	filters := nestedSlice(t, nestedMapAt(t, rules, 0), "filters")
-	rewrite := nestedMapAt(t, filters, 0)
-	if nestedString(t, rewrite, "type") != "URLRewrite" || nestedString(t, rewrite, "urlRewrite", "path", "type") != "ReplacePrefixMatch" || nestedString(t, rewrite, "urlRewrite", "path", "replacePrefixMatch") != "/" {
-		t.Fatalf("path route rewrite = %#v", rewrite)
-	}
-	backendRefs := nestedSlice(t, nestedMapAt(t, rules, 0), "backendRefs")
+	backendRefs := nestedSlice(t, nestedMapAt(t, rules, 2), "backendRefs")
 	backend := nestedMapAt(t, backendRefs, 0)
-	if nestedString(t, backend, "name") != "provider-openai" {
-		t.Fatalf("backend name = %q, want provider-openai", nestedString(t, backend, "name"))
+	if nestedString(t, backend, "name") != "provider-selection-required-model" {
+		t.Fatalf("backend name = %q, want fail-closed sink", nestedString(t, backend, "name"))
 	}
 	if port, _, _ := unstructured.NestedInt64(backend, "port"); port != 443 {
 		t.Fatalf("backend port = %d, want 443", port)
@@ -105,7 +228,7 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 	if _, found, err := unstructured.NestedString(backend, "namespace"); err != nil || found {
 		t.Fatal("route backend must remain in the tenant namespace; unexpected cross-namespace backend reference")
 	}
-	bodyMatches := nestedSlice(t, nestedMapAt(t, rules, 1), "matches")
+	bodyMatches := nestedSlice(t, nestedMapAt(t, rules, 3), "matches")
 	headers := nestedSlice(t, nestedMapAt(t, bodyMatches, 0), "headers")
 	name := nestedString(t, nestedMapAt(t, headers, 0), "name")
 	value := nestedString(t, nestedMapAt(t, headers, 0), "value")
@@ -114,6 +237,163 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 	}
 	if _, found, err := unstructured.NestedMap(nestedMapAt(t, bodyMatches, 0), "path"); err != nil || found {
 		t.Fatalf("body route must intentionally be path-independent: found=%v err=%v", found, err)
+	}
+}
+
+func TestModelHTTPRouteHasOneTrustedRulePerProviderBeforeFallback(t *testing.T) {
+	routes := []resolver.Route{
+		{Model: "model", ClientName: "chat", Provider: "provider-b"},
+		{Model: "model", ClientName: "chat", Provider: "provider-a"},
+	}
+	obj := modelHTTPRouteSet(routes, "tenant-a", "gateway", "gateway-system")
+	rules := nestedSlice(t, obj.Object, "spec", "rules")
+	if len(rules) != 6 {
+		t.Fatalf("rules = %d, want two trusted entry rules per provider plus path and body fallback", len(rules))
+	}
+	for i, provider := range []string{"provider-provider-b", "provider-provider-a"} {
+		ruleIndex := i * 2
+		matches := nestedSlice(t, nestedMapAt(t, rules, ruleIndex), "matches")
+		header := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, matches, 0), "headers"), 0)
+		if got := nestedString(t, header, "name"); got != selectedProviderHeader {
+			t.Fatalf("rule %d header name = %q, want %q", i, got, selectedProviderHeader)
+		}
+		if got := nestedString(t, header, "value"); got != provider {
+			t.Fatalf("rule %d header value = %q, want %q", i, got, provider)
+		}
+		backend := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, ruleIndex), "backendRefs"), 0)
+		if got := nestedString(t, backend, "name"); got != provider {
+			t.Fatalf("rule %d backend = %q, want %q", i, got, provider)
+		}
+	}
+}
+
+func TestModelHTTPRouteFailsClosedWithoutTrustedSelection(t *testing.T) {
+	routes := []resolver.Route{
+		{Model: "model", ClientName: "chat", Provider: "provider-a", Endpoint: "a.example.com"},
+		{Model: "model", ClientName: "chat", Provider: "provider-b", Endpoint: "b.example.com"},
+	}
+	obj := modelHTTPRouteSet(routes, "tenant-a", "gateway", "gateway-system")
+	rules := nestedSlice(t, obj.Object, "spec", "rules")
+	sinkName := providerSelectionSinkName("model")
+	if len(rules) != 6 {
+		t.Fatalf("rules = %d, want two selected rules per provider and two sink rules", len(rules))
+	}
+	for i := 0; i < len(rules)-2; i++ {
+		matches := nestedSlice(t, nestedMapAt(t, rules, i), "matches")
+		foundSelection := false
+		for _, rawMatch := range matches {
+			match, ok := rawMatch.(map[string]any)
+			if !ok {
+				t.Fatalf("provider rule %d match has type %T", i, rawMatch)
+			}
+			for _, rawHeader := range nestedSlice(t, match, "headers") {
+				header, ok := rawHeader.(map[string]any)
+				if !ok {
+					t.Fatalf("provider rule %d header has type %T", i, rawHeader)
+				}
+				if header["name"] == selectedProviderHeader {
+					foundSelection = true
+				}
+			}
+		}
+		if !foundSelection {
+			t.Fatalf("provider rule %d lacks an exact trusted selection match", i)
+		}
+		filters := nestedSlice(t, nestedMapAt(t, rules, i), "filters")
+		removed := map[string]bool{}
+		for _, rawFilter := range filters {
+			filter, ok := rawFilter.(map[string]any)
+			if !ok {
+				t.Fatalf("provider rule %d filter has type %T", i, rawFilter)
+			}
+			if filter["type"] != "RequestHeaderModifier" {
+				continue
+			}
+			for _, rawName := range nestedSlice(t, filter, "requestHeaderModifier", "remove") {
+				if name, ok := rawName.(string); ok {
+					removed[name] = true
+				}
+			}
+		}
+		for _, name := range []string{"x-ai-routing-candidate", "x-ai-routing-request-id", "x-ai-routing-revision"} {
+			if !removed[name] {
+				t.Fatalf("provider rule %d does not remove %s before forwarding", i, name)
+			}
+		}
+	}
+	for i := len(rules) - 2; i < len(rules); i++ {
+		backend := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, i), "backendRefs"), 0)
+		if got := nestedString(t, backend, "name"); got != sinkName {
+			t.Fatalf("fallback rule %d backend = %q, want endpoint-less sink %q", i, got, sinkName)
+		}
+	}
+	sink := providerSelectionSink(routes[0], "tenant-a")
+	if _, found, err := unstructured.NestedFieldNoCopy(sink.Object, "spec", "selector"); err != nil || found {
+		t.Fatalf("sink selector = found=%v err=%v, want no selector and therefore no provider endpoint", found, err)
+	}
+}
+
+func TestProviderTransportPreservesAuthorityPortAndHostnameSNI(t *testing.T) {
+	route := resolver.Route{Provider: "provider", Endpoint: "provider.example.com:8443"}
+	service := providerService(route, "tenant-a")
+	if got := nestedString(t, service.Object, "spec", "externalName"); got != "provider.example.com" {
+		t.Fatalf("ExternalName = %q, want hostname only", got)
+	}
+	if got := nestedMapAt(t, nestedSlice(t, service.Object, "spec", "ports"), 0)["port"]; got != int64(8443) {
+		t.Fatalf("Service port = %v, want 8443", got)
+	}
+	entry := providerServiceEntry(route, "tenant-a")
+	hosts := nestedSlice(t, entry.Object, "spec", "hosts")
+	if got, ok := hosts[0].(string); !ok || got != "provider.example.com" {
+		t.Fatalf("ServiceEntry host = %q, want hostname only", got)
+	}
+	destination := providerDestinationRule(route, "tenant-a")
+	exportTo := nestedSlice(t, destination.Object, "spec", "exportTo")
+	if len(exportTo) != 1 || exportTo[0] != "*" {
+		t.Fatalf("DestinationRule exportTo = %#v, want [*]", exportTo)
+	}
+	if got := nestedString(t, destination.Object, "spec", "host"); got != "provider.example.com" {
+		t.Fatalf("DestinationRule host = %q, want hostname only", got)
+	}
+	if got := nestedString(t, destination.Object, "spec", "trafficPolicy", "tls", "sni"); got != "provider.example.com" {
+		t.Fatalf("DestinationRule SNI = %q, want hostname only", got)
+	}
+}
+
+func TestProviderTransportUsesConfiguredCAFileWithoutDisablingVerification(t *testing.T) {
+	route := resolver.Route{Provider: "provider", Endpoint: "provider.example.com", TLSCACertificates: "/etc/istio/provider-ca/ca.crt"}
+	destination := providerDestinationRule(route, "tenant-a")
+	if got := nestedString(t, destination.Object, "spec", "trafficPolicy", "tls", "caCertificates"); got != "/etc/istio/provider-ca/ca.crt" {
+		t.Fatalf("DestinationRule CA file = %q", got)
+	}
+	if got, found, err := unstructured.NestedBool(destination.Object, "spec", "trafficPolicy", "tls", "insecureSkipVerify"); err != nil || found && got {
+		t.Fatalf("provider TLS must retain verification: found=%v value=%v err=%v", found, got, err)
+	}
+}
+
+func TestProviderDestinationRuleIsolatedPerTenantInSharedGatewayNamespace(t *testing.T) {
+	route := resolver.Route{Provider: "provider-a", Endpoint: "provider-a-tenant-b.example.com"}
+	defaultRule := providerDestinationRuleForTenant(route, "gateway-system", "models-as-a-service")
+	tenantRule := providerDestinationRuleForTenant(route, "gateway-system", "tenant-b")
+	if got := defaultRule.GetName(); got != "provider-provider-a" {
+		t.Fatalf("default DestinationRule name = %q, want historical name", got)
+	}
+	if got := tenantRule.GetName(); got != "provider-provider-a-tenant-b" {
+		t.Fatalf("tenant DestinationRule name = %q, want tenant-qualified name", got)
+	}
+	if got := nestedString(t, tenantRule.Object, "spec", "host"); got != "provider-a-tenant-b.example.com" {
+		t.Fatalf("tenant DestinationRule host = %q, want tenant endpoint", got)
+	}
+	if got := nestedString(t, tenantRule.Object, "spec", "trafficPolicy", "tls", "sni"); got != "provider-a-tenant-b.example.com" {
+		t.Fatalf("tenant DestinationRule SNI = %q, want hostname-only tenant endpoint", got)
+	}
+}
+
+func TestProviderEndpointRejectsURLsAndInvalidPorts(t *testing.T) {
+	for _, endpoint := range []string{"https://provider.example.com", "provider.example.com:0", "provider.example.com:65536"} {
+		if err := validateProviderEndpoint(endpoint); err == nil {
+			t.Errorf("validateProviderEndpoint(%q) succeeded, want error", endpoint)
+		}
 	}
 }
 
@@ -134,7 +414,7 @@ func TestCandidateIdentityUsesClientModelName(t *testing.T) {
 	}
 	obj := modelHTTPRoute(route, "tenant-a", "gateway", "tenant-a")
 	rules := nestedSlice(t, obj.Object, "spec", "rules")
-	path := nestedString(t, nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 0), "matches"), 0), "path", "value")
+	path := nestedString(t, nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 2), "matches"), 0), "path", "value")
 	if path != "/tenant-a/client-visible-model" {
 		t.Fatalf("HTTPRoute path = %q, want client-visible-model path", path)
 	}
@@ -148,14 +428,13 @@ func TestValidateProviderAuthenticationStrategies(t *testing.T) {
 		want       string
 	}{
 		{name: "apikey", authType: "apikey", secretData: map[string][]byte{"api-key": []byte("fixture")}},
-		{name: "missing api key", authType: "apikey", secretData: map[string][]byte{"other": []byte("fixture")}, want: "missing key api-key"},
 		{name: "sigv4 unsupported", authType: "sigv4", secretData: map[string][]byte{"api-key": []byte("fixture")}, want: "unsupported authentication strategy"},
 		{name: "oauth2 unsupported", authType: "oauth2", secretData: map[string][]byte{"api-key": []byte("fixture")}, want: "unsupported authentication strategy"},
 		{name: "unknown unsupported", authType: "custom", secretData: map[string][]byte{"api-key": []byte("fixture")}, want: "unsupported authentication strategy"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			provider := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalProviderSpec{
+			provider := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalProviderSpec{Endpoint: "provider.example.com",
 				Auth: v1alpha1.AuthConfig{Type: tc.authType, SecretRef: v1alpha1.NameReference{Name: "credentials"}},
 			}}
 			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: tc.secretData}
@@ -338,7 +617,7 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	if err := r.Create(context.Background(), ait); err != nil {
 		t.Fatal(err)
 	}
-	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "tenant-a", "external-model"
+	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "gateway-system", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
 	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
@@ -352,15 +631,28 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, object := range []struct{ kind, name string }{{"Service", "provider-provider"}, {"ServiceEntry", "provider-provider"}, {"DestinationRule", "provider-provider"}, {"HTTPRoute", "external-model-model"}} {
+	for _, object := range []struct{ kind, name string }{{"Service", "provider-provider"}, {"ServiceEntry", "provider-provider"}, {"DestinationRule", "provider-provider-tenant"}, {"HTTPRoute", "external-model-model"}} {
 		got := &unstructured.Unstructured{}
 		groups := map[string]string{
 			"Service": "", "ServiceEntry": "networking.istio.io",
 			"DestinationRule": "networking.istio.io", "HTTPRoute": "gateway.networking.k8s.io",
 		}
 		got.SetGroupVersionKind(schema.GroupVersionKind{Group: groups[object.kind], Version: "v1", Kind: object.kind})
-		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: object.name}, got); err != nil {
+		objectNamespace := "tenant-a"
+		if object.kind == "DestinationRule" {
+			objectNamespace = "gateway-system"
+		}
+		if err := r.Get(context.Background(), client.ObjectKey{Namespace: objectNamespace, Name: object.name}, got); err != nil {
 			t.Fatalf("get %s: %v", object.kind, err)
+		}
+		if object.kind == "DestinationRule" {
+			if len(got.GetOwnerReferences()) != 0 {
+				t.Fatalf("cross-namespace DestinationRule owner references = %#v", got.GetOwnerReferences())
+			}
+			if got.GetLabels()["inference.opendatahub.io/external-provider"] != "provider" {
+				t.Fatalf("DestinationRule provider label = %q", got.GetLabels()["inference.opendatahub.io/external-provider"])
+			}
+			continue
 		}
 		if len(got.GetOwnerReferences()) != 1 {
 			t.Fatalf("%s owner references = %#v", object.kind, got.GetOwnerReferences())
@@ -426,6 +718,22 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	}
 }
 
+func TestValidateResolvedCredentialsUsesEffectiveModelOverride(t *testing.T) {
+	base := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-default", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("default")}}
+	r := controllerTestClient(t, base)
+	route := resolver.Route{Model: "model", Provider: "provider", Namespace: "tenant-a", AuthType: "apikey", SecretName: "model-override", SecretKey: "api-key"}
+	if err := r.validateResolvedCredentials(context.Background(), []resolver.Route{route}); err == nil || !strings.Contains(err.Error(), "model-override") {
+		t.Fatalf("validateResolvedCredentials() error = %v, want missing effective override Secret", err)
+	}
+	override := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "model-override", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("override")}}
+	if err := r.Create(context.Background(), override); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.validateResolvedCredentials(context.Background(), []resolver.Route{route}); err != nil {
+		t.Fatalf("validateResolvedCredentials() = %v, want effective override accepted", err)
+	}
+}
+
 func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
@@ -465,8 +773,8 @@ func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T
 	if err := r.Delete(context.Background(), secret); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Reconcile(context.Background(), req); !errors.Is(err, resolver.ErrNoRoutes) {
-		t.Fatalf("missing-secret reconcile error = %v, want %v", err, resolver.ErrNoRoutes)
+	if _, err := r.Reconcile(context.Background(), req); !errors.Is(err, errCredentialNotReady) {
+		t.Fatalf("missing-secret reconcile error = %v, want credential-not-ready", err)
 	}
 	var after corev1.ConfigMap
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &after); err != nil {

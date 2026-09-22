@@ -419,6 +419,30 @@ func TestRenameEnvoyFilterRepointsClusterAddresses(t *testing.T) {
 	}
 }
 
+func externalModelEnvoyFilterFixture() unstructured.Unstructured {
+	return unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.istio.io/v1alpha3",
+		"kind":       "EnvoyFilter",
+		"metadata":   map[string]any{"name": PayloadProcessingExternalModelFilterName},
+		"spec": map[string]any{
+			"configPatches": []any{clusterPatch("payload-processing-external-model-extproc", "payload-processing-external-model.istio-system.svc.cluster.local")},
+		},
+	}}
+}
+
+func TestRenameExternalModelEnvoyFilterRepointsClusterAddress(t *testing.T) {
+	out, err := Rename([]unstructured.Unstructured{externalModelEnvoyFilterFixture()}, "redteam", "istio-system")
+	if err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if got := out[0].GetName(); got != PayloadProcessingExternalModelFilterNameForTenant("redteam") {
+		t.Fatalf("name = %q, want %q", got, PayloadProcessingExternalModelFilterNameForTenant("redteam"))
+	}
+	patches, _, _ := unstructured.NestedSlice(out[0].Object, "spec", "configPatches")
+	value := mustMap(t, mustMap(t, mustMap(t, patches[0])["patch"])["value"])
+	assertClusterAddress(t, value, "payload-processing-external-model-redteam.istio-system.svc.cluster.local")
+}
+
 func assertClusterAddress(t *testing.T, value map[string]any, wantFQDN string) {
 	t.Helper()
 	sni, _, err := unstructured.NestedString(value, "transport_socket", "typed_config", "sni")

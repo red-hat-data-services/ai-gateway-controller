@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -34,19 +35,24 @@ import (
 )
 
 const (
-	conditionReady              = "Ready"
-	conditionOverlayDistributed = "OverlayDistributed"
-	reasonReconciled            = "Reconciled"
-	reasonReconcileFailed       = "ReconcileFailed"
-	reasonNotPraxis             = "NotPraxisTenant"
-	reasonTenantNotReady        = "TenantNotReady"
-	reasonNoRoutes              = "NoRoutes"
-	reasonProviderNotReady      = "ProviderNotReady"
-	reasonClusterAllowlist      = "ClusterAllowlistMissing"
-	providerServicePrefix       = "provider-"
-	modelRoutePrefix            = "external-model-"
-	externalModelFinalizer      = "inference.opendatahub.io/external-model-cleanup"
+	conditionReady                = "Ready"
+	conditionOverlayDistributed   = "OverlayDistributed"
+	reasonReconciled              = "Reconciled"
+	reasonReconcileFailed         = "ReconcileFailed"
+	reasonNotPraxis               = "NotPraxisTenant"
+	reasonTenantNotReady          = "TenantNotReady"
+	reasonNoRoutes                = "NoRoutes"
+	reasonProviderNotReady        = "ProviderNotReady"
+	providerServicePrefix         = "provider-"
+	providerSelectionSinkPrefix   = "provider-selection-required-"
+	selectedProviderHeader        = "X-AI-Routing-Candidate"
+	externalModelPreExtProcFilter = "envoy.filters.http.ext_proc.external-model-pre"
+	externalModelExtProcFilter    = "envoy.filters.http.ext_proc.external-model"
+	modelRoutePrefix              = "external-model-"
+	externalModelFinalizer        = "inference.opendatahub.io/external-model-cleanup"
 )
+
+var errCredentialNotReady = errors.New("effective provider credential is not ready")
 
 // Reconciler is the sole writer for the ExternalModel transport plane and the
 // routing overlay. It resolves one namespace-scoped route set and renders both
@@ -64,7 +70,10 @@ type Reconciler struct {
 	LocalSite        string
 	ConfigMap        string
 	KnownClusters    []string
-	Log              logr.Logger
+	// ProducerVersion is supplied by build metadata and recorded in the
+	// content-addressed overlay provenance.
+	ProducerVersion string
+	Log             logr.Logger
 	// ApplyResource and PublishOverlay are test seams. Production leaves them
 	// nil, selecting the real SSA renderer and publisher below. Applying one
 	// object at a time preserves the production order and lets tests inject a
@@ -278,8 +287,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		return reconcile.Result{}, err
 	}
+	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
+		reason := reasonReconcileFailed
+		if errors.Is(err, errCredentialNotReady) {
+			reason = reasonProviderNotReady
+		}
+		if statusErr := r.updateModelStatus(ctx, &model, false, reason, err.Error(), nil); statusErr != nil {
+			return reconcile.Result{}, statusErr
+		}
+		return reconcile.Result{}, err
+	}
 	if len(set.Routes()) == 0 {
-		if cleanupErr := r.cleanupTransport(ctx, req.Namespace, nil); cleanupErr != nil {
+		if err := r.enableExternalModelRoutes(ctx, tenant.ID(ait.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+			return reconcile.Result{}, err
+		}
+		if cleanupErr := r.cleanupTransport(ctx, req.Namespace, gatewayNamespace, nil); cleanupErr != nil {
 			return reconcile.Result{}, cleanupErr
 		}
 		if cleanupErr := r.cleanupOverlay(ctx, req.Namespace); cleanupErr != nil {
@@ -291,15 +313,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		return reconcile.Result{}, resolver.ErrNoRoutes
 	}
-	if len(r.KnownClusters) == 0 {
-		message := "no Praxis load_balancer clusters are configured; set at least one --known-cluster"
-		if statusErr := r.updateModelStatus(ctx, &model, false, reasonClusterAllowlist, message, nil); statusErr != nil {
-			return reconcile.Result{}, statusErr
-		}
-		return reconcile.Result{}, errors.New(message)
-	}
-
-	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
+	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(ait.GetName()), gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
 		for _, p := range validProviders {
 			if statusErr := r.updateProviderStatus(ctx, p, false, reasonReconcileFailed, err.Error()); statusErr != nil {
 				return reconcile.Result{}, statusErr
@@ -310,7 +324,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		return reconcile.Result{}, err
 	}
-	if err := r.cleanupTransport(ctx, req.Namespace, set.Routes()); err != nil {
+	if err := r.cleanupTransport(ctx, req.Namespace, gatewayNamespace, set.Routes()); err != nil {
 		if statusErr := r.updateModelStatus(ctx, &model, false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
@@ -333,7 +347,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	result, err := publish(ctx, set, envelope.Scope{
 		Network: r.Network, Gateway: gatewayName, Namespace: req.Namespace, LocalSite: r.localSite(),
 	}, envelope.Options{
-		KnownClusters: r.KnownClusters, SourceUID: string(model.UID), ProducerVersion: "dev",
+		KnownClusters: r.KnownClusters, SourceUID: string(model.UID), ProducerVersion: r.ProducerVersion,
 	})
 	if err != nil {
 		if statusErr := r.updateModelStatus(ctx, &model, false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
@@ -352,7 +366,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 // cleanupUnselectedModel releases only resources owned by this controller when
 // the tenant no longer selects Praxis. The default IPP path is not targeted.
 func (r *Reconciler) cleanupUnselectedModel(ctx context.Context, model *v1alpha1.ExternalModel) error {
-	if err := r.cleanupTransport(ctx, model.Namespace, nil); err != nil {
+	if err := r.cleanupTransport(ctx, model.Namespace, r.gatewayNamespace(), nil); err != nil {
 		return err
 	}
 	if err := r.cleanupOverlay(ctx, model.Namespace); err != nil {
@@ -384,6 +398,11 @@ func (r *Reconciler) handleModelLifecycle(ctx context.Context, model *v1alpha1.E
 // releasing the ExternalModel finalizer. Deletion therefore does not depend on
 // an unrelated sibling watch to remove stale transport or overlay state.
 func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha1.ExternalModel, ait *unstructured.Unstructured) error {
+	gatewayName := r.gatewayName()
+	gatewayNamespace := r.gatewayNamespace()
+	if selectedGateway, selectedNamespace, ok := tenant.GatewayRef(ait); ok {
+		gatewayName, gatewayNamespace = selectedGateway, selectedNamespace
+	}
 	var models v1alpha1.ExternalModelList
 	if err := r.List(ctx, &models, client.InNamespace(deleted.Namespace)); err != nil {
 		return fmt.Errorf("list remaining ExternalModels for deletion: %w", err)
@@ -414,10 +433,13 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 		if len(modelPtrs) > 0 {
 			return err
 		}
-		if err := r.cleanupTransport(ctx, deleted.Namespace, nil); err != nil {
+		if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayNamespace, nil); err != nil {
 			return err
 		}
 		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
+			return err
+		}
+		if err := r.enableExternalModelRoutes(ctx, tenant.ID(ait.GetName()), deleted.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
 			return err
 		}
 		return r.removeExternalModelFinalizer(ctx, deleted)
@@ -425,17 +447,13 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 	if err != nil {
 		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
 	}
-	if len(r.KnownClusters) == 0 {
-		return errors.New("no Praxis load_balancer clusters are configured while deleting ExternalModel")
+	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
+		return fmt.Errorf("validate remaining ExternalModel credentials after deletion: %w", err)
 	}
-	gatewayName, gatewayNamespace := r.gatewayName(), r.gatewayNamespace()
-	if selectedGateway, selectedNamespace, ok := tenant.GatewayRef(ait); ok {
-		gatewayName, gatewayNamespace = selectedGateway, selectedNamespace
-	}
-	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
+	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenant.ID(ait.GetName()), gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
-	if err := r.cleanupTransport(ctx, deleted.Namespace, set.Routes()); err != nil {
+	if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayNamespace, set.Routes()); err != nil {
 		return err
 	}
 	pub, err := publisher.New(r.Client, publisher.Config{Namespace: deleted.Namespace, Name: r.ConfigMap})
@@ -449,7 +467,7 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 	if _, err := publish(ctx, set, envelope.Scope{
 		Network: r.Network, Gateway: gatewayName, Namespace: deleted.Namespace, LocalSite: r.localSite(),
 	}, envelope.Options{
-		KnownClusters: r.KnownClusters, SourceUID: string(modelPtrs[0].UID), ProducerVersion: "dev",
+		KnownClusters: r.KnownClusters, SourceUID: string(modelPtrs[0].UID), ProducerVersion: r.ProducerVersion,
 	}); err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
 	}
@@ -466,7 +484,7 @@ func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1
 	return nil
 }
 
-func (r *Reconciler) cleanupTransport(ctx context.Context, namespace string, routes []resolver.Route) error {
+func (r *Reconciler) cleanupTransport(ctx context.Context, namespace, gatewayNamespace string, routes []resolver.Route) error {
 	providers := map[string]bool{}
 	models := map[string]bool{}
 	for _, route := range routes {
@@ -478,21 +496,35 @@ func (r *Reconciler) cleanupTransport(ctx context.Context, namespace string, rou
 		keep                        map[string]bool
 	}{
 		{"Service", "", "v1", "inference.opendatahub.io/external-provider", providers},
+		{"Service", "", "v1", "inference.opendatahub.io/external-model", models},
 		{"ServiceEntry", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", providers},
 		{"DestinationRule", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", providers},
 		{"HTTPRoute", "gateway.networking.k8s.io", "v1", "inference.opendatahub.io/external-model", models},
 	}
 	for _, resource := range resources {
-		list := &unstructured.UnstructuredList{}
-		list.SetGroupVersionKind(schema.GroupVersionKind{Group: resource.group, Version: resource.version, Kind: resource.kind + "List"})
-		if err := r.List(ctx, list, client.InNamespace(namespace), client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}); err != nil {
-			return fmt.Errorf("list stale %s resources: %w", resource.kind, err)
+		namespaces := []string{namespace}
+		if resource.kind == "DestinationRule" && gatewayNamespace != namespace {
+			namespaces = append(namespaces, gatewayNamespace)
 		}
-		for i := range list.Items {
-			name := list.Items[i].GetLabels()[resource.label]
-			if name != "" && !resource.keep[name] {
-				if err := r.Delete(ctx, &list.Items[i]); client.IgnoreNotFound(err) != nil {
-					return fmt.Errorf("delete stale %s %s/%s: %w", resource.kind, namespace, list.Items[i].GetName(), err)
+		for _, resourceNamespace := range namespaces {
+			list := &unstructured.UnstructuredList{}
+			list.SetGroupVersionKind(schema.GroupVersionKind{Group: resource.group, Version: resource.version, Kind: resource.kind + "List"})
+			if err := r.List(ctx, list, client.InNamespace(resourceNamespace), client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}); err != nil {
+				return fmt.Errorf("list stale %s resources: %w", resource.kind, err)
+			}
+			for i := range list.Items {
+				name := list.Items[i].GetLabels()[resource.label]
+				keep := resource.keep[name]
+				// DestinationRules are Gateway-local when the Gateway and
+				// tenant namespaces differ. Remove an older controller-owned
+				// copy left in the tenant namespace during that topology move.
+				if resource.kind == "DestinationRule" && resourceNamespace == namespace && gatewayNamespace != namespace {
+					keep = false
+				}
+				if name != "" && !keep {
+					if err := r.Delete(ctx, &list.Items[i]); client.IgnoreNotFound(err) != nil {
+						return fmt.Errorf("delete stale %s %s/%s: %w", resource.kind, resourceNamespace, list.Items[i].GetName(), err)
+					}
 				}
 			}
 		}
@@ -535,7 +567,10 @@ func (r *Reconciler) praxisTenantForNamespace(ctx context.Context, namespace str
 	return nil, false, nil
 }
 
-func (r *Reconciler) validateProvider(ctx context.Context, p *v1alpha1.ExternalProvider) error {
+func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalProvider) error {
+	if err := validateProviderEndpoint(p.Spec.Endpoint); err != nil {
+		return err
+	}
 	authType := strings.ToLower(strings.TrimSpace(p.Spec.Auth.Type))
 	if authType != "apikey" {
 		if authType == "" {
@@ -546,15 +581,39 @@ func (r *Reconciler) validateProvider(ctx context.Context, p *v1alpha1.ExternalP
 	if p.Spec.Auth.SecretRef.Name == "" {
 		return errors.New("auth.secretRef.name is required")
 	}
+	return nil
+}
+
+// validateResolvedCredentials checks the effective credential after applying
+// any ExternalModel ref override. This is intentionally route-based: the same
+// resolved reference is published in the overlay and projected into ExtProc.
+func (r *Reconciler) validateResolvedCredentials(ctx context.Context, routes []resolver.Route) error {
 	if r.APIReader == nil {
 		return errors.New("APIReader is required for credential Secret reads")
 	}
-	var secret corev1.Secret
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: p.Spec.Auth.SecretRef.Name}, &secret); err != nil {
-		return fmt.Errorf("credential Secret %s/%s: %w", p.Namespace, p.Spec.Auth.SecretRef.Name, err)
-	}
-	if _, ok := secret.Data["api-key"]; !ok {
-		return fmt.Errorf("credential Secret %s/%s is missing key api-key", p.Namespace, p.Spec.Auth.SecretRef.Name)
+	seen := map[client.ObjectKey]bool{}
+	for _, route := range routes {
+		if route.AuthType == "" {
+			continue
+		}
+		if route.AuthType != "apikey" {
+			return fmt.Errorf("model %s provider %s uses unsupported authentication strategy %q", route.Model, route.Provider, route.AuthType)
+		}
+		if route.SecretName == "" || route.SecretKey == "" {
+			return fmt.Errorf("model %s provider %s has an incomplete effective credential reference", route.Model, route.Provider)
+		}
+		key := client.ObjectKey{Namespace: route.Namespace, Name: route.SecretName}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		var secret corev1.Secret
+		if err := r.APIReader.Get(ctx, key, &secret); err != nil {
+			return fmt.Errorf("%w: Secret %s/%s: %w", errCredentialNotReady, key.Namespace, key.Name, err)
+		}
+		if _, ok := secret.Data[route.SecretKey]; !ok {
+			return fmt.Errorf("%w: Secret %s/%s is missing key %s", errCredentialNotReady, key.Namespace, key.Name, route.SecretKey)
+		}
 	}
 	return nil
 }
@@ -563,7 +622,7 @@ func (r *Reconciler) namespaceAllowed(namespace string) bool {
 	return namespace != "" && (r.Namespace == "" || r.Namespace == namespace)
 }
 
-func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, gatewayName,
+func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, tenantID, gatewayName,
 	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel,
 	providerOwners map[string]*v1alpha1.ExternalProvider) error {
 	resources := make([]unstructured.Unstructured, 0, len(routes)*3+len(routes))
@@ -572,10 +631,16 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 		for _, obj := range []unstructured.Unstructured{
 			providerService(route, modelNamespace),
 			providerServiceEntry(route, modelNamespace),
-			providerDestinationRule(route, modelNamespace),
+			providerDestinationRuleForTenant(route, gatewayNamespace, tenantID),
 		} {
-			if owner := providerOwners[route.Provider]; owner != nil {
+			if owner := providerOwners[route.Provider]; owner != nil && owner.GetNamespace() == obj.GetNamespace() {
 				setOwnerReference(&obj, owner)
+			} else if obj.GetKind() == "DestinationRule" {
+				// Gateway-local rules cannot be owned by the tenant-local
+				// ExternalProvider. Explicitly clear any owner reference from
+				// an older reconciliation so Kubernetes does not garbage-collect
+				// the cross-namespace rule.
+				obj.SetOwnerReferences([]metav1.OwnerReference{})
 			}
 			key := obj.GetKind() + "/" + obj.GetNamespace() + "/" + obj.GetName()
 			if !seen[key] {
@@ -584,13 +649,27 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 			}
 		}
 	}
-	models := map[string]resolver.Route{}
+	models := map[string][]resolver.Route{}
 	for _, route := range routes {
-		models[route.Model] = route
+		models[route.Model] = append(models[route.Model], route)
 	}
-	for _, route := range models {
-		obj := modelHTTPRoute(route, modelNamespace, gatewayName, gatewayNamespace)
-		if owner := modelOwners[route.Model]; owner != nil {
+	modelNames := make([]string, 0, len(models))
+	for modelName := range models {
+		modelNames = append(modelNames, modelName)
+	}
+	sort.Strings(modelNames)
+	for _, modelName := range modelNames {
+		modelRoutes := models[modelName]
+		sink := providerSelectionSink(modelRoutes[0], modelNamespace)
+		if owner := modelOwners[modelRoutes[0].Model]; owner != nil {
+			setOwnerReference(&sink, owner)
+		}
+		if key := sink.GetKind() + "/" + sink.GetNamespace() + "/" + sink.GetName(); !seen[key] {
+			resources = append(resources, sink)
+			seen[key] = true
+		}
+		obj := modelHTTPRouteSet(modelRoutes, modelNamespace, gatewayName, gatewayNamespace)
+		if owner := modelOwners[modelRoutes[0].Model]; owner != nil {
 			setOwnerReference(&obj, owner)
 		}
 		key := obj.GetKind() + "/" + obj.GetNamespace() + "/" + obj.GetName()
@@ -609,7 +688,130 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 			return err
 		}
 	}
+	if err := r.enableExternalModelRoutes(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, routes); err != nil {
+		return err
+	}
 	return nil
+}
+
+// enableExternalModelRoutes owns a separate EnvoyFilter containing only the
+// route-specific ExternalModel filter overrides. The tenant reconciler owns
+// the base EnvoyFilter; keeping these objects separate prevents concurrent
+// tenant/model reconciles from overwriting configPatches.
+func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, modelNamespace, gatewayName, gatewayNamespace string, routes []resolver.Route) error {
+	name := tenant.PayloadProcessingExternalModelEnvoyFilterName(tenantID)
+	if len(routes) == 0 {
+		filter := &unstructured.Unstructured{}
+		filter.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"})
+		filter.SetName(name)
+		filter.SetNamespace(gatewayNamespace)
+		if err := r.Get(ctx, client.ObjectKeyFromObject(filter), filter); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if filter.GetLabels()["app.kubernetes.io/managed-by"] != "ai-gateway-controller" {
+			return nil
+		}
+		return client.IgnoreNotFound(r.Delete(ctx, filter))
+	}
+	filter := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.istio.io/v1alpha3",
+		"kind":       "EnvoyFilter",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": gatewayNamespace,
+			"labels": map[string]any{
+				"app.kubernetes.io/managed-by": "ai-gateway-controller",
+			},
+		},
+		"spec": map[string]any{
+			"priority": int64(20),
+			"workloadSelector": map[string]any{
+				"labels": map[string]any{
+					"gateway.networking.k8s.io/gateway-name": gatewayName,
+				},
+			},
+		},
+	}}
+	kept := make([]any, 0, len(routes)*2+2)
+
+	byModel := map[string]int{}
+	for _, route := range routes {
+		byModel[route.Model]++
+	}
+	models := make([]string, 0, len(byModel))
+	for model := range byModel {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		// modelHTTPRouteSet emits two provider rules per route plus the
+		// canonical and header-only fail-closed sink rules.
+		count := byModel[model]*2 + 2
+		for index := 0; index < count; index++ {
+			kept = append(kept, map[string]any{
+				"applyTo": "HTTP_ROUTE",
+				"match": map[string]any{
+					"context": "GATEWAY",
+					"routeConfiguration": map[string]any{"vhost": map[string]any{
+						"route": map[string]any{
+							"name": fmt.Sprintf("%s.%s.%d", modelNamespace, modelRouteName(model), index),
+						},
+					}},
+				},
+				"patch": map[string]any{
+					"operation": "MERGE",
+					"value": map[string]any{"typed_per_filter_config": map[string]any{
+						externalModelPreExtProcFilter: map[string]any{
+							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+							"overrides": map[string]any{
+								"processing_mode": map[string]any{
+									"request_header_mode":   "SEND",
+									"request_body_mode":     "BUFFERED",
+									"response_header_mode":  "SKIP",
+									"response_body_mode":    "NONE",
+									"request_trailer_mode":  "SKIP",
+									"response_trailer_mode": "SKIP",
+								},
+							},
+						},
+						externalModelExtProcFilter: map[string]any{
+							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+							// ExtProcPerRoute is disable-only when the
+							// vhost config is disabled. An overrides
+							// object is the supported way for this
+							// more-specific ExternalModel route to
+							// re-enable the filter.
+							"overrides": map[string]any{
+								"processing_mode": map[string]any{
+									"request_header_mode":   "SEND",
+									"request_body_mode":     "NONE",
+									"response_header_mode":  "SEND",
+									"response_body_mode":    "NONE",
+									"request_trailer_mode":  "SKIP",
+									"response_trailer_mode": "SKIP",
+								},
+							},
+						},
+						"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
+							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+							"disabled": true,
+						},
+						"envoy.filters.http.ext_proc.ipp": map[string]any{
+							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+							"disabled": true,
+						},
+					}},
+				},
+			})
+		}
+	}
+	if err := unstructured.SetNestedSlice(filter.Object, kept, "spec", "configPatches"); err != nil {
+		return fmt.Errorf("write ExternalModel EnvoyFilter route patches: %w", err)
+	}
+	if r.ApplyResource != nil {
+		return r.ApplyResource(ctx, r.Client, *filter)
+	}
+	return render.Apply(ctx, r.Client, []unstructured.Unstructured{*filter})
 }
 
 func setOwnerReference(obj *unstructured.Unstructured, owner client.Object) {
@@ -729,64 +931,171 @@ func labelledMetadata(name, namespace, key, value string) map[string]any {
 }
 
 func providerService(route resolver.Route, ns string) unstructured.Unstructured {
+	endpoint := providerEndpointForRoute(route)
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "Service",
 		"metadata": labelledMetadata(providerServicePrefix+route.Provider, ns, "inference.opendatahub.io/external-provider", route.Provider),
 		"spec": map[string]any{
-			"type": "ExternalName", "externalName": route.Endpoint,
-			"ports": []any{map[string]any{"name": "https", "port": int64(443), "targetPort": int64(443)}},
+			"type": "ExternalName", "externalName": endpoint.host,
+			"ports": []any{map[string]any{"name": "https", "port": endpoint.port, "targetPort": endpoint.port}},
 		},
 	}}
 }
 func providerServiceEntry(route resolver.Route, ns string) unstructured.Unstructured {
+	endpoint := providerEndpointForRoute(route)
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "networking.istio.io/v1", "kind": "ServiceEntry",
 		"metadata": labelledMetadata(providerServicePrefix+route.Provider, ns, "inference.opendatahub.io/external-provider", route.Provider),
 		"spec": map[string]any{
-			"hosts": []any{route.Endpoint}, "location": "MESH_EXTERNAL", "resolution": "DNS",
-			"ports": []any{map[string]any{"name": "https", "number": int64(443), "protocol": "HTTPS"}},
+			"hosts": []any{endpoint.host}, "location": "MESH_EXTERNAL", "resolution": "DNS",
+			"ports": []any{map[string]any{"name": "https", "number": endpoint.port, "protocol": "HTTPS"}},
 		},
 	}}
 }
 func providerDestinationRule(route resolver.Route, ns string) unstructured.Unstructured {
+	return providerDestinationRuleForTenant(route, ns, "")
+}
+
+// providerDestinationRuleForTenant names Gateway-local provider policies per
+// tenant. Multiple tenant reconcilers share a Gateway namespace, so the
+// provider-only name is insufficient: a later reconcile could otherwise
+// overwrite another tenant's endpoint/SNI policy. Preserve the historical
+// default-tenant name for compatibility with existing installations.
+func providerDestinationRuleForTenant(route resolver.Route, ns, tenantID string) unstructured.Unstructured {
+	endpoint := providerEndpointForRoute(route)
+	tls := map[string]any{"mode": "SIMPLE", "sni": endpoint.host}
+	if route.TLSCACertificates != "" {
+		tls["caCertificates"] = route.TLSCACertificates
+	}
+	name := providerServicePrefix + route.Provider
+	if tenantID != "" && tenantID != "models-as-a-service" {
+		name += "-" + tenantID
+	}
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "networking.istio.io/v1", "kind": "DestinationRule",
-		"metadata": labelledMetadata(providerServicePrefix+route.Provider, ns, "inference.opendatahub.io/external-provider", route.Provider),
+		"metadata": labelledMetadata(name, ns, "inference.opendatahub.io/external-provider", route.Provider),
 		"spec": map[string]any{
-			"host":          route.Endpoint,
-			"trafficPolicy": map[string]any{"tls": map[string]any{"mode": "SIMPLE", "sni": route.Endpoint}},
+			// The Gateway workload may be in a different namespace from the
+			// tenant-owned transport resources. Export the rule explicitly so
+			// Envoy receives the provider TLS/SNI policy across that boundary.
+			"exportTo":      []any{"*"},
+			"host":          endpoint.host,
+			"trafficPolicy": map[string]any{"tls": tls},
 		},
 	}}
 }
+
+func providerPort(route resolver.Route) int64 {
+	return providerEndpointForRoute(route).port
+}
+
+func providerEndpointForRoute(route resolver.Route) providerEndpoint {
+	endpoint, err := parseProviderEndpoint(route.Endpoint)
+	if err != nil {
+		// Reconciliation validates provider endpoints before rendering. This
+		// defensive value keeps render-only unit fixtures with an omitted
+		// endpoint structurally inspectable without creating a new fallback in
+		// the live reconcile path.
+		return providerEndpoint{authority: route.Endpoint, host: route.Endpoint, port: 443}
+	}
+	return endpoint
+}
+
 func modelHTTPRoute(route resolver.Route, ns, gateway, gatewayNS string) unstructured.Unstructured {
+	return modelHTTPRouteSet([]resolver.Route{route}, ns, gateway, gatewayNS)
+}
+
+func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) unstructured.Unstructured {
+	if len(routes) == 0 {
+		return unstructured.Unstructured{}
+	}
+	route := routes[0]
 	parent := map[string]any{"name": gateway}
 	if gatewayNS != "" && gatewayNS != ns {
 		parent["namespace"] = gatewayNS
 	}
 	path := "/" + ns + "/" + route.ClientName
-	backend := providerServicePrefix + route.Provider
+	rules := make([]any, 0, len(routes)*2+2)
+	seenProviders := map[string]bool{}
+	for _, candidate := range routes {
+		if seenProviders[candidate.Provider] {
+			continue
+		}
+		seenProviders[candidate.Provider] = true
+		rules = append(rules, map[string]any{
+			"matches": []any{map[string]any{
+				"path":    map[string]any{"type": "PathPrefix", "value": path},
+				"headers": []any{map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": "provider-" + candidate.Provider}},
+			}},
+			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
+			"filters":     []any{providerURLRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
+			"timeouts":    map[string]any{"request": "300s"},
+		})
+		// Body-routed requests enter on a model header rather than the
+		// canonical path. The selected-provider header is still authoritative
+		// after post-auth ExtProc clears the route cache.
+		rules = append(rules, map[string]any{
+			"matches": []any{map[string]any{"headers": []any{
+				map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName},
+				map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": "provider-" + candidate.Provider},
+			}}},
+			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
+			"filters":     []any{providerHostnameRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
+			"timeouts":    map[string]any{"request": "300s"},
+		})
+	}
+	sinkName := providerSelectionSinkName(route.Model)
+	rules = append(rules, map[string]any{
+		"matches":     []any{map[string]any{"path": map[string]any{"type": "PathPrefix", "value": path}}},
+		"backendRefs": []any{map[string]any{"name": sinkName, "port": int64(443)}},
+		"timeouts":    map[string]any{"request": "300s"},
+	})
+	// Keep the body-routing rule for requests whose path is not the canonical
+	// model path. The post-auth ExtProc selection header is authoritative for
+	// provider choice and the route-cache clear causes Envoy to reselect one of
+	// the header rules above.
+	rules = append(rules, map[string]any{
+		"matches":     []any{map[string]any{"headers": []any{map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName}}}},
+		"backendRefs": []any{map[string]any{"name": sinkName, "port": int64(443)}},
+		"timeouts":    map[string]any{"request": "300s"},
+	})
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
 		"metadata": labelledMetadata(modelRouteName(route.Model), ns, "inference.opendatahub.io/external-model", route.Model),
 		"spec": map[string]any{
 			"parentRefs": []any{parent},
-			"rules": []any{
-				map[string]any{
-					"matches":     []any{map[string]any{"path": map[string]any{"type": "PathPrefix", "value": path}}},
-					"backendRefs": []any{map[string]any{"name": backend, "port": int64(443)}},
-					"filters":     []any{map[string]any{"type": "URLRewrite", "urlRewrite": map[string]any{"path": map[string]any{"type": "ReplacePrefixMatch", "replacePrefixMatch": "/"}}}},
-					"timeouts":    map[string]any{"request": "300s"},
-				},
-				map[string]any{
-					// This body-routing rule intentionally matches the model header
-					// on any Gateway path. ExtProc extracts the client model identity
-					// from the request body/header, while the path rule above preserves
-					// the normal URL-based contract and rewrite.
-					"matches":     []any{map[string]any{"headers": []any{map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName}}}},
-					"backendRefs": []any{map[string]any{"name": backend, "port": int64(443)}},
-					"timeouts":    map[string]any{"request": "300s"},
-				},
-			},
+			"rules":      rules,
+		},
+	}}
+}
+
+func providerURLRewrite(endpoint providerEndpoint) map[string]any {
+	return map[string]any{"type": "URLRewrite", "urlRewrite": map[string]any{
+		"hostname": endpoint.host,
+		"path":     map[string]any{"type": "ReplacePrefixMatch", "replacePrefixMatch": "/"},
+	}}
+}
+
+func providerHostnameRewrite(endpoint providerEndpoint) map[string]any {
+	return map[string]any{"type": "URLRewrite", "urlRewrite": map[string]any{"hostname": endpoint.host}}
+}
+
+func removeInternalRoutingHeaders() map[string]any {
+	return map[string]any{"type": "RequestHeaderModifier", "requestHeaderModifier": map[string]any{
+		"remove": []any{"x-ai-routing-candidate", "x-ai-routing-request-id", "x-ai-routing-revision"},
+	}}
+}
+
+func providerSelectionSinkName(model string) string {
+	return providerSelectionSinkPrefix + strings.ToLower(strings.ReplaceAll(model, "/", "-"))
+}
+
+func providerSelectionSink(route resolver.Route, namespace string) unstructured.Unstructured {
+	return unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "Service",
+		"metadata": labelledMetadata(providerSelectionSinkName(route.Model), namespace, "inference.opendatahub.io/external-model", route.Model),
+		"spec": map[string]any{
+			"ports": []any{map[string]any{"name": "https", "port": int64(443), "targetPort": int64(443)}},
 		},
 	}}
 }
