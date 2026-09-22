@@ -21,7 +21,7 @@ spec:
   automountServiceAccountToken: false
   restartPolicy: Always
   securityContext:
-    runAsNonRoot: true
+    runAsNonRoot: ${EXTERNAL_MODEL_CLIENT_RUN_AS_NON_ROOT}
     seccompProfile: {type: RuntimeDefault}
   containers:
     - name: client

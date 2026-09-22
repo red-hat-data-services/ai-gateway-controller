@@ -17,7 +17,7 @@ assert_titles() {
   local output=$1
   for title in \
     'TEST 1: Deployment readiness' \
-    'TEST 2: Tenant Praxis selection' \
+    'TEST 2: Tenant ExtProc selection' \
     'TEST 3: Route acceptance' \
     'TEST 4: Public TLS and authentication' \
     'TEST 5: Provider A request' \

@@ -17,6 +17,7 @@ mkdir -p "$OUT"
 RECOMPUTE_BIN="$OUT/recompute-digest"
 go build -o "$RECOMPUTE_BIN" "$ROOT/test/openshift-env/recompute_digest.go"
 AITENANT_NAME="${OPENSHIFT_E2E_AITENANT_NAME:-models-as-a-service}"
+POST_AUTH_DEPLOYMENT=payload-processing-external-model
 RESULTS="$OUT/results.json"
 tmp="$RESULTS.tmp.$$"
 printf '{"suite":"openshift-routing","functional":"RUNNING","assertions":[]}' >"$tmp"
@@ -76,10 +77,17 @@ wait_json() {
 wait_json "controller deployment" "${OC[*]} get deployment ai-gateway-controller -n $OPENSHIFT_E2E_CONTROLLER_NAMESPACE -o json | jq -e '.status.availableReplicas == 1' >/dev/null" || { record 1 "controller deployment Ready" FAIL deployment "controller did not become available"; exit 1; }
 record 1 "controller deployment Ready" PASS deployment "availableReplicas=1"
 "${OC[@]}" get aitenant "$AITENANT_NAME" -n ai-tenants -o json >"$OUT/aitenant.json"
+RESOLVED_TENANT_NAMESPACE=$(jq -r '.status.tenantNamespace // empty' "$OUT/aitenant.json")
+if [[ -z "$RESOLVED_TENANT_NAMESPACE" || "$RESOLVED_TENANT_NAMESPACE" != "$OPENSHIFT_E2E_TENANT_NAMESPACE" ]]; then
+  record 2 "AITenant namespace resolution" FAIL maas "run state namespace does not match live AITenant status"
+  exit 1
+fi
 wait_json "AITenant Ready" "${OC[*]} get aitenant $AITENANT_NAME -n ai-tenants -o json | jq -e '[.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1' >/dev/null" || { record 2 "AITenant Ready" FAIL maas "MaaS did not report Ready"; exit 1; }
 record 2 "AITenant Ready" PASS maas "MaaS reported Ready"
+CURRENT_ASSERTION="ExternalProvider Ready"
 wait_json "provider Ready" "${OC[*]} get externalprovider provider-a -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.status.phase == \"Ready\"' >/dev/null" || { record 3 "ExternalProvider Ready" FAIL controller "provider status did not converge"; exit 1; }
 record 3 "ExternalProvider Ready" PASS controller "status.phase=Ready"
+CURRENT_ASSERTION="ExternalModel Ready"
 wait_json "model Ready" "${OC[*]} get externalmodel demo-model -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.status.phase == \"Ready\"' >/dev/null" || { record 4 "ExternalModel Ready" FAIL controller "model status did not converge"; exit 1; }
 record 4 "ExternalModel Ready" PASS controller "status.phase=Ready"
 "${OC[@]}" get httproute -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json >"$OUT/httproutes.json"
@@ -88,36 +96,54 @@ record 5 "HTTPRoute Accepted" PASS gateway "Accepted=True observed"
 wait_json "HTTPRoute references" "${OC[*]} get httproute -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '[.items[].status.parents[]?.conditions[]? | select(.type==\"ResolvedRefs\" and .status==\"True\")] | length > 0' >/dev/null" || { record 6 "HTTPRoute ResolvedRefs" FAIL gateway "no ResolvedRefs=True parent"; exit 1; }
 record 6 "HTTPRoute ResolvedRefs" PASS gateway "ResolvedRefs=True observed"
 "${OC[@]}" get deployment,service,serviceaccount,configmap -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json >"$OUT/tenant-resources.json"
-wait_json "Praxis deployment" "${OC[*]} get deployment -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app.kubernetes.io/managed-by=ai-gateway-controller -o json | jq -e '.items | length == 1 and .[0].status.availableReplicas == 1' >/dev/null" || { record 7 "standalone Praxis Ready" FAIL tenant "tenant Praxis deployment did not become available"; exit 1; }
-record 7 "standalone Praxis Ready" PASS tenant "tenant-local deployment available"
-praxis_config=$(${OC[@]} get configmap praxis-config -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)
-printf '%s\n' "$praxis_config" >"$OUT/praxis-transport-config.txt"
-transport_ok=true
-for provider in a b; do
-  endpoint="provider-$provider.$OPENSHIFT_E2E_BACKEND_NAMESPACE.svc.cluster.local"
-  grep -Fq "authority: \"$endpoint\"" "$OUT/praxis-transport-config.txt" || transport_ok=false
-  grep -Fq "sni: \"$endpoint\"" "$OUT/praxis-transport-config.txt" || transport_ok=false
-  grep -Fq "endpoints: [\"$endpoint:443\"]" "$OUT/praxis-transport-config.txt" || transport_ok=false
-done
-if [[ "$transport_ok" == true ]] && ! grep -Eq 'sni: "[^"]+:[0-9]+' "$OUT/praxis-transport-config.txt"; then
-  record 8-transport "External HTTPS transport" PASS transport "Provider A/B authority, verified TLS SNI hostnames, and explicit :443 dial ports observed"
-else
-  record 8-transport "External HTTPS transport" FAIL transport "Praxis config did not prove authority, verified TLS SNI, and explicit :443 dial ports for both providers"
+wait_json "ExtProc workloads" "${OC[*]} get deployment payload-pre-processing -n $OPENSHIFT_E2E_GATEWAY_NAMESPACE -o json | jq -e '.status.availableReplicas == 1' >/dev/null && ${OC[*]} get deployment $POST_AUTH_DEPLOYMENT -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.status.availableReplicas == 1' >/dev/null" || { record 7 "ExtProc-only workloads Ready" FAIL tenant "pre-auth or post-auth ExtProc deployment did not become available"; exit 1; }
+if "${OC[@]}" get deployment praxis -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o name 2>/dev/null | grep -q .; then
+  record 7 "Standalone provider-forwarding workload absent" FAIL tenant "unexpected standalone provider-forwarding deployment exists"
   exit 1
 fi
-PRAXIS_SA=$("${OC[@]}" get deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app.kubernetes.io/managed-by=ai-gateway-controller -o jsonpath='{.items[0].spec.template.spec.serviceAccountName}' 2>/dev/null || true)
+record 7 "ExtProc-only workloads Ready" PASS tenant "Gateway-local pre-auth and tenant-local post-auth ExtProc are available; standalone provider-forwarding workload absent"
+extproc_config=$("${OC[@]}" get configmap -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app.kubernetes.io/managed-by=ai-gateway-controller -o json 2>/dev/null | jq -r '[.items[] | .data["extproc.yaml"] // empty] | first // ""' || true)
+printf '%s\n' "$extproc_config" >"$OUT/extproc-transport-config.txt"
+: >"$OUT/external-https-transport.json"
+transport_ok=true
+for provider in a b; do
+  grep -Fq "provider-provider-$provider" "$OUT/extproc-transport-config.txt" || transport_ok=false
+  provider_host="provider-$provider.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local"
+  service_json=$(${OC[@]} get service "provider-$provider" -n "$OPENSHIFT_E2E_BACKEND_NAMESPACE" -o json 2>/dev/null || true)
+  service_entry=$(${OC[@]} get serviceentry "provider-$provider" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json 2>/dev/null || true)
+  destination_rule=$(${OC[@]} get destinationrule "provider-$provider" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o json 2>/dev/null || true)
+  [[ "$(jq -r '[.spec.ports[]?.port] | any(. == 443)' <<<"$service_json")" == true ]] || transport_ok=false
+  [[ "$(jq -r '.spec.host // empty' <<<"$destination_rule")" == "$provider_host" ]] || transport_ok=false
+  [[ "$(jq -r '.spec.trafficPolicy.tls.sni // empty' <<<"$destination_rule")" == "$provider_host" ]] || transport_ok=false
+  [[ "$(jq -r '[.spec.hosts[]?] | any(. == $host)' --arg host "$provider_host" <<<"$service_entry")" == true ]] || transport_ok=false
+  jq -n --arg provider "$provider" --arg host "$provider_host" --argjson service "$service_json" --argjson serviceEntry "$service_entry" --argjson destinationRule "$destination_rule" \
+    '{provider:$provider,host:$host,service:{ports:($service.spec.ports // [])},serviceEntry:{hosts:($serviceEntry.spec.hosts // [])},destinationRule:{host:($destinationRule.spec.host // null),sni:($destinationRule.spec.trafficPolicy.tls.sni // null)}}' \
+    >>"$OUT/external-https-transport.json" 2>/dev/null || true
+done
+if [[ "$transport_ok" == true ]]; then
+  record 8-transport "External HTTPS transport" PASS transport "provider Services expose 443; ServiceEntry hosts, DestinationRule authority, and TLS SNI match the provider hostnames"
+else
+  record 8-transport "External HTTPS transport" FAIL transport "provider cluster, Service port 443, ServiceEntry host, or DestinationRule host/SNI contract was not proven"
+  exit 1
+fi
+PRAXIS_SA=$("${OC[@]}" get deployment "$POST_AUTH_DEPLOYMENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.spec.template.spec.serviceAccountName}' 2>/dev/null || true)
 if [[ -z "$PRAXIS_SA" ]]; then
-  record 8 "Praxis Secret API denied" FAIL rbac "standalone Praxis ServiceAccount was not found"
+  record 8 "ExtProc Secret API denied" FAIL rbac "post-auth ExtProc ServiceAccount was not found"
+  exit 1
+fi
+printf 'serviceAccount=%s\n' "$PRAXIS_SA" >"$OUT/post-auth-service-account.txt"
+if [[ "$PRAXIS_SA" != payload-processing-external-model* ]]; then
+  record 8 "ExtProc Secret API denied" FAIL rbac "ExternalModel post-auth ExtProc uses unexpected ServiceAccount: $PRAXIS_SA"
   exit 1
 fi
 SECRET_API_ACCESS=$("${OC[@]}" auth can-i get secrets --as="system:serviceaccount:$OPENSHIFT_E2E_TENANT_NAMESPACE:$PRAXIS_SA" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" || true)
 if [[ "$SECRET_API_ACCESS" == no ]]; then
-  record 8 "Praxis Secret API denied" PASS rbac "tenant Praxis ServiceAccount denied Secret reads"
+  record 8 "ExtProc Secret API denied" PASS rbac "post-auth ExtProc ServiceAccount $PRAXIS_SA denied Secret reads"
 else
-  record 8 "Praxis Secret API denied" FAIL rbac "tenant Praxis ServiceAccount can read Secrets"
+  record 8 "ExtProc Secret API denied" FAIL rbac "post-auth ExtProc ServiceAccount can read Secrets"
   exit 1
 fi
-"${OC[@]}" get pods -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o json >"$OUT/praxis-pods.json"
+"${OC[@]}" get pods -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=payload-processing-external-model -o json >"$OUT/post-auth-extproc-pods.json"
 "${OC[@]}" get events -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --sort-by=.lastTimestamp >"$OUT/events.txt" 2>/dev/null || :
 jq '.functional="RUNNING" | .note="functional request qualification"' "$RESULTS" >"$tmp"
 mv "$tmp" "$RESULTS"
@@ -163,20 +189,24 @@ wait_for_gateway_tls() {
   printf 'Gateway TLS endpoint did not become reachable before deadline\n' >&2
   return 1
 }
-wait_for_praxis_overlay() {
+wait_for_extproc_overlay() {
   local expected_provider=$1 expected_generation=$2 expected_digest=$3
-  local stable=0 previous="" observation config_content mounted_content static_config generation digest recomputed mounted_digest praxis_identity
+  local stable=0 previous="" observation config_content mounted_content static_config generation digest recomputed mounted_digest extproc_identity revision_line accepted_revision serving_revision
   local deadline=$((SECONDS + 180))
   while (( SECONDS < deadline )); do
     observation=""
     config_content=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.data.routing-overlay\.json}' 2>/dev/null || true)
-    static_config=$(${OC[@]} get configmap praxis-config -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)
+    static_config=$("${OC[@]}" get configmap -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app.kubernetes.io/managed-by=ai-gateway-controller -o json 2>/dev/null | jq -r '[.items[] | .data["extproc.yaml"] // empty] | first // ""' || true)
     generation=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-source-generation}' 2>/dev/null || true)
     digest=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-content-digest}' 2>/dev/null || true)
-    mounted_content=$(${OC[@]} exec deploy/praxis -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- cat /etc/praxis/routing/routing-overlay.json 2>/dev/null || true)
-    praxis_identity=$(${OC[@]} get pods -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o json 2>/dev/null | jq -r '[.items[] | select([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1)] | if length == 1 then .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv else empty end' || true)
+    mounted_content=$("${OC[@]}" exec deploy/"$POST_AUTH_DEPLOYMENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- cat /etc/praxis/routing/routing-overlay.json 2>/dev/null || true)
+    extproc_identity=$("${OC[@]}" get pods -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=payload-processing-external-model -o json 2>/dev/null | jq -r '[.items[] | select([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1)] | if length == 1 then .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv else empty end' || true)
+    revision_line=$("${OC[@]}" logs deploy/"$POST_AUTH_DEPLOYMENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -c payload-processing --tail=200 2>/dev/null | sed $'s/\033\\[[0-9;]*m//g' | rg 'intelligent_route: overlay (snapshot initialized|reloaded)' | tail -1 || true)
+    accepted_revision=$(printf '%s\n' "$revision_line" | grep -oE '(^|[[:space:]])accepted_revision="?[0-9a-f]{64}"?' | tail -1 | sed 's/^[[:space:]]*accepted_revision=//; s/"//g' || true)
+    serving_revision=$(printf '%s\n' "$revision_line" | grep -oE '(^|[[:space:]])serving_revision="?[0-9a-f]{64}"?' | tail -1 | sed 's/^[[:space:]]*serving_revision=//; s/"//g' || true)
     printf '%s' "$config_content" >"$OUT/config-overlay.json"
     printf '%s' "$mounted_content" >"$OUT/mounted-overlay.json"
+    printf 'line=%s\naccepted_revision=%s\nserving_revision=%s\n' "$revision_line" "$accepted_revision" "$serving_revision" >"$OUT/extproc-overlay-revision.txt"
     recomputed=$($RECOMPUTE_BIN "$OUT/config-overlay.json" 2>/dev/null || true)
     mounted_digest=$($RECOMPUTE_BIN "$OUT/mounted-overlay.json" 2>/dev/null || true)
     # Bind the expected revision only after the requested provider is present;
@@ -186,8 +216,8 @@ wait_for_praxis_overlay() {
       expected_generation="$generation"
       expected_digest="$digest"
     fi
-    if [[ -n "$praxis_identity" && "$generation" == "$expected_generation" && "$digest" == "$expected_digest" && "$digest" =~ ^[0-9a-f]{64}$ && "$recomputed" == "$digest" && "$mounted_digest" == "$digest" && "$config_content" == *"provider-provider-$expected_provider"* && "$mounted_content" == *"provider-provider-$expected_provider"* && "$static_config" == *"provider-provider-a"* && "$static_config" == *"provider-provider-b"* ]]; then
-      observation="$generation:$digest:$mounted_digest:$expected_provider:$praxis_identity"
+    if [[ -n "$extproc_identity" && "$generation" == "$expected_generation" && "$digest" == "$expected_digest" && "$digest" =~ ^[0-9a-f]{64}$ && "$recomputed" == "$digest" && "$mounted_digest" == "$digest" && "$accepted_revision" == "$digest" && "$serving_revision" == "$digest" && "$config_content" == *"provider-provider-$expected_provider"* && "$mounted_content" == *"provider-provider-$expected_provider"* && "$static_config" == *"provider-provider-a"* && "$static_config" == *"provider-provider-b"* ]]; then
+      observation="$generation:$digest:$mounted_digest:$accepted_revision:$serving_revision:$expected_provider:$extproc_identity"
       if [[ "$observation" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; previous="$observation"; fi
       [[ "$stable" -ge 2 ]] && return 0
     else
@@ -196,13 +226,13 @@ wait_for_praxis_overlay() {
     fi
     sleep 2
   done
-  printf 'overlay convergence failed: expected provider=%s generation=%s digest=%s observed generation=%s digest=%s recomputed=%s mounted=%s\n' "$expected_provider" "$expected_generation" "$expected_digest" "$generation" "$digest" "$recomputed" "$mounted_digest" >&2
+  printf 'overlay convergence failed: expected provider=%s generation=%s digest=%s observed generation=%s digest=%s recomputed=%s mounted=%s accepted=%s serving=%s\n' "$expected_provider" "$expected_generation" "$expected_digest" "$generation" "$digest" "$recomputed" "$mounted_digest" "$accepted_revision" "$serving_revision" >&2
   return 1
 }
 ${OC[@]} patch externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs/0/weight","value":1},{"op":"replace","path":"/spec/externalProviderRefs/1/weight","value":0}]' >"$OUT/baseline-provider-a.txt"
 wait_json "first endpoint controller reconciliation" "${OC[*]} get externalmodel demo-model -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.status.phase == \"Ready\"' >/dev/null" 180 || { record baseline "First endpoint baseline" FAIL cleanup "controller did not reconcile first endpoint"; exit 1; }
 wait_json "first endpoint ConfigMap" "${OC[*]} get configmap routing-overlay -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.data[\"routing-overlay.json\"] | contains(\"provider-provider-a\") and (contains(\"provider-provider-b\") | not)' >/dev/null" 180 || { record baseline "First endpoint baseline" FAIL cleanup "first endpoint ConfigMap did not converge"; exit 1; }
-wait_for_praxis_overlay a "" "" || { record baseline "First endpoint baseline" FAIL cleanup "Praxis projection did not converge"; exit 1; }
+wait_for_extproc_overlay a "" "" || { record baseline "First endpoint baseline" FAIL cleanup "ExternalModel ExtProc projection did not converge"; exit 1; }
 request_body='{"model":"demo","messages":[{"role":"user","content":"qualification"}]}'
 wait_for_gateway_tls || { record 9 "Gateway TLS endpoint" FAIL authorization "TLS endpoint did not reach the expected unauthenticated response"; exit 1; }
 unauth=$(request none "$URL" "$request_body" 2>/dev/null || true)
@@ -241,14 +271,14 @@ else
 fi
 unknown=$(request "$KEY" "https://$HOST/$OPENSHIFT_E2E_TENANT_NAMESPACE/missing-model/v1/chat/completions" '{"model":"missing-model","messages":[{"role":"user","content":"qualification"}]}' 2>/dev/null || true)
 [[ "$unknown" == 404 ]] && record 12 "Unknown model" PASS routing "HTTP 404" || { record 12 "Unknown model" FAIL routing "expected HTTP 404, observed $unknown"; exit 1; }
-before=$(wait_json "single ready Praxis pod" "${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=praxis -o json | jq -e '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | length == 1' >/dev/null && ${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=praxis -o json | jq -r '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv'" 180)
+before=$(wait_json "single ready post-auth ExtProc pod" "${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=payload-processing-external-model -o json | jq -e '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | length == 1' >/dev/null && ${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=payload-processing-external-model -o json | jq -r '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv'" 180)
 ${OC[@]} patch externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs/0/weight","value":0},{"op":"replace","path":"/spec/externalProviderRefs/1/weight","value":1}]' >"$OUT/endpoint-switch.txt"
 wait_json "second endpoint overlay" "${OC[*]} get configmap routing-overlay -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.data[\"routing-overlay.json\"] | contains(\"provider-provider-b\")' >/dev/null" 180 || { record 13-converge "Endpoint switch convergence" FAIL routing "second endpoint overlay did not converge"; exit 1; }
-wait_for_praxis_overlay b "" "" || { record 13-converge "Endpoint switch convergence" FAIL routing "second endpoint projection did not converge"; exit 1; }
+wait_for_extproc_overlay b "" "" || { record 13-converge "Endpoint switch convergence" FAIL routing "second endpoint projection did not converge"; exit 1; }
 b_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true); b_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
 [[ "$b_status" == 200 && "$b_body" == *provider-b* ]] && record 13 "Second test endpoint" PASS routing "HTTP 200; Test Provider B attribution observed" || { record 13 "Second test endpoint" FAIL routing "expected HTTP 200 from second endpoint"; exit 1; }
-after=$(wait_json "single ready Praxis pod after switch" "${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=praxis -o json | jq -e '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | length == 1' >/dev/null && ${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=praxis -o json | jq -r '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv'" 180)
-[[ "$before" == "$after" ]] && record 14 "Praxis identity stable" PASS tenant "UID and restart count unchanged" || { record 14 "Praxis identity stable" FAIL tenant "before=$before after=$after"; exit 1; }
+after=$(wait_json "single ready post-auth ExtProc pod after switch" "${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=payload-processing-external-model -o json | jq -e '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | length == 1' >/dev/null && ${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=payload-processing-external-model -o json | jq -r '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv'" 180)
+[[ "$before" == "$after" ]] && record 14 "ExternalModel ExtProc identity stable" PASS tenant "UID and restart count unchanged" || { record 14 "ExternalModel ExtProc identity stable" FAIL tenant "before=$before after=$after"; exit 1; }
 noop_before=$(${OC[@]} get externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json | jq -r '.metadata.generation')
 noop_cm_before=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json | jq -r '[.metadata.generation,.metadata.resourceVersion,.metadata.annotations["inference.opendatahub.io/routing-overlay-content-digest"]] | @tsv')
 ${OC[@]} get externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json | jq 'del(.metadata.creationTimestamp,.metadata.generation,.metadata.managedFields,.metadata.resourceVersion,.metadata.uid,.status)' | ${OC[@]} apply --server-side --field-manager=openshift-e2e-noop -f - >"$OUT/semantic-noop.txt"
@@ -259,7 +289,7 @@ valid_overlay=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT
 printf '%s' "$valid_overlay" >"$OUT/valid-overlay-before-lkg.json"
 ${OC[@]} patch configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --type=merge -p='{"data":{"routing-overlay.json":"{invalid-overlay"}}' >"$OUT/invalid-overlay-injection.txt"
 sleep 3
-lkg_mounted=$(${OC[@]} exec deploy/praxis -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- cat /etc/praxis/routing/routing-overlay.json 2>/dev/null || true)
+lkg_mounted=$("${OC[@]}" exec deploy/"$POST_AUTH_DEPLOYMENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- cat /etc/praxis/routing/routing-overlay.json 2>/dev/null || true)
 lkg_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true)
 [[ "$lkg_status" == 200 && "$lkg_mounted" == *provider-provider-b* ]] && record 16 "Invalid overlay LKG" PASS routing "malformed replacement retained the accepted Provider B route" || { record 16 "Invalid overlay LKG" FAIL routing "expected HTTP 200 with mounted Provider B last-known-good overlay, observed $lkg_status"; exit 1; }
 # The publisher intentionally refuses to chain from a tampered envelope.  The
@@ -267,7 +297,7 @@ lkg_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true)
 # the next normal ExternalModel reconciliation recreates the valid envelope.
 ${OC[@]} delete configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --ignore-not-found >"$OUT/lkg-recovery-delete.txt"
 ${OC[@]} patch externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs/0/weight","value":1},{"op":"replace","path":"/spec/externalProviderRefs/1/weight","value":0}]' >"$OUT/reset-provider-a.txt"
-wait_for_praxis_overlay a "" "" || { record 18 "Provider A reset" FAIL cleanup "baseline did not restore"; exit 1; }
+wait_for_extproc_overlay a "" "" || { record 18 "Provider A reset" FAIL cleanup "baseline did not restore"; exit 1; }
 reset_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true); reset_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
 [[ "$reset_status" == 200 && "$reset_body" == *provider-a* ]] && record 19 "Provider A reset request" PASS routing "HTTP 200; first test endpoint restored" || { record 19 "Provider A reset request" FAIL routing "expected HTTP 200 from first endpoint after reset"; exit 1; }
 revoke_key && record 17 "API-key revocation" PASS authorization "HTTP 200" || { record 17 "API-key revocation" FAIL authorization "revocation failed"; exit 1; }
@@ -293,4 +323,4 @@ fi
 jq '.functional=(if (([.assertions[] | select(.status=="FAIL")] | length) == 0 and ([.assertions[] | select(.status=="NOT_DEMONSTRATED")] | length) == 0) then "PASS" else "PARTIAL" end) | .note="Single-tenant routing; two-tenant MaaS authorization remains issue #23"' "$RESULTS" >"$tmp"
 mv "$tmp" "$RESULTS"
 printf '%s\n' "$RESULTS"
-if [[ "$(jq '[.assertions[] | select(.status=="FAIL")] | length' "$RESULTS")" -ne 0 ]]; then exit 1; fi
+if [[ "$(jq '[.assertions[] | select(.status=="FAIL" or .status=="NOT_DEMONSTRATED")] | length' "$RESULTS")" -ne 0 ]]; then exit 1; fi

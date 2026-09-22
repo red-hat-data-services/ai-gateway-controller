@@ -53,7 +53,7 @@ type Skip struct {
 
 // Route is one resolved (model x provider) pair — the atom both output
 // planes are rendered from: the Envoy plane (HTTPRoute/SE/DR) and the
-// praxis overlay envelope.
+// ExtProc routing overlay envelope.
 type Route struct {
 	// Model is the ExternalModel CR name. Overlay candidate.name and the
 	// HTTPRoute `X-Gateway-Model-Name` match both key on this (#425).
@@ -72,14 +72,19 @@ type Route struct {
 	// for this provider (fixed convention: "provider-<crName>").
 	Cluster string
 	// Endpoint is the provider FQDN (for HTTPRoute Host rewrite).
-	Endpoint    string
-	TargetModel string
-	APIFormat   string
-	Path        string // fully resolved, no placeholders
-	Weight      int    // normalized: unset == 1; only positive weights survive
-	AuthType    string // merged auth type: apikey|sigv4|oauth2
-	SecretName  string // credential secret (same namespace as provider)
-	SecretKey   string // fixed "api-key" per the CRD contract
+	Endpoint string
+	// TLSCACertificates is an optional absolute path already mounted in the
+	// calling proxy. It is a file path only; the controller never reads or
+	// stores certificate bytes. This supports private test/provider CAs while
+	// keeping TLS verification enabled.
+	TLSCACertificates string
+	TargetModel       string
+	APIFormat         string
+	Path              string // fully resolved, no placeholders
+	Weight            int    // normalized: unset == 1; only positive weights survive
+	AuthType          string // merged auth type: apikey|sigv4|oauth2
+	SecretName        string // credential secret (same namespace as provider)
+	SecretKey         string // fixed "api-key" per the CRD contract
 }
 
 // ModelRoutes is the per-model outcome: resolved routes in ref order (the
@@ -115,6 +120,19 @@ var ErrNoRoutes = errors.New("resolver: no provider refs resolved to routes")
 // skip is not an error by itself — its skips are reported and only a wholly
 // empty set returns ErrNoRoutes.
 func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error) {
+	return resolve(models, providers, false)
+}
+
+// ResolveAll resolves every valid provider binding, including weight-zero
+// references. The serving overlay uses Resolve and therefore excludes those
+// references from selection. The ExtProc runtime uses ResolveAll to preload
+// the complete referenced provider/credential set, so changing the selected
+// provider is an overlay-only update and does not require a pod rollout.
+func ResolveAll(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error) {
+	return resolve(models, providers, true)
+}
+
+func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider, includeDisabled bool) (*ResolvedRouteSet, error) {
 	type provKey struct{ ns, name string }
 	byKey := make(map[provKey]*v1alpha1.ExternalProvider, len(providers))
 	for _, p := range providers {
@@ -132,6 +150,7 @@ func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 		}
 		mref := m.Namespace + "/" + m.Name
 		mr := ModelRoutes{ModelRef: mref}
+		activeProviders := map[string]bool{}
 		clientName := m.Name
 		if m.Spec.ModelName != "" {
 			clientName = m.Spec.ModelName
@@ -155,13 +174,23 @@ func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 			if ref.Weight != nil {
 				weight = *ref.Weight
 			}
-			if weight <= 0 {
+			if weight <= 0 && !includeDisabled {
 				mr.Skips = append(mr.Skips, newSkip(base,
 					SkipWeightDisabled, fmt.Sprintf("weight %d disables this ref", weight)))
 				continue
 			}
+			if weight > 0 && activeProviders[prov.Name] {
+				return nil, fmt.Errorf("resolver: model %s has multiple active references to provider %s", mref, prov.Name)
+			}
+			if weight > 0 {
+				activeProviders[prov.Name] = true
+			}
 
 			cfg := mergeConfig(prov.Spec.Config, ref.Config)
+			caCertificates := strings.TrimSpace(cfg["tls.caCertificates"])
+			if caCertificates != "" && (!strings.HasPrefix(caCertificates, "/") || strings.Contains(caCertificates, "..")) {
+				return nil, fmt.Errorf("resolver: model %s ref %s: tls.caCertificates must be an absolute mounted file path", mref, ref.Ref.Name)
+			}
 			path, err := resolvePath(ref.Path, ref.TargetModel, cfg)
 			if err != nil {
 				// IPP #368: unresolved placeholders are a reconcile-time
@@ -174,20 +203,21 @@ func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				auth = *ref.Auth
 			}
 			mr.Routes = append(mr.Routes, Route{
-				Model:        m.Name,
-				ClientName:   clientName,
-				Namespace:    m.Namespace,
-				Provider:     prov.Name,
-				ProviderType: prov.Spec.Provider,
-				Cluster:      "provider-" + prov.Name,
-				Endpoint:     prov.Spec.Endpoint,
-				TargetModel:  ref.TargetModel,
-				APIFormat:    ref.APIFormat,
-				Path:         path,
-				Weight:       weight,
-				AuthType:     auth.Type,
-				SecretName:   auth.SecretRef.Name,
-				SecretKey:    "api-key",
+				Model:             m.Name,
+				ClientName:        clientName,
+				Namespace:         m.Namespace,
+				Provider:          prov.Name,
+				ProviderType:      prov.Spec.Provider,
+				Cluster:           "provider-" + prov.Name,
+				Endpoint:          prov.Spec.Endpoint,
+				TLSCACertificates: caCertificates,
+				TargetModel:       ref.TargetModel,
+				APIFormat:         ref.APIFormat,
+				Path:              path,
+				Weight:            weight,
+				AuthType:          auth.Type,
+				SecretName:        auth.SecretRef.Name,
+				SecretKey:         "api-key",
 			})
 			resolved++
 		}

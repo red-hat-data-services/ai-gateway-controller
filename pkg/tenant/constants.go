@@ -133,13 +133,28 @@ const (
 	// for backward compatibility.
 	DefaultAITenantName = "models-as-a-service"
 
-	// Base resource names present in the vendored praxis-extproc overlay
-	// (config/manifests/praxis-extproc/overlays/odh). Per-tenant resources
-	// suffix these with "-{tenantID}"; the default tenant keeps them as-is.
+	// Base resource names present in the controller-owned ExternalModel overlay
+	// (config/manifests/external-model/overlays/odh), which composes the pinned
+	// praxis-extproc manifests with controller-owned filter patches. Per-tenant
+	// resources suffix these with "-{tenantID}"; the default tenant keeps them as-is.
 	PayloadProcessingName                         = "payload-processing"
+	PayloadProcessingExternalModelName            = "payload-processing-external-model"
 	PayloadPreProcessingName                      = "payload-pre-processing"
 	PayloadProcessingPluginsConfigMapName         = "payload-processing-plugins"
 	PayloadProcessingReaderClusterRoleBindingName = "payload-processing-reader"
+	PayloadProcessingExternalModelFilterName      = "payload-processing-external-model-filters"
+
+	// Legacy standalone names are retained only so cleanup can remove resources
+	// created before the ExtProc dataplane migration.
+	praxisDeploymentName = "praxis"
+	praxisServiceName    = "praxis"
+	praxisConfigMapName  = "praxis-config"
+	praxisServiceAccount = "praxis"
+
+	// Active ExtProc overlay names are consumed by intelligent_route. They are
+	// not standalone Praxis resources and must remain stable across upgrades.
+	praxisOverlayName    = "routing-overlay"
+	praxisOverlayDataKey = "routing-overlay.json"
 
 	// LabelTenantInstance distinguishes pods/Services when multiple
 	// per-tenant praxis-extproc stacks share a gateway namespace (mirrors

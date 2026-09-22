@@ -23,6 +23,7 @@ GOARCH ?= $(shell go env GOARCH)
 # maas-controller's convention); pass GO_STRICTFIPS=false to opt out for a
 # faster local build/run loop.
 GO_STRICTFIPS ?= true
+VERSION ?= dev
 
 CGO_ENABLED ?= 1
 
@@ -45,7 +46,7 @@ build: tidy lint test binary ##	run full build: tidy, lint, test, binary
 
 .PHONY: binary
 binary: $(BUILD_DIR) ##	build manager binary to bin/manager (skip checks)
-	$(GO_ENV) go build -o "$(BUILD_DIR)/$(BINARY_NAME)" ./cmd/manager
+	$(GO_ENV) go build -ldflags="-X main.buildVersion=$(VERSION)" -o "$(BUILD_DIR)/$(BINARY_NAME)" ./cmd/manager
 
 $(BUILD_DIR):
 	mkdir -p "$(BUILD_DIR)"

@@ -77,8 +77,8 @@ e2e_test_files=(
     "$TEST_DIR/tests/test_tenant_rate_limit_isolation.py"
     "$TEST_DIR/tests/test_per_tenant_ipp_isolation.py"
     "$TEST_DIR/tests/test_embedding_inference.py"
-    # TODO(before-merge): enable external-model e2e when reconciler lands:
-    # "$TEST_DIR/tests/test_external_models.py"
+    # Sister to ExtProc-only ExternalModel dataplane (PR #52): start validation.
+    "$TEST_DIR/tests/test_external_models.py"
 )
 
 resolved_extra_args=()

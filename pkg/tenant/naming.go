@@ -56,6 +56,33 @@ func PayloadProcessingServiceAccountName(tenantID string) string {
 	return ResourceName(PayloadProcessingName, tenantID)
 }
 
+// PayloadProcessingPostServiceAccountName is intentionally distinct from
+// MaaS's payload-processing ServiceAccount. MaaS's shared IPP reader binding
+// may grant that account Secret access; the post-auth ExtProc only needs
+// projected volumes and must not inherit the shared MaaS permissions.
+func PayloadProcessingPostServiceAccountName(tenantID string) string {
+	return ResourceName(PayloadProcessingName+"-post", tenantID)
+}
+
+// PayloadProcessingExternalModelServiceAccountName is the credential-bearing
+// account for the ExternalModel-only header-phase ExtProc. It is separate from
+// both the pre-auth account and MaaS's existing post-auth account.
+func PayloadProcessingExternalModelServiceAccountName(tenantID string) string {
+	return ResourceName(PayloadProcessingExternalModelName, tenantID)
+}
+
+func PayloadProcessingExternalModelDeploymentName(tenantID string) string {
+	return ResourceName(PayloadProcessingExternalModelName, tenantID)
+}
+
+func PayloadProcessingExternalModelServiceName(tenantID string) string {
+	return ResourceName(PayloadProcessingExternalModelName, tenantID)
+}
+
+func PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID string) string {
+	return ResourceName(PayloadProcessingExternalModelName+"-plugins", tenantID)
+}
+
 func PayloadProcessingNetworkPolicyName(tenantID string) string {
 	return ResourceName(PayloadProcessingName, tenantID)
 }
@@ -64,10 +91,28 @@ func PayloadProcessingEnvoyFilterName(tenantID string) string {
 	return ResourceName(PayloadProcessingName, tenantID)
 }
 
+// PayloadProcessingExternalModelEnvoyFilterName is owned exclusively by the
+// ExternalModel reconciler. Keeping route-specific patches separate from the
+// tenant-owned base EnvoyFilter prevents concurrent reconcilers from losing
+// each other's configPatches.
+func PayloadProcessingExternalModelEnvoyFilterName(tenantID string) string {
+	return ResourceName(PayloadProcessingExternalModelName+"-routes", tenantID)
+}
+
+// PayloadProcessingExternalModelFilterNameForTenant returns the name of the
+// controller-owned static ExternalModel filter resource for a tenant.
+func PayloadProcessingExternalModelFilterNameForTenant(tenantID string) string {
+	return ResourceName(PayloadProcessingExternalModelFilterName, tenantID)
+}
+
 func PayloadProcessingPluginsConfigMapForTenant(tenantID string) string {
 	return ResourceName(PayloadProcessingPluginsConfigMapName, tenantID)
 }
 
 func PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID string) string {
 	return ResourceName(PayloadProcessingReaderClusterRoleBindingName, tenantID)
+}
+
+func PayloadProcessingReaderClusterRoleBindingPostNameForTenant(tenantID string) string {
+	return ResourceName(PayloadProcessingReaderClusterRoleBindingName+"-post", tenantID)
 }

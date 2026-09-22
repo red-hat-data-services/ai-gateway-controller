@@ -34,3 +34,7 @@ test/e2e/.pytest_cache/
 test/e2e/.venv/
 # Local Kind qualification evidence and image-input cache
 evidence/
+
+# Local OpenShift state, rendered manifests, credentials, and run evidence.
+.openshift-state/
+test/openshift-env/.state/
