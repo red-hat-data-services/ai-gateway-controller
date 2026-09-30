@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -157,6 +158,12 @@ func withMTCFinalizer(u *unstructured.Unstructured) *unstructured.Unstructured {
 // MaasTenantConfig in tenantConfigNamespace (status.tenantNamespace —
 // controller-authored ownership, distinct from gatewayRef.namespace).
 // phase == "" omits status.phase entirely.
+//
+// When phase is set it also emits the AITenantConditionReady condition
+// maas-controller writes alongside status.phase (setAITenantPhase), with
+// observedGeneration equal to metadata.generation (0 by default), so the
+// StatusIsCurrent generation fence sees a status computed for the current
+// generation. Use withStaleReadyGeneration to simulate a lagging status.
 func newAITenantOwner(name, namespace, phase, gatewayName, gatewayNamespace, tenantConfigNamespace string) *unstructured.Unstructured {
 	u := NewAITenant()
 	u.SetName(name)
@@ -164,6 +171,17 @@ func newAITenantOwner(name, namespace, phase, gatewayName, gatewayNamespace, ten
 	status := map[string]any{}
 	if phase != "" {
 		status["phase"] = phase
+		readyStatus := "False"
+		if phase == AITenantPhaseActive {
+			readyStatus = "True"
+		}
+		status["conditions"] = []any{
+			map[string]any{
+				"type":               AITenantConditionReady,
+				"status":             readyStatus,
+				"observedGeneration": u.GetGeneration(),
+			},
+		}
 	}
 	if gatewayName != "" || gatewayNamespace != "" {
 		status["gatewayRef"] = map[string]any{"name": gatewayName, "namespace": gatewayNamespace}
@@ -172,6 +190,15 @@ func newAITenantOwner(name, namespace, phase, gatewayName, gatewayNamespace, ten
 		status["tenantNamespace"] = tenantConfigNamespace
 	}
 	u.Object["status"] = status
+	return u
+}
+
+// withStaleReadyGeneration bumps metadata.generation above the Ready
+// condition's observedGeneration, simulating an in-flight spec change
+// maas-controller has not reconciled yet (status.phase / gatewayRef still
+// reflect the prior generation). StatusIsCurrent must treat it as not ready.
+func withStaleReadyGeneration(u *unstructured.Unstructured) *unstructured.Unstructured {
+	u.SetGeneration(u.GetGeneration() + 1)
 	return u
 }
 
@@ -250,7 +277,7 @@ func TestReconcileSkipsWhenMaasTenantConfigNotFound(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest("ai-tenant-missing"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -270,7 +297,7 @@ func TestReconcileSkipsWhenNotUsingPraxis(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest("ai-tenant-redteam"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -291,7 +318,7 @@ func TestReconcileAddsFinalizerAndRequeuesShortlyWhenNotActiveYet(t *testing.T) 
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
 	res, err := r.Reconcile(context.Background(), mtcRequest("ai-tenant-redteam"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -324,7 +351,7 @@ func TestReconcileRequeuesShortlyWhenActiveButGatewayRefNotReady(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
 	res, err := r.Reconcile(context.Background(), mtcRequest("ai-tenant-redteam"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -335,6 +362,195 @@ func TestReconcileRequeuesShortlyWhenActiveButGatewayRefNotReady(t *testing.T) {
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
 		t.Fatalf("expected no resource applies/deletes until status.gatewayRef is populated, got patched=%v deleted=%v", patched, deleted)
+	}
+}
+
+// TestReconcileRequeuesWhenAITenantStatusIsStale covers the generation fence:
+// an Active AITenant whose Ready condition observedGeneration
+// lags metadata.generation (maas-controller mid-reconcile after a spec change)
+// must not drive a praxis-extproc install, even though phase and gatewayRef are
+// populated — they may still reflect the superseded generation.
+func TestReconcileRequeuesWhenAITenantStatusIsStale(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	aitenant := withStaleReadyGeneration(newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns"))
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
+	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	patched, _, deleted := rec.snapshot()
+	if len(patched) != 0 || len(deleted) != 0 {
+		t.Fatalf("expected no resource applies/deletes while AITenant status is stale, got patched=%v deleted=%v", patched, deleted)
+	}
+}
+
+// TestAITenantStillValidForApply covers the RHAI-2514 apply-path fence helper:
+// the live re-read must confirm the owning AITenant is still the same object
+// (metadata.uid), still binds this MaasTenantConfig, is still Active and current
+// for its generation, and still publishes the gatewayRef this reconcile
+// rendered against. A delete+recreate (new UID), a re-home (new gatewayRef), a
+// stale generation, or a lost ownership bind must all be rejected rather than
+// applied against superseded state.
+func TestAITenantStillValidForApply(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	mtc := newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants")
+	ownerWithUID := func(uid string) *unstructured.Unstructured {
+		u := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns")
+		u.SetUID(types.UID(uid))
+		return u
+	}
+	ownerWith := func(uid, phase, gatewayName string) *unstructured.Unstructured {
+		u := newAITenantOwner("redteam", "ai-tenants", phase, gatewayName, "tenant-ns", "tenant-ns")
+		u.SetUID(types.UID(uid))
+		return u
+	}
+	withUID := func(u *unstructured.Unstructured, uid string) *unstructured.Unstructured {
+		u.SetUID(types.UID(uid))
+		return u
+	}
+
+	cases := []struct {
+		name    string
+		objects []client.Object
+		mtc     *unstructured.Unstructured
+		wantUID types.UID
+		want    bool
+	}{
+		{"empty wantUID disables the check", []client.Object{mtc, ownerWithUID("uid-1")}, mtc, "", true},
+		{"matching uid, active, current, gateway matches", []client.Object{mtc, ownerWithUID("uid-1")}, mtc, "uid-1", true},
+		{"uid changed (recreate)", []client.Object{mtc, ownerWithUID("uid-2")}, mtc, "uid-1", false},
+		{"owning AITenant gone", []client.Object{mtc}, mtc, "uid-1", false},
+		{"no owning-ref annotations", []client.Object{ownerWithUID("uid-1")}, newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "", ""), "uid-1", false},
+		{"gateway re-homed (live gateway name differs)", []client.Object{mtc, ownerWith("uid-1", AITenantPhaseActive, "new-gateway")}, mtc, "uid-1", false},
+		{"gateway re-homed (live gateway namespace differs)", []client.Object{mtc, withUID(newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "other-ns", "tenant-ns"), "uid-1")}, mtc, "uid-1", false},
+		{"gateway dropped (live gatewayRef unset)", []client.Object{mtc, withUID(newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "", "", "tenant-ns"), "uid-1")}, mtc, "uid-1", false},
+		{"ownership bind lost (live tenantNamespace differs)", []client.Object{mtc,
+			withUID(newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "other-ns"), "uid-1")}, mtc, "uid-1", false},
+		{"not active", []client.Object{mtc, ownerWith("uid-1", "Terminating", "my-gateway")}, mtc, "uid-1", false},
+		{"status generation stale", []client.Object{mtc, withStaleReadyGeneration(ownerWithUID("uid-1"))}, mtc, "uid-1", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(c.objects...).Build()
+			r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
+			got, err := r.aiTenantStillValidForApply(context.Background(), c.mtc, c.wantUID, "my-gateway", "tenant-ns")
+			if err != nil {
+				t.Fatalf("aiTenantStillValidForApply: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("aiTenantStillValidForApply = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestReconcileRefusesWhenAITenantReplacedBeforeApply covers the UID
+// fence at the reconcile level: an AITenant that resolves Active+current but is
+// deleted and recreated (new metadata.uid) between resolution and the apply
+// must abort the in-flight reconcile — no praxis-extproc resources may be
+// written against a tenant identity that no longer matches. The Get
+// interceptor swaps the UID on the second AITenant read (the pre-apply
+// re-confirmation), simulating a mid-reconcile recreate.
+func TestReconcileRefusesWhenAITenantReplacedBeforeApply(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
+	aitenant.SetUID(types.UID("uid-1"))
+
+	rec := &recorder{}
+	funcs := rec.funcs()
+	var aitenantGets int
+	funcs.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if err := c.Get(ctx, key, obj, opts...); err != nil {
+			return err
+		}
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == AITenantGVK.Kind {
+			aitenantGets++
+			if aitenantGets >= 2 {
+				u.SetUID(types.UID("uid-2")) // deleted+recreated mid-reconcile
+			}
+		}
+		return nil
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(funcs).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	res, err := r.Reconcile(context.Background(), mtcRequest(DefaultAITenantName))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant replaced mid-reconcile)", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	patched, _, deleted := rec.snapshot()
+	if len(patched) != 0 || len(deleted) != 0 {
+		t.Fatalf("expected no resource applies/deletes when the owning AITenant was replaced before apply, got patched=%v deleted=%v", patched, deleted)
+	}
+}
+
+// TestReconcileUsesLiveReadNotStaleCache is the Finding #1 regression guard.houl sh
+// After a watch drop the informer cache still holds the
+// pre-delete AITenant (uid-1, Active), but the object has actually been
+// deleted. The pre-apply fence must re-read live (APIReader), see it gone,
+// and refuse to apply — proving the fence no longer trusts a stale cache.
+func TestReconcileUsesLiveReadNotStaleCache(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
+	aitenant.SetUID(types.UID("uid-1"))
+
+	rec := &recorder{}
+	// Cache-backed client (r.Client): MTC + the stale, pre-delete AITenant.
+	cacheClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
+	// Live client (r.APIReader): the AITenant is gone (deleted during the watch drop).
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).Build()
+
+	r := &Reconciler{Client: cacheClient, APIReader: liveClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	res, err := r.Reconcile(context.Background(), mtcRequest(DefaultAITenantName))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (AITenant deleted; only the live read can see it)", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	patched, _, deleted := rec.snapshot()
+	if len(patched) != 0 || len(deleted) != 0 {
+		t.Fatalf("expected no resource applies/deletes when the live read shows the owning AITenant is gone, got patched=%v deleted=%v", patched, deleted)
+	}
+}
+
+// TestReconcileRequeuesWhenAITenantDeleted covers matrix row 4: the owning
+// AITenant is gone, so resolveOwningAITenant returns not-ready and the apply
+// path requeues without writing praxis-extproc resources. (The delete/cleanup
+// path is exercised by the cleanup tests.)
+func TestReconcileRequeuesWhenAITenantDeleted(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	// No AITenant object: it has been deleted.
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	res, err := r.Reconcile(context.Background(), mtcRequest(DefaultAITenantName))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant deleted)", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	patched, _, deleted := rec.snapshot()
+	if len(patched) != 0 || len(deleted) != 0 {
+		t.Fatalf("expected no resource applies/deletes when the owning AITenant is gone, got patched=%v deleted=%v", patched, deleted)
 	}
 }
 
@@ -353,7 +569,7 @@ func TestReconcileWaitsForBlockedMigrationMarker(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -379,7 +595,7 @@ func TestReconcileProceedsWhenMigrationMarkerClear(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest(DefaultAITenantName))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -417,7 +633,7 @@ func TestReconcileSkipsMigrationMarkerCheckWhenBundleAlreadyExists(t *testing.T)
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, existingDeployment).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest(DefaultAITenantName))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -438,7 +654,7 @@ func TestReconcileAppliesAndRequeuesResyncIntervalForNonDefaultTenant(t *testing
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
 	const resync = 5 * time.Minute
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: resync}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: resync}
 	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -476,7 +692,7 @@ func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	if _, err := r.Reconcile(context.Background(), mtcRequest(DefaultAITenantName)); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -502,7 +718,7 @@ func TestReconcileRejectsSpoofedOwningAITenantAnnotations(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, victim).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	_, err := r.Reconcile(context.Background(), mtcRequest("ai-tenant-attacker"))
 	if err == nil {
 		t.Fatal("Reconcile error = nil, want ownership mismatch error")
@@ -525,7 +741,7 @@ func TestReconcileSwitchAwayRejectsSpoofedOwningAITenantAnnotations(t *testing.T
 	objs := append([]client.Object{mtc, victim}, seed...)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	_, err := r.Reconcile(context.Background(), mtcRequest("ai-tenant-attacker"))
 	if err == nil {
 		t.Fatal("Reconcile error = nil, want ownership mismatch error")
@@ -602,7 +818,7 @@ func TestReconcileCleansUpAndRemovesFinalizerWhenSwitchedAwayFromPraxis(t *testi
 	objs := append([]client.Object{mtc, aitenant}, seed...)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -645,7 +861,7 @@ func TestReconcileCleanupSkipsMaaSOwnedResources(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, legacyDeploy).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -665,7 +881,7 @@ func TestReconcileSwitchAwayWithoutFinalizerIsNoop(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -687,7 +903,7 @@ func TestReconcileDeleteCleansUpAndRemovesFinalizer(t *testing.T) {
 	objs := append([]client.Object{mtc, aitenant}, seed...)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute, DeletionTimeout: 10 * time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute, DeletionTimeout: 10 * time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -720,7 +936,7 @@ func TestReconcileDeleteCleansUpWhenAITenantTerminating(t *testing.T) {
 	objs := append([]client.Object{mtc, aitenant}, seed...)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute, DeletionTimeout: 10 * time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute, DeletionTimeout: 10 * time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -750,7 +966,7 @@ func TestReconcileDeleteWithoutFinalizerIsNoop(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -770,7 +986,7 @@ func TestReconcileDeleteRequeuesWhenGatewayRefNeverPopulated(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -803,7 +1019,7 @@ func TestReconcileSwitchAwayRequeuesWhenAITenantNotReady(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
 	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -826,7 +1042,7 @@ func TestReconcileDeleteForceRemovesFinalizerAfterDeletionTimeout(t *testing.T) 
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute, DeletionTimeout: 10 * time.Minute}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute, DeletionTimeout: 10 * time.Minute}
 	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}

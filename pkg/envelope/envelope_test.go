@@ -3,6 +3,7 @@ package envelope
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -85,12 +86,62 @@ func TestRender_CredentialWireShapeExact(t *testing.T) {
 	}
 }
 
-func TestRender_APIKeyRejectsUnsupportedProvider(t *testing.T) {
+func TestRender_APIKeyRejectsUnqualifiedCombinations(t *testing.T) {
+	// Only explicitly qualified provider/API-format pairs earn a wire
+	// strategy; every other combination — including the qualified formats
+	// under the wrong provider — must fail closed loudly.
+	tests := []struct {
+		name         string
+		providerType string
+		apiFormat    string
+	}{
+		{"anthropic with openai chat format", "anthropic", "openai-chat"},
+		{"openai with anthropic messages format", "openai", "messages"},
+		{"azure with openai chat format", "azure", "openai-chat"},
+		{"azure with anthropic messages format", "azure", "messages"},
+		{"aws-bedrock with openai chat format", "aws-bedrock", "openai-chat"},
+		{"vertex with anthropic messages format", "vertex", "messages"},
+		{"anthropic with unknown format", "anthropic", "completions"},
+		{"unknown provider with known format", "mistral", "openai-chat"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := route("m1", "p1", 1)
+			r.ProviderType = tc.providerType
+			r.APIFormat = tc.apiFormat
+			_, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{})
+			if err == nil || !strings.Contains(err.Error(), "provider credential semantics are not supported") {
+				t.Fatalf("expected provider-specific credential error for %s/%s, got %v", tc.providerType, tc.apiFormat, err)
+			}
+			if !strings.Contains(err.Error(), strconv.Quote(tc.providerType)) ||
+				!strings.Contains(err.Error(), strconv.Quote(tc.apiFormat)) {
+				t.Errorf("error must name both the provider and the API format, got %v", err)
+			}
+		})
+	}
+}
+
+func TestRender_AnthropicMessagesMapsToApikeyReference(t *testing.T) {
+	// The anthropic messages contract injects the Secret value through the
+	// credential_inject filter's configured header, so the wire carries the
+	// apikey strategy with the same reference-only shape as bearer_token.
 	r := route("m1", "p1", 1)
 	r.ProviderType = "anthropic"
-	_, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{})
-	if err == nil || !strings.Contains(err.Error(), "provider credential semantics are not supported") {
-		t.Fatalf("expected provider-specific credential error, got %v", err)
+	r.APIFormat = "messages"
+	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	raw, err := json.Marshal(env.Overlay.Candidates[0].Credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"strategy":"apikey","secretRef":{"name":"p1-key","namespace":"ns1","key":"api-key"}}`
+	if string(raw) != want {
+		t.Errorf("credential JSON:\n got %s\nwant %s", raw, want)
+	}
+	if strings.Contains(string(raw), "fixture-only-secret") {
+		t.Error("credential value must never reach the wire")
 	}
 }
 

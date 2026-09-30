@@ -21,7 +21,8 @@ import (
 // processing resources in the Gateway namespace and adds only the dedicated
 // ExternalModel ExtProc copy in the resolved tenant namespace. The shared
 // filter, workload, Service, TLS identity, and buffered configuration are
-// intentionally not retargeted by this function.
+// intentionally not retargeted. The ExternalModel EnvoyFilter is retargeted to
+// the tenant-local ExtProc Service.
 //
 //nolint:gocyclo // Namespace/resource splitting is an explicit compatibility matrix; each branch preserves a distinct ownership contract.
 func SplitPostAuthResources(resources []unstructured.Unstructured, tenantID, gatewayNamespace, tenantNamespace string) ([]unstructured.Unstructured, error) {
@@ -132,6 +133,11 @@ func SplitPostAuthResources(resources []unstructured.Unstructured, tenantID, gat
 				return nil, err
 			}
 			out = append(out, *post)
+		case u.GetKind() == "EnvoyFilter" && u.GetName() == PayloadProcessingExternalModelFilterNameForTenant(tenantID):
+			if err := renamePayloadProcessingExternalModelFilter(u, tenantID, tenantNamespace); err != nil {
+				return nil, fmt.Errorf("external-model EnvoyFilter: %w", err)
+			}
+			out = append(out, *u)
 		case u.GetKind() == "ClusterRoleBinding" && u.GetName() == PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID):
 			out = append(out, *u)
 			// Do not bind the tenant-local ExternalModel ExtProc to the shared

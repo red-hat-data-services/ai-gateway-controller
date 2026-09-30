@@ -6,6 +6,8 @@ approvers:
   - ryancham715
   - shaneutt
   - aslakknutsen
+  - pierDipi
+  - bartoszmajsak
 reviewers:
   - nerdalert
   - jland-redhat
@@ -14,3 +16,5 @@ reviewers:
   - ryancham715
   - shaneutt
   - aslakknutsen
+  - pierDipi
+  - bartoszmajsak

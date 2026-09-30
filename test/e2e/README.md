@@ -1,6 +1,6 @@
 # ai-gateway-controller E2E
 
-MaaS pytest suite is **not vendored** in this repo. `prow_run_ai_gateway_controller_test.sh` fetches [models-as-a-service](https://github.com/opendatahub-io/models-as-a-service) into `test/maas-e2e/` (gitignored) at the commit in `test/maas-e2e.lock` (currently MaaS `main` @ `53fdb8a1`, 2026-09-14).
+MaaS pytest suite is **not vendored** in this repo. `prow_run_ai_gateway_controller_test.sh` fetches [models-as-a-service](https://github.com/opendatahub-io/models-as-a-service) into `test/maas-e2e/` (gitignored) at the commit in `test/maas-e2e.lock` by default. Set `MAAS_COMMIT` to override the lock for a single run.
 
 **Orchestration (this repo):** `test/e2e/scripts/`  
 **Tests + fixtures (MaaS checkout):** `test/maas-e2e/test/e2e/`
@@ -8,6 +8,15 @@ MaaS pytest suite is **not vendored** in this repo. `prow_run_ai_gateway_control
 See [TODO.md](TODO.md) for excluded tests and upstream gaps.
 
 ```bash
+AI_GATEWAY_CONTROLLER_IMAGE=quay.io/opendatahub/odh-ai-gateway-controller:odh-pr \
+  ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
+```
+
+For a one-off run against a different MaaS source revision, set `MAAS_COMMIT` to its full Git SHA. This overrides the locked commit for that run only and does not update `test/maas-e2e.lock`:
+
+```bash
+MAAS_UPDATE_LOCK=false \
+MAAS_COMMIT="<full-commit-sha>" \
 AI_GATEWAY_CONTROLLER_IMAGE=quay.io/opendatahub/odh-ai-gateway-controller:odh-pr \
   ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
 ```

@@ -102,8 +102,8 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 		}
 		mode, found, err := unstructured.NestedMap(overrides, "processing_mode")
 		if err != nil || !found || mode["request_header_mode"] != "SEND" ||
-			mode["request_body_mode"] != "NONE" || mode["response_body_mode"] != "NONE" {
-			t.Fatalf("route %q processing mode=%#v found=%t err=%v, want SEND/NONE", match, mode, found, err)
+			mode["request_body_mode"] != "STREAMED" || mode["response_body_mode"] != "NONE" {
+			t.Fatalf("route %q processing mode=%#v found=%t err=%v, want SEND/STREAMED", match, mode, found, err)
 		}
 		sharedDisabled, found, err := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp", "disabled")
 		if err != nil || !found || !sharedDisabled {

@@ -72,6 +72,12 @@ type Reconciler struct {
 	// Client applies the rendered resources and reads/updates MaasTenantConfig
 	// (and reads AITenant).
 	Client client.Client
+	// APIReader reads directly from the API server, bypassing the informer
+	// cache. The AITenant identity/ownership/readiness decision must be made
+	// against live state: a cache-backed read can lag a delete+recreate during
+	// a watch disruption, letting the UID fence compare stale-to-stale and
+	// adopt a replaced tenant.
+	APIReader client.Reader
 	// ManifestPath is the controller-owned kustomize entrypoint, e.g.
 	// config/manifests/external-model/overlays/odh. It composes the pinned
 	// upstream praxis-extproc tree with controller-specific patches.
@@ -221,10 +227,76 @@ func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructure
 	if err != nil || aitenant == nil {
 		return aitenant, false, err
 	}
-	if !IsActive(aitenant) {
+	// Require both an Active phase and status observed for the current spec
+	// generation: an Active phase whose gatewayRef still reflects a superseded
+	// generation (maas-controller mid-reconcile after a spec change) must not
+	// drive a praxis-extproc install against a stale Gateway.
+	if !IsActive(aitenant) || !StatusIsCurrent(aitenant) {
 		return aitenant, false, nil
 	}
 	return aitenant, true, nil
+}
+
+// aiTenantStillValidForApply re-reads the owning AITenant live (via APIReader,
+// not the informer cache) immediately before the praxis-extproc apply and
+// reports whether it is still the exact object, in the exact state, that this
+// reconcile resolved and rendered against. It is the TOCTOU (Time-of-Check to
+// Time-of-Use) fence for the apply path (RHAI-2514): between the cached resolve
+// and the write, the AITenant may have been deleted, recreated with a new UID,
+// re-homed to a different gateway, or had its spec bumped ahead of maas. Any of
+// those means the resources computed from the resolved copy would target the
+// wrong tenant/gateway or a superseded generation, so it must requeue.
+//
+// It returns false (transient ⇒ requeue, not an error) when, read live, the
+// AITenant: is gone; has a different metadata.uid than wantUID; no longer binds
+// this MaasTenantConfig (status.tenantNamespace); is not Active; is not current
+// for its generation (StatusIsCurrent); or no longer publishes the same
+// status.gatewayRef this reconcile rendered against. An empty wantUID disables
+// the check, so a live object always carries a UID and only tests can opt out.
+// This guards the apply path only: delete/cleanup must run regardless of
+// identity (see resolveOwnedAITenant).
+func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstructured.Unstructured, wantUID types.UID, wantGatewayName, wantGatewayNamespace string) (bool, error) {
+	if wantUID == "" {
+		return true, nil
+	}
+	name, namespace, ok := OwningAITenantRef(mtc)
+	if !ok {
+		return false, nil
+	}
+	aitenant := NewAITenant()
+	// Read live from the API server, not the informer cache: a cache-backed
+	// re-read can lag a delete+recreate or a spec update during a watch
+	// disruption, defeating this fence. APIReader must be wired (see
+	// Reconciler.APIReader); reads fail rather than silently degrade.
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, aitenant); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("re-read owning AITenant %s/%s: %w", namespace, name, err)
+	}
+	// Identity: the same object, not a delete+recreate that reused the name.
+	if aitenant.GetUID() != wantUID {
+		return false, nil
+	}
+	// Ownership bind still holds live (anti-spoof): re-checked because the
+	// resolve above read the possibly-stale cache.
+	if ns, ok := ConfigNamespace(aitenant); !ok || ns != mtc.GetNamespace() {
+		return false, nil
+	}
+	// Readiness + generation currency against live state: an Active tenant
+	// whose status lags a spec change (StatusIsCurrent false) must not drive an
+	// install against a superseded generation.
+	if !IsActive(aitenant) || !StatusIsCurrent(aitenant) {
+		return false, nil
+	}
+	// The gateway we rendered against must still be the live one: a re-home
+	// (new status.gatewayRef for the same object) must not be applied against
+	// the old gateway.
+	gwName, gwNamespace, gwReady := GatewayRef(aitenant)
+	if !gwReady || gwName != wantGatewayName || gwNamespace != wantGatewayNamespace {
+		return false, nil
+	}
+	return true, nil
 }
 
 // reconcilePraxis is the steady-state path for a tenant that currently
@@ -241,7 +313,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		log.Info("MaasTenantConfig opted into praxis but owning AITenant is not Active yet; will retry")
+		log.Info("MaasTenantConfig opted into praxis but owning AITenant is not Active for its current generation yet; will retry")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
@@ -341,6 +413,21 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	}
 	if err := r.waitForForeignOwnership(ctx, resources); err != nil {
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+
+	// Re-validate the owning AITenant live, immediately before writing cluster
+	// resources: the resolve above read the informer cache, which can lag a
+	// delete+recreate (new UID), a re-home (new gatewayRef), or a spec bump
+	// (generation ahead of status) during a watch disruption. Everything
+	// rendered — gateway namespace, tenant identifier — was computed from the
+	// resolved copy, so if the live object no longer matches on identity,
+	// ownership, readiness, generation, or gateway, it must not be applied
+	// (RHAI-2514 apply-path fence). Transient ⇒ requeue.
+	if valid, err := r.aiTenantStillValidForApply(ctx, mtc, aitenant.GetUID(), gatewayName, gatewayNamespace); err != nil {
+		return ctrl.Result{}, err
+	} else if !valid {
+		log.Info("owning AITenant changed (uid, ownership, readiness, generation, or gatewayRef) before praxis-extproc apply; will re-resolve")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
@@ -473,7 +560,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([
 	}
 	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
 	for _, route := range runtimeSet.Routes() {
-		strategy, err := envelope.CredentialStrategy(route)
+		strategy, err := envelope.StrategyFor(route)
 		if err != nil {
 			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
 		}
