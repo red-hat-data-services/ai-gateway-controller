@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	inferencev1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/controller"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
@@ -103,6 +104,10 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	if err := inferencev1alpha1.AddToScheme(clientgoscheme.Scheme); err != nil {
 		setupLog.Error(err, "unable to register inference API scheme")
+		os.Exit(1)
+	}
+	if err := aigatewayv1alpha1.AddToScheme(clientgoscheme.Scheme); err != nil {
+		setupLog.Error(err, "unable to register AI gateway API scheme")
 		os.Exit(1)
 	}
 

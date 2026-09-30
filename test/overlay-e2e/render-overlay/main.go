@@ -67,7 +67,7 @@ func main() {
 				ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
 					Ref:         v1alpha1.NameReference{Name: provider},
 					TargetModel: model,
-					APIFormat:   "anthropic",
+					APIFormat:   "messages",
 					Path:        "/v1/messages",
 				}},
 			},

@@ -66,6 +66,12 @@ test: tidy ##	run tests with coverage
 tidy: ##	go mod tidy
 	go mod tidy
 
+.PHONY: manifests
+manifests: $(CONTROLLER_GEN) ##	generate CRDs and deepcopy implementations
+	$(CONTROLLER_GEN) object paths=./api/... \
+		crd paths=./api/... \
+		output:crd:artifacts:config=config/crd/bases
+
 .PHONY: vet
 vet: ##	go vet ./...
 	go vet ./...
