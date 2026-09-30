@@ -2,7 +2,7 @@
 
 Tests and deploy tooling come from [models-as-a-service](https://github.com/opendatahub-io/models-as-a-service) at runtime (`test/e2e/scripts/fetch-maas-e2e.sh`).
 
-**Pin policy:** `test/maas-e2e.lock` holds a fixed commit SHA (currently `5c36d49` on branch `rq-95503`, [PR #1508](https://github.com/opendatahub-io/models-as-a-service/pull/1508)). Prow/CI always fetch that SHA; they do **not** track rolling `main`. Bump the lock only after e2e passes on a newer MaaS revision.
+**Pin policy:** `test/maas-e2e.lock` holds a fixed commit SHA. Prow/CI fetch that source revision rather than rolling `main`. The MaaS runtime image is configured separately.
 
 **Repo:** `fetch-maas-e2e.sh` reads `maas_repo` from the lock file (default `opendatahub-io/models-as-a-service`).
 
@@ -41,7 +41,7 @@ Some e2e fixes from the vendored branch (`ci/maas-e2e-konflux-group-test`) are *
 | **Upstream MaaS PR** (preferred) | Fix belongs in shared MaaS tests (praxis log skip, `_poll_status` flakes, duplicate-header warmup) | All MaaS consumers benefit; slower until merged |
 | **aigc post-fetch patch** (`patch-maas-tests-for-aigc.sh`, not added yet) | Short-term CI unblock while upstream PR is open | Duplicated logic; must re-apply after every lock bump |
 
-**Current choice (branch `ci/e2e-maas-pr-1508`):** MaaS @ `5c36d49` ([#1508](https://github.com/opendatahub-io/models-as-a-service/pull/1508) — `ipp-migration-cleanup-complete` handoff). Deploy patches stay in `patch-maas-deploy-for-aigc.sh`. IPP migration **workarounds removed** from aigc (no pod labeling / managed-by stamp / MaasTenantConfig retry loop).
+**Current choice:** MaaS source @ `26e3116`, including the [#1537](https://github.com/opendatahub-io/models-as-a-service/pull/1537) rate-grouping test. Deploy patches stay in `patch-maas-deploy-for-aigc.sh`. IPP migration **workarounds remain removed** from aigc (no pod labeling / managed-by stamp / MaasTenantConfig retry loop).
 
 ---
 
@@ -68,6 +68,6 @@ Some fixes landed in upstream MaaS `main` @ `5ece7d3` (#1493); IPP backend-swap 
 ## ai-gateway-controller repo gaps (not MaaS)
 
 - [ ] `RELATED_IMAGE_ODH_AI_GATEWAY_CONTROLLER_IMAGE` — operator still installs via kustomize in CI
-- [ ] Merge [odh-konflux-central](https://github.com/jland-redhat/odh-konflux-central) group-test pipeline upstream
+- [x] Merge [odh-konflux-central](https://github.com/opendatahub-io/odh-konflux-central) group-test pipeline upstream
 - [x] Praxis stable default (`quay.io/opendatahub/odh-praxis-extproc:odh-stable`, praxis-extproc#79 @ `9872fc9`)
-- [ ] Point `.tekton/ai-gateway-controller-group-test.yaml` at upstream konflux-central after merge
+- [x] Point `.tekton/ai-gateway-controller-group-test.yaml` at upstream konflux-central after merge

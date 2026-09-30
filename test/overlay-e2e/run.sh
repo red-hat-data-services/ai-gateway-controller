@@ -8,6 +8,10 @@
 #      with no pod restart (kubelet projection -> inotify -> ArcSwap).
 #   3. Unknown models get 404 from intelligent_route.
 #   4. A corrupted envelope retains the last-known-good snapshot.
+#   5. Credential injection: the projected Secret (strategy: apikey) is
+#      injected upstream, the caller's own x-api-key is stripped and
+#      overridden, and a wrong projected credential is rejected by the
+#      backend (proving the injected value is the live Secret value).
 #
 # Usage:
 #   ./run.sh            # create cluster if needed, deploy, assert
@@ -75,6 +79,20 @@ cat "$TMP/v1.meta"
 echo "==> applying manifests"
 $KCTL apply -f manifests/00-namespace.yaml -f manifests/10-backends.yaml -f manifests/20-praxis-config.yaml >/dev/null
 
+# Provider credentials Praxis injects. Non-secret fixture values for the
+# local echo backends; they must match the --api-keys each katan validates
+# against (manifests/10-backends.yaml) and the credential_inject files
+# (manifests/20-praxis-config.yaml). Recreated every run so a previous
+# negative test that rotated a key self-heals.
+KEY_A=e2e-injected-key-a
+KEY_B=e2e-injected-key-b
+put_secret() { # $1 = secret name, $2 = api-key value
+  $KCTL -n "$NS" create secret generic "$1" --from-literal="api-key=$2" \
+    --dry-run=client -o yaml | $KCTL apply -f - >/dev/null
+}
+put_secret katan-a-key "$KEY_A"
+put_secret katan-b-key "$KEY_B"
+
 # The overlay ConfigMap must exist with a valid envelope before praxis starts:
 # an invalid cold-start envelope fails filter construction (crashloop).
 apply_overlay() { # $1 = envelope json file
@@ -104,12 +122,27 @@ sleep 2
 # ---- helpers ----------------------------------------------------------------
 
 # Anthropic-dialect POST /v1/messages, returns HTTP status on stdout.
+# Deliberately sends NO x-api-key: the provider credential must arrive via
+# credential_inject from the projected Secret, not from the client.
 request() { # $1 = model
   curl -sS -o "$TMP/body.json" -w '%{http_code}' --max-time 10 \
     -X POST "http://127.0.0.1:$LOCAL_PORT/v1/messages" \
     -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
-    -H 'x-api-key: e2e-test-key' \
     -d "{\"model\":\"$1\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
+}
+
+# Same request but with a caller-supplied x-api-key, to prove Praxis strips
+# it and injects the projected credential instead.
+request_with_key() { # $1 = model, $2 = x-api-key
+  curl -sS -o "$TMP/body.json" -w '%{http_code}' --max-time 10 \
+    -X POST "http://127.0.0.1:$LOCAL_PORT/v1/messages" \
+    -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+    -H "x-api-key: $2" \
+    -d "{\"model\":\"$1\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
+}
+
+katan_auth_rejects() { # $1 = deployment -> count of auth rejections in log
+  $KCTL -n "$NS" logs "deployment/$1" 2>/dev/null | grep -c "| 401 |" || true
 }
 
 log_count() { # $1 = deployment, $2 = model -> served-request count in log
@@ -138,14 +171,47 @@ status=$(request echo-one)
 a2=$(log_count katan-a echo-one); b2=$(log_count katan-b echo-one)
 [[ "$status" == "200" && $((a2 - a)) -eq 1 && "$b2" -eq "$b" ]] \
   || fail "expected the request to land on katan-a only (katan-a +$((a2-a)), katan-b +$((b2-b)))"
-pass "echo-one served by katan-a"
+pass "echo-one served by katan-a, credential injected from the projected Secret"
 
-echo "==> 2. unknown model gets 404"
+echo "==> 2. caller x-api-key is stripped; the projected credential wins"
+status=$(request_with_key echo-one caller-key-must-be-stripped)
+[[ "$status" == "200" ]] || { cat "$TMP/body.json"; fail "caller-supplied key was not overridden (status=$status)"; }
+pass "caller x-api-key overridden by the injected credential"
+
+echo "==> 3. wrong projected credential is rejected by the backend"
+rejects_before=$(katan_auth_rejects katan-a)
+put_secret katan-a-key rotated-wrong-value
+status=200
+for _ in $(seq 1 60); do
+  status=$(request echo-one)
+  [[ "$status" == "401" ]] && break
+  sleep 2
+done
+[[ "$status" == "401" ]] || { cat "$TMP/body.json"; fail "wrong projected credential still served 200 (status=$status)"; }
+[[ "$(katan_auth_rejects katan-a)" -gt "$rejects_before" ]] \
+  || fail "401 did not originate from katan-a; the backend never evaluated the injected value"
+pass "backend rejected the rotated Secret value — injection carries the live projected value"
+# Restore the Secret for cluster hygiene but do NOT assert recovery: the
+# credential_inject watcher (praxis-ai #1136) watches the credential file's
+# parent directory, which for the <secret>/<key> projected layout resolves
+# INSIDE the volume's timestamped data dir. kubelet deletes that watched inode
+# on every re-sync, the first rotation is observed only as the watch's death
+# event, and the watch is never re-armed — so a SECOND change is invisible
+# until pod restart. Reproduced: projected file correct, katan still received
+# the stale rotated key 4 minutes later. Recovery leg returns once upstream
+# re-arms the watch (pkg/tenant/extproc.go renders this same layout, so
+# production hits
+# it too).
+put_secret katan-a-key "$KEY_A"
+
+echo "==> 4. unknown model gets 404"
 status=$(request ghost-model-not-in-overlay)
 [[ "$status" == "404" ]] || fail "unknown model returned $status, want 404"
 pass "unknown model 404"
 
-echo "==> 3. hot-swap: generation 2 moves echo-one to katan-b, no restart"
+echo "==> 5. hot-swap: generation 2 moves echo-one to katan-b, no restart"
+echo "    (katan-b validates a DIFFERENT key, so a 200 there also proves the"
+echo "     right credential entry is selected per route — client sends none)"
 go run ./render-overlay \
   --route echo-one:katan-b \
   --known-clusters provider-katan-a,provider-katan-b \
@@ -180,7 +246,7 @@ a5=$(log_count katan-a echo-one); b5=$(log_count katan-b echo-one)
   || fail "praxis pod changed or restarted during hot-swap"
 pass "route hot-swapped to katan-b on the same pod (generation $gen2 accepted)"
 
-echo "==> 4. corrupted envelope retains last-known-good"
+echo "==> 6. corrupted envelope retains last-known-good"
 python3 - "$TMP/v2.json" "$TMP/bad.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))

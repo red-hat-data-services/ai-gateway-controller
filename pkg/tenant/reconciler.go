@@ -473,7 +473,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([
 	}
 	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
 	for _, route := range runtimeSet.Routes() {
-		strategy, err := envelope.CredentialStrategy(route)
+		strategy, err := envelope.StrategyFor(route)
 		if err != nil {
 			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
 		}

@@ -17,7 +17,11 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -87,24 +91,31 @@ func TestExternalModelDeepCopy(t *testing.T) {
 }
 
 // CRD schema validation (patterns) is enforced at admission time by the K8s API server,
-// not in Go structs. These tests verify the regex patterns themselves are correct.
+// not in Go structs. These tests read the kubebuilder marker from the source
+// file directly so the test pattern is always the deployed pattern.
 
 func TestNameReferencePattern(t *testing.T) {
-	pattern := regexp.MustCompile(`^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$`)
+	pattern := regexp.MustCompile(kubebuilderPattern(t, "common_types.go", "NameReference", "Name"))
 
-	valid := []string{"my-openai", "a", "openai-key-v2", "a1b2"}
+	valid := []string{
+		"my-openai", "a", "openai-key-v2", "a1b2",
+		"glm5.1-w8a8-key", "has.dot", "a.b", "a.b.c",
+	}
 	for _, name := range valid {
 		assert.True(t, pattern.MatchString(name), "should accept %q", name)
 	}
 
-	invalid := []string{"My-OpenAI", "UPPERCASE", "-leading-dash", "trailing-", "has/slash", "has.dot", "has space"}
+	invalid := []string{
+		"My-OpenAI", "UPPERCASE", "-leading-dash", "trailing-", "has/slash", "has space",
+		"a..b", "a.-b", "a-.b", ".leading-dot", "trailing-dot.",
+	}
 	for _, name := range invalid {
 		assert.False(t, pattern.MatchString(name), "should reject %q", name)
 	}
 }
 
 func TestEndpointPattern(t *testing.T) {
-	pattern := regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$`)
+	pattern := regexp.MustCompile(kubebuilderPattern(t, "externalprovider_types.go", "ExternalProviderSpec", "Endpoint"))
 
 	valid := []string{"api.openai.com", "bedrock.us-east-1.amazonaws.com", "3-147-232-199.sslip.io", "a.b"}
 	for _, ep := range valid {
@@ -115,4 +126,49 @@ func TestEndpointPattern(t *testing.T) {
 	for _, ep := range invalid {
 		assert.False(t, pattern.MatchString(ep), "should reject %q", ep)
 	}
+}
+
+// kubebuilderPattern extracts the +kubebuilder:validation:Pattern value from
+// the doc comment of a struct field in a Go source file. This is the single
+// source of truth: the test reads the actual marker instead of duplicating it.
+func kubebuilderPattern(t *testing.T, filename, typeName, fieldName string) string {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)
+	require.NoError(t, err)
+
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != typeName {
+				continue
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+			for _, field := range st.Fields.List {
+				for _, name := range field.Names {
+					if name.Name != fieldName {
+						continue
+					}
+					if field.Doc == nil {
+						break
+					}
+					for _, c := range field.Doc.List {
+						const prefix = "// +kubebuilder:validation:Pattern=`"
+						if strings.HasPrefix(c.Text, prefix) && strings.HasSuffix(c.Text, "`") {
+							return c.Text[len(prefix) : len(c.Text)-1]
+						}
+					}
+				}
+			}
+		}
+	}
+	t.Fatalf("no +kubebuilder:validation:Pattern marker found for %s.%s in %s", typeName, fieldName, filename)
+	return ""
 }

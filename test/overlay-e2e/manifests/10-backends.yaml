@@ -1,6 +1,10 @@
-# Two identical llm-katan echo backends. They are deliberately interchangeable
-# except for which one a request lands on: the hot-swap assertion checks which
-# backend's access log grows, not what the response says.
+# Two llm-katan echo backends. They are deliberately interchangeable except
+# for which one a request lands on: the hot-swap assertion checks which
+# backend's access log grows, not what the response says. Each backend
+# validates the injected provider key (--validate-keys); the expected values
+# are non-secret fixtures for this local echo harness and match the Secrets
+# run.sh projects into Praxis. Distinct per backend so an injection that
+# picked the wrong credential entry would be rejected by the backend.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,6 +32,9 @@ spec:
             - echo
             - --providers
             - anthropic
+            - --validate-keys
+            - --api-keys
+            - anthropic=e2e-injected-key-a
             - --host
             - 0.0.0.0
             - --port
@@ -86,6 +93,9 @@ spec:
             - echo
             - --providers
             - anthropic
+            - --validate-keys
+            - --api-keys
+            - anthropic=e2e-injected-key-b
             - --host
             - 0.0.0.0
             - --port
