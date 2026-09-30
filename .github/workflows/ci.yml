@@ -98,6 +98,31 @@ jobs:
             exit 1
           fi
 
+  verify-api-manifests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify generated API artifacts
+        run: |
+          make manifests
+          if ! git diff --quiet -- . || [ -n "$(git status --short --untracked-files=all)" ]; then
+            echo "ERROR: generated API artifacts are out of date." >&2
+            echo "Run 'make manifests' locally and commit the generated changes." >&2
+            git diff --stat -- .
+            git status --short --untracked-files=all
+            exit 1
+          fi
+
   typos:
     runs-on: ubuntu-latest
     steps:

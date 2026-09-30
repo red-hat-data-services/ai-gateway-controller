@@ -21,6 +21,11 @@ data:
       # services (dogfood runs everything on public hostnames, which is why
       # this never bit us there).
       allow_private_endpoints: true
+      # Praxis core also gates hostnames that RESOLVE to private/reserved IPs
+      # at connect time (DNS-rebinding/SSRF protection), separately from the
+      # config-time endpoint check above. The katan service DNS names land in
+      # the pod CIDR, so in-cluster load_balancer endpoints need both flags.
+      allow_private_upstreams: true
 
     listeners:
       - name: proxy
@@ -41,6 +46,27 @@ data:
             reload:
               enabled: true
               debounce_ms: 500
+
+          # Mirrors what pkg/tenant/extproc.go renders in production: one
+          # entry per provider Secret, each carrying the strategy the
+          # overlay candidates resolve to. The overlay's anthropic+messages
+          # candidates carry strategy apikey, so these entries must too —
+          # praxis rejects any candidate whose strategy differs from the
+          # configured entry (praxis-ai #1172 cross-check). The credential
+          # files are projected by the Deployment from the katan-*-key
+          # Secrets run.sh creates.
+          - filter: credential_inject
+            credentials:
+              - name: katan-a-key
+                namespace: overlay-e2e
+                key: api-key
+                file: /etc/praxis/credentials/katan-a-key/api-key
+                strategy: apikey
+              - name: katan-b-key
+                namespace: overlay-e2e
+                key: api-key
+                file: /etc/praxis/credentials/katan-b-key/api-key
+                strategy: apikey
 
           - filter: load_balancer
             clusters:

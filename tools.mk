@@ -13,6 +13,13 @@ $(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
 $(GOLANGCI_LINT): $(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)
 
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+CONTROLLER_GEN_VERSION ?= v0.19.0
+# Target the versioned binary so version bumps trigger reinstall
+$(CONTROLLER_GEN)-$(CONTROLLER_GEN_VERSION): $(LOCALBIN)
+	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_GEN_VERSION))
+$(CONTROLLER_GEN): $(CONTROLLER_GEN)-$(CONTROLLER_GEN_VERSION)
+
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary (ideally with version)
 # $2 - package url which can be installed

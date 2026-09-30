@@ -32,6 +32,11 @@ spec:
             - name: routing-overlay
               mountPath: /etc/praxis/routing
               readOnly: true
+            # Same layout pkg/tenant renders: <secret>/<key> under
+            # /etc/praxis/credentials, referenced by credential_inject files.
+            - name: credentials
+              mountPath: /etc/praxis/credentials
+              readOnly: true
           resources:
             requests:
               cpu: 50m
@@ -52,6 +57,19 @@ spec:
         - name: routing-overlay
           configMap:
             name: routing-overlay
+        - name: credentials
+          projected:
+            sources:
+              - secret:
+                  name: katan-a-key
+                  items:
+                    - key: api-key
+                      path: katan-a-key/api-key
+              - secret:
+                  name: katan-b-key
+                  items:
+                    - key: api-key
+                      path: katan-b-key/api-key
 ---
 apiVersion: v1
 kind: Service

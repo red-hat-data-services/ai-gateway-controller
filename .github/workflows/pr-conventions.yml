@@ -2,6 +2,7 @@ name: PR Conventions
 
 on:
   pull_request:
+    branches: [main]
     types: [opened, edited, synchronize, reopened, labeled, unlabeled]
 
 permissions:

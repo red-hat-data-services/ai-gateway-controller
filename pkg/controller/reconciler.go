@@ -383,8 +383,9 @@ func (r *Reconciler) handleModelLifecycle(ctx context.Context, model *v1alpha1.E
 		if !model.DeletionTimestamp.IsZero() {
 			return true, nil
 		}
+		base := model.DeepCopy()
 		controllerutil.AddFinalizer(model, externalModelFinalizer)
-		if err := r.Update(ctx, model); err != nil {
+		if err := r.Patch(ctx, model, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 			return true, fmt.Errorf("add ExternalModel cleanup finalizer: %w", err)
 		}
 	}
@@ -475,10 +476,11 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 }
 
 func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {
+	base := model.DeepCopy()
 	if !controllerutil.RemoveFinalizer(model, externalModelFinalizer) {
 		return nil
 	}
-	if err := r.Update(ctx, model); err != nil {
+	if err := r.Patch(ctx, model, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return fmt.Errorf("remove ExternalModel cleanup finalizer: %w", err)
 	}
 	return nil
@@ -783,8 +785,9 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 							// re-enable the filter.
 							"overrides": map[string]any{
 								"processing_mode": map[string]any{
-									"request_header_mode":   "SEND",
-									"request_body_mode":     "NONE",
+									"request_header_mode": "SEND",
+									// Praxis treats the omitted NONE enum as BUFFERED; STREAMED runs selection at headers.
+									"request_body_mode":     "STREAMED",
 									"response_header_mode":  "SEND",
 									"response_body_mode":    "NONE",
 									"request_trailer_mode":  "SKIP",
