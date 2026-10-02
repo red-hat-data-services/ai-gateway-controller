@@ -120,6 +120,26 @@ func TestSplitPostAuthResourcesUsesResolvedTenantNamespace(t *testing.T) {
 	if data, _, _ := unstructured.NestedStringMap(externalConfig.Object, "data"); data["extproc.yaml"] == "" || data["pre-extproc.yaml"] != "" {
 		t.Fatal("ExternalModel ConfigMap must contain only the dedicated post-auth configuration")
 	}
+	externalFilter := find("EnvoyFilter", PayloadProcessingExternalModelFilterNameForTenant("tenant-a"), "gateway-system")
+	externalPatches, _, _ := unstructured.NestedSlice(externalFilter.Object, "spec", "configPatches")
+	wantExternalFQDN := "payload-processing-external-model-tenant-a.tenant-a.svc.cluster.local"
+	foundExternalCluster := false
+	for _, raw := range externalPatches {
+		patch, ok := raw.(map[string]any)
+		if !ok || patch["applyTo"] != "CLUSTER" {
+			continue
+		}
+		body, _ := patch["patch"].(map[string]any)
+		value, _ := body["value"].(map[string]any)
+		if value["name"] != "payload-processing-external-model-extproc" {
+			continue
+		}
+		assertClusterAddress(t, value, wantExternalFQDN)
+		foundExternalCluster = true
+	}
+	if !foundExternalCluster {
+		t.Fatal("ExternalModel EnvoyFilter must target the tenant-local ExtProc Service")
+	}
 
 	envoy := find("EnvoyFilter", PayloadProcessingEnvoyFilterName("tenant-a"), "gateway-system")
 	patches, _, _ := unstructured.NestedSlice(envoy.Object, "spec", "configPatches")

@@ -48,3 +48,45 @@ func GatewayRef(aitenant *unstructured.Unstructured) (name, namespace string, ok
 	namespace, _, _ = unstructured.NestedString(aitenant.Object, "status", "gatewayRef", "namespace")
 	return name, namespace, name != "" && namespace != ""
 }
+
+// StatusIsCurrent reports whether the AITenant's Ready condition was computed
+// for the object's current spec generation — i.e. status.phase and
+// status.gatewayRef reflect the live spec, not an in-flight older one that
+// maas-controller has not reconciled yet. It looks for the
+// AITenantConditionReady condition and requires its observedGeneration to
+// equal metadata.generation; maas-controller stamps that on every phase
+// transition (setAITenantPhase), and AITenantStatus exposes no top-level
+// observedGeneration to rely on instead.
+//
+// Used together with IsActive as the readiness gate: acting on an Active phase
+// whose gatewayRef still reflects a superseded generation would install
+// praxis-extproc against a stale Gateway. A false result is a transient
+// not-ready state (requeue), not an error.
+func StatusIsCurrent(aitenant *unstructured.Unstructured) bool {
+	conditions, _, _ := unstructured.NestedSlice(aitenant.Object, "status", "conditions")
+	for _, entry := range conditions {
+		condition, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		condType, _, _ := unstructured.NestedString(condition, "type")
+		if condType != AITenantConditionReady {
+			continue
+		}
+		observed, ok := nestedInt64(condition, "observedGeneration")
+		return ok && observed == aitenant.GetGeneration()
+	}
+	return false
+}
+
+// nestedInt64 reads an integer field that may have been decoded as int64
+// (runtime.DefaultUnstructuredConverter) or float64 (plain encoding/json).
+func nestedInt64(m map[string]any, key string) (int64, bool) {
+	switch v := m[key].(type) {
+	case int64:
+		return v, true
+	case float64:
+		return int64(v), true
+	}
+	return 0, false
+}

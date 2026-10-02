@@ -4,25 +4,19 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.19.0
-  name: externalproviders.inference.opendatahub.io
+  name: aiguardrails.aigateway.opendatahub.io
 spec:
-  group: inference.opendatahub.io
+  group: aigateway.opendatahub.io
   names:
-    kind: ExternalProvider
-    listKind: ExternalProviderList
-    plural: externalproviders
-    singular: externalprovider
+    kind: AIGuardrail
+    listKind: AIGuardrailList
+    plural: aiguardrails
+    singular: aiguardrail
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.provider
-      name: Provider
-      type: string
-    - jsonPath: .spec.endpoint
-      name: Endpoint
-      type: string
-    - jsonPath: .status.phase
-      name: Phase
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -31,8 +25,8 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          ExternalProvider defines a connection to an external LLM provider (endpoint + credentials).
-          Multiple ExternalModel resources can reference the same ExternalProvider.
+          AIGuardrail is a reusable, ordered collection of checks backed by a
+          TrustyAI NemoGuardrails service.
         properties:
           apiVersion:
             description: |-
@@ -52,71 +46,114 @@ spec:
           metadata:
             type: object
           spec:
-            description: ExternalProviderSpec defines the desired state of ExternalProvider.
+            description: AIGuardrailSpec defines a guardrail provider and its ordered
+              checks.
             properties:
-              auth:
-                description: Auth configures how to authenticate with the provider.
-                properties:
-                  secretRef:
-                    description: |-
-                      SecretRef references a Kubernetes Secret containing the provider API key.
-                      The Secret must be in the same namespace as the ExternalProvider
-                      and must contain a data key "api-key" with the credential value.
-                    properties:
-                      name:
-                        maxLength: 253
-                        minLength: 1
-                        pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$
+              checks:
+                description: |-
+                  Checks is the ordered list of independent checks. All selected checks
+                  must pass. Check names are unique within this list.
+                items:
+                  description: |-
+                    AIGuardrailCheck defines one named NeMo configuration and the phases in
+                    which it is evaluated.
+                  properties:
+                    configId:
+                      description: ConfigID identifies the configuration loaded by
+                        NemoGuardrails.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                    name:
+                      description: |-
+                        Name is the stable name used by attachment resources to select this
+                        check.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    phases:
+                      description: Phases is the non-empty set of request phases for
+                        this check.
+                      items:
+                        description: GuardrailPhase identifies when a guardrail check
+                          is applied.
+                        enum:
+                        - Input
+                        - Output
                         type: string
-                    required:
-                    - name
-                    type: object
-                  type:
-                    description: |-
-                      Type identifies the auth type for this provider.
-                      e.g. "apikey" (header based), "sigv4", etc.
-                    enum:
-                    - apikey
-                    - sigv4
-                    - oauth2
-                    type: string
-                required:
-                - secretRef
-                - type
-                type: object
-              config:
-                additionalProperties:
-                  type: string
-                description: |-
-                  Config holds provider-specific configuration as key-value pairs.
-                  e.g., Vertex AI: {"project": "my-project", "location": "us-central1"}.
-                type: object
-              endpoint:
-                description: |-
-                  Endpoint is the FQDN of the external provider (no scheme or path).
-                  e.g. "api.openai.com", "bedrock.amazonaws.com".
-                maxLength: 253
-                minLength: 1
-                pattern: ^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$
-                type: string
+                      maxItems: 2
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-type: set
+                  required:
+                  - configId
+                  - name
+                  - phases
+                  type: object
+                maxItems: 64
+                minItems: 1
+                type: array
+                x-kubernetes-list-type: atomic
+                x-kubernetes-validations:
+                - message: check names must be unique
+                  rule: self.all(x, self.exists_one(y, y.name == x.name))
               provider:
-                description: |-
-                  Provider identifies the API type for this provider.
-                  e.g. "openai", "anthropic", "azure", "aws-bedrock", "vertex".
-                maxLength: 63
-                minLength: 1
-                type: string
+                description: Provider identifies the service used to execute the checks.
+                properties:
+                  nemo:
+                    description: |-
+                      Nemo references a NemoGuardrails resource. If Namespace is omitted,
+                      the reference resolves in the AIGuardrail namespace.
+                    properties:
+                      ref:
+                        description: Ref references a NemoGuardrails resource.
+                        properties:
+                          name:
+                            maxLength: 253
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          namespace:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                        required:
+                        - name
+                        type: object
+                    required:
+                    - ref
+                    type: object
+                  timeout:
+                    description: Timeout is the maximum duration for an individual
+                      provider call.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: timeout must be a valid positive duration
+                      rule: isDuration(self) && duration(self) > duration('0s')
+                required:
+                - nemo
+                - timeout
+                type: object
             required:
-            - auth
-            - endpoint
+            - checks
             - provider
             type: object
           status:
-            description: ExternalProviderStatus defines the observed state of ExternalProvider.
+            description: AIGuardrailStatus defines the observed provider binding and
+              readiness.
             properties:
+              bindingRevision:
+                description: |-
+                  BindingRevision changes when provider, Secret, configuration or
+                  permission dependencies change independently of the policy generation.
+                type: string
               conditions:
-                description: Conditions represent the latest available observations
-                  of the provider's state.
+                description: |-
+                  Conditions report sanitized acceptance, reference, provider and
+                  compatibility state. Credentials and provider configuration are never
+                  exposed here.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -173,22 +210,14 @@ spec:
                   type: object
                 type: array
               observedGeneration:
-                description: ObservedGeneration is the latest spec generation processed
-                  by the controller.
+                description: |-
+                  ObservedGeneration is the latest spec generation processed by the
+                  controller.
                 format: int64
                 type: integer
-              phase:
-                description: |-
-                  Phase represents the current reconciliation phase.
-                  Ready: all networking resources created and Secret validated.
-                  Failed: reconciliation error (e.g., missing Secret, Istio resource creation failed).
-                  This reflects controller reconciliation state, not runtime request health.
-                enum:
-                - Pending
-                - Ready
-                - Failed
-                type: string
             type: object
+        required:
+        - spec
         type: object
     served: true
     storage: true

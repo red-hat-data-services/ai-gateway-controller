@@ -120,6 +120,17 @@ const (
 	// optimistically (from spec, unvalidated) before that work happens.
 	AITenantPhaseActive = "Active"
 
+	// AITenantConditionReady is the AITenant status condition type
+	// maas-controller's AITenant reconciler stamps together with status.phase
+	// (mirrors maasv1alpha1.AITenantConditionReady, set by
+	// AITenantReconciler.setAITenantPhase), carrying ObservedGeneration set to
+	// the AITenant's metadata.generation. It is the only place a per-generation
+	// marker is exposed: AITenantStatus has no top-level observedGeneration
+	// field. Reads of status.phase / status.gatewayRef are only trustworthy for
+	// the current spec when this condition's observedGeneration matches
+	// metadata.generation — see StatusIsCurrent.
+	AITenantConditionReady = "Ready"
+
 	// PraxisCleanupFinalizer is added to every MaasTenantConfig this controller
 	// has applied praxis-extproc resources for, so it can clean them up when
 	// the tenant switches away from praxis or the MaasTenantConfig is deleted
