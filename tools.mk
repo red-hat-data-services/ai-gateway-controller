@@ -20,6 +20,12 @@ $(CONTROLLER_GEN)-$(CONTROLLER_GEN_VERSION): $(LOCALBIN)
 	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_GEN_VERSION))
 $(CONTROLLER_GEN): $(CONTROLLER_GEN)-$(CONTROLLER_GEN_VERSION)
 
+SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest
+SETUP_ENVTEST_VERSION ?= v0.0.0-20260305142021-f9589b9f2b9d
+$(SETUP_ENVTEST)-$(SETUP_ENVTEST_VERSION): $(LOCALBIN)
+	$(call go-install-tool,$(SETUP_ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(SETUP_ENVTEST_VERSION))
+$(SETUP_ENVTEST): $(SETUP_ENVTEST)-$(SETUP_ENVTEST_VERSION)
+
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary (ideally with version)
 # $2 - package url which can be installed

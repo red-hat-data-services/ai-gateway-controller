@@ -78,9 +78,10 @@ func TestUsesPraxis(t *testing.T) {
 		typ  string
 		want bool
 	}{
-		{"absent means IPP", "", false},
+		{"absent defaults to praxis", "", true},
 		{"praxis", "praxis", true},
-		{"unexpected value", "ipp", false},
+		{"ipp opts into legacy", "ipp", false},
+		{"unrecognized defaults to praxis", "unknown", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

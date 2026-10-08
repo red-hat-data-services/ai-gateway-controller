@@ -29,15 +29,22 @@ func NewMaasTenantConfig() *unstructured.Unstructured {
 }
 
 // PayloadProcessingType reads the AnnotationPayloadProcessingType annotation
-// from a MaasTenantConfig. Absent/empty means IPP; this package only cares
-// whether it equals PayloadProcessingBackendPraxis.
+// from a MaasTenantConfig.
 func PayloadProcessingType(mtc *unstructured.Unstructured) string {
 	return mtc.GetAnnotations()[AnnotationPayloadProcessingType]
 }
 
-// UsesPraxis reports whether a MaasTenantConfig opted into this controller.
+// UsesPraxis reports whether this controller owns payload processing for the
+// MaasTenantConfig. Mirrors maas-controller's resolveSkipIPP: absent,
+// "praxis", or any unrecognized value defaults to praxis; only
+// PayloadProcessingBackendIPP opts into legacy IPP.
 func UsesPraxis(mtc *unstructured.Unstructured) bool {
-	return PayloadProcessingType(mtc) == PayloadProcessingBackendPraxis
+	switch PayloadProcessingType(mtc) {
+	case PayloadProcessingBackendIPP:
+		return false
+	default:
+		return true
+	}
 }
 
 // IdentifierFor derives the per-tenant resource-naming identifier from
