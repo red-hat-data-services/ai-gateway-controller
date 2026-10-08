@@ -14,18 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package tenant watches AITenant CRs (owned by maas-controller) and, for
-// every tenant whose spec.payloadProcessing.type is "praxis", renders and
-// SSA-applies a dedicated per-tenant copy of the vendored praxis-extproc
-// manifests into that tenant's Gateway namespace.
+// Package tenant watches MaasTenantConfig CRs (owned by maas-controller) and,
+// for every tenant whose payload-processing annotation selects Praxis, renders
+// and SSA-applies a dedicated per-tenant copy of the vendored praxis-extproc
+// manifests into that tenant's Gateway namespace. AITenant is resolved only
+// for status, ownership, and Gateway identity.
 //
-// This package deliberately reads AITenant via unstructured +
+// This package deliberately reads both resources via unstructured +
 // schema.GroupVersionKind rather than importing
 // models-as-a-service/maas-controller's Go types: that module's go.mod pulls
 // in kserve, knative, KEDA, openshift/api, and more, none of which this
 // controller needs, and DESIGN.md's stated goal is to keep this repo's
-// dependency graph minimal. AITenant's on-wire JSON shape is the only
-// contract this package relies on.
+// dependency graph minimal. Their on-wire JSON shapes are the only contracts
+// this package relies on.
 package tenant
 
 import "k8s.io/apimachinery/pkg/runtime/schema"
@@ -60,9 +61,9 @@ const (
 	// AnnotationPayloadProcessingType selects a tenant's payload-processing
 	// dataplane. Both this controller and maas-controller always read the
 	// same single source of truth (mirrors maas-controller's
-	// tenantreconcile.AnnotationPayloadProcessingType). Absent, empty, or any
-	// value other than PayloadProcessingBackendPraxis means IPP
-	// (maas-controller), out of scope for this controller.
+	// tenantreconcile.AnnotationPayloadProcessingType). Default (absent or
+	// "praxis") means this controller owns praxis; set to
+	// PayloadProcessingBackendIPP to opt back into maas-controller legacy IPP.
 	AnnotationPayloadProcessingType = "maas.opendatahub.io/payload-processing-type"
 
 	// AnnotationPayloadProcessingStatus coordinates the payload-processing
@@ -107,10 +108,15 @@ const (
 	LabelManagedByAITenant = "maas.opendatahub.io/managed-by-aitenant"
 	LabelTenantName        = "maas.opendatahub.io/tenant-name"
 
-	// PayloadProcessingBackendPraxis is the only AnnotationPayloadProcessingType
-	// value that opts a tenant into this controller (mirrors
-	// maas-controller's tenantreconcile.PayloadProcessingTypePraxis).
+	// PayloadProcessingBackendPraxis is the AnnotationPayloadProcessingType
+	// value for the praxis dataplane (also the product default when the
+	// annotation is absent; mirrors maas-controller's
+	// tenantreconcile.PayloadProcessingTypePraxis).
 	PayloadProcessingBackendPraxis = "praxis"
+
+	// PayloadProcessingBackendIPP opts a tenant into maas-controller legacy
+	// IPP (mirrors maas-controller's tenantreconcile.PayloadProcessingTypeIPP).
+	PayloadProcessingBackendIPP = "ipp"
 
 	// AITenantPhaseActive is the AITenant status.phase value maas-controller's
 	// AITenant reconciler sets only after it has validated the tenant's

@@ -80,6 +80,7 @@ jobs:
               ':(exclude)*.md' \
               ':(exclude)go.sum' \
               ':(exclude)config/manifests/**' \
+              ':(exclude)test/envtest/testdata/crds/*.yaml' \
             | awk '{sum += $1} END {print sum+0}')
           echo "Added production lines: $added"
           if [ "$added" -gt 750 ]; then

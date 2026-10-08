@@ -49,11 +49,11 @@ const notReadyRequeueInterval = 10 * time.Second
 
 // Reconciler primarily watches MaasTenantConfig CRs (owned by
 // maas-controller) — mirroring maas-controller's own TenantReconciler — and,
-// for every tenant whose AnnotationPayloadProcessingType annotation is
-// "praxis", renders and SSA-applies a per-tenant copy of the vendored
-// praxis-extproc manifests into that tenant's Gateway namespace. Tenants
-// that don't opt into praxis (absent/empty/other) are ignored:
-// maas-controller's own TenantReconciler owns their IPP deployment.
+// for every tenant that UsesPraxis (default when AnnotationPayloadProcessingType
+// is absent or "praxis"), renders and SSA-applies a per-tenant copy of the
+// vendored praxis-extproc manifests into that tenant's Gateway namespace.
+// Tenants annotated with PayloadProcessingBackendIPP are ignored:
+// maas-controller's own TenantReconciler owns their legacy IPP deployment.
 //
 // Reconciler still Gets a tenant's owning AITenant (see
 // OwningAITenantRef / GatewayRef / IsActive) — status.gatewayRef and
@@ -273,6 +273,13 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 			return false, nil
 		}
 		return false, fmt.Errorf("re-read owning AITenant %s/%s: %w", namespace, name, err)
+	}
+	// Terminating: the owner's delete/cleanup is already in flight, so a fresh
+	// apply would provision for a tenant on its way out. deletionTimestamp is the
+	// only signal that flips here — uid/bind/active/current/gatewayRef can all
+	// still pass while the object is finalizing.
+	if !aitenant.GetDeletionTimestamp().IsZero() {
+		return false, nil
 	}
 	// Identity: the same object, not a delete+recreate that reused the name.
 	if aitenant.GetUID() != wantUID {
@@ -565,7 +572,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([
 			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
 		}
 		candidate := envelope.Candidate{
-			Cluster: route.Cluster, StableID: "provider-" + route.Provider,
+			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
 			Kind: "inference_model", Name: route.ClientName, Fresh: true,
 		}
 		if strategy != "" {

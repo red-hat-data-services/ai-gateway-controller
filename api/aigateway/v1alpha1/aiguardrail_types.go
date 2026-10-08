@@ -68,9 +68,14 @@ type AIGuardrailProvider struct {
 	// +kubebuilder:validation:Required
 	Nemo AIGuardrailNemoProvider `json:"nemo"`
 
+	// Format=duration is omitted because it admits strings metav1.Duration cannot
+	// decode. Kept apart from the field doc so it stays out of the CRD description.
+
 	// Timeout is the maximum duration for an individual provider call.
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:XValidation:rule="isDuration(self) && duration(self) > duration('0s')",message="timeout must be a valid positive duration"
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="timeout must be a valid positive duration"
 	Timeout metav1.Duration `json:"timeout"`
 }
 

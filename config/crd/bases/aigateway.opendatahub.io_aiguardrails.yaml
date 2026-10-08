@@ -128,10 +128,11 @@ spec:
                   timeout:
                     description: Timeout is the maximum duration for an individual
                       provider call.
+                    maxLength: 64
                     type: string
                     x-kubernetes-validations:
                     - message: timeout must be a valid positive duration
-                      rule: isDuration(self) && duration(self) > duration('0s')
+                      rule: duration(self) > duration('0s')
                 required:
                 - nemo
                 - timeout
