@@ -57,10 +57,24 @@ run: binary ##	build and run manager locally (see cmd/manager/main.go for flags)
 
 TEST_FLAGS ?= -race -coverprofile=coverage.out
 .PHONY: test
-test: tidy ##	run tests with coverage
+test: test-unit test-envtest ##	run unit and control-plane tests
+
+.PHONY: test-unit
+test-unit: tidy ##	run unit tests with coverage
 	go test $(TEST_FLAGS) ./...
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "Test coverage report generated: $(abspath coverage.html)"
+
+ENVTEST_K8S_VERSION ?= 1.35.0
+ENVTEST_FLAGS ?= -race -count=1 -timeout=10m
+.PHONY: test-envtest
+test-envtest: $(SETUP_ENVTEST) ##	run controller scenarios against a local API server
+	@set -eu; \
+	assets="$${KUBEBUILDER_ASSETS:-}"; \
+	if [ -z "$$assets" ]; then \
+		assets="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)/envtest -p path)"; \
+	fi; \
+	KUBEBUILDER_ASSETS="$$assets" go test -tags envtest $(ENVTEST_FLAGS) ./test/envtest/...
 
 .PHONY: tidy
 tidy: ##	go mod tidy

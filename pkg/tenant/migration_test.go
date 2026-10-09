@@ -131,7 +131,7 @@ func TestEnsurePraxisMayDeploy(t *testing.T) {
 		})
 		live := caller.DeepCopy()
 		annotations := live.GetAnnotations()
-		delete(annotations, AnnotationPayloadProcessingType) // legacy selection
+		annotations[AnnotationPayloadProcessingType] = PayloadProcessingBackendIPP // legacy selection
 		live.SetAnnotations(annotations)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(live).Build()
 

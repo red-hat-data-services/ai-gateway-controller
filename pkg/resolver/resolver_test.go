@@ -35,7 +35,7 @@ func model(ns, name string, refs ...v1alpha1.ExternalProviderRef) *v1alpha1.Exte
 
 func ref(name, target, path string) v1alpha1.ExternalProviderRef {
 	return v1alpha1.ExternalProviderRef{
-		Ref:         v1alpha1.NameReference{Name: name},
+		Ref:         v1alpha1.ExternalProviderReference{Name: name},
 		TargetModel: target,
 		APIFormat:   "openai-chat",
 		Path:        path,
@@ -220,6 +220,48 @@ func TestResolve_SkipAggregationKeepsGoodRefs(t *testing.T) {
 func withWeight(r v1alpha1.ExternalProviderRef, w int) v1alpha1.ExternalProviderRef {
 	r.Weight = intptr(w)
 	return r
+}
+
+func TestResolve_ProviderNamespace(t *testing.T) {
+	for name, resolve := range map[string]func([]*v1alpha1.ExternalModel, []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error){
+		"serving": Resolve, "preload": ResolveAll,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, namespace := range []string{"", "models", "shared"} {
+				t.Run("namespace="+namespace, func(t *testing.T) {
+					r := ref("provider", "gpt", "/v1/chat/completions")
+					r.Ref.Namespace = namespace
+					set, err := resolve([]*v1alpha1.ExternalModel{model("models", "model", r)}, []*v1alpha1.ExternalProvider{
+						provider("models", "provider", PhaseReady, "local.example.com", nil),
+						provider("shared", "provider", PhaseReady, "foreign.example.com", nil),
+					})
+					if namespace == "shared" {
+						if !errors.Is(err, ErrNoRoutes) || len(set.Routes()) != 0 {
+							t.Fatalf("foreign reference resolved: set=%#v err=%v", set, err)
+						}
+						if len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipRefNamespaceUnsupported {
+							t.Fatalf("foreign reference skips = %#v", set.Models[0].Skips)
+						}
+					} else if err != nil || len(set.Routes()) != 1 || set.Routes()[0].Endpoint != "local.example.com" {
+						t.Fatalf("local reference: set=%#v err=%v", set, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestResolve_UnsupportedNamespaceKeepsLocalRefs(t *testing.T) {
+	foreign := ref("provider", "foreign-target", "/v1/chat/completions")
+	foreign.Ref.Namespace = "shared"
+	m := model("models", "model", foreign, ref("provider", "local-target", "/v1/chat/completions"))
+	p := provider("models", "provider", PhaseReady, "local.example.com", nil)
+	for _, resolve := range []func([]*v1alpha1.ExternalModel, []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error){Resolve, ResolveAll} {
+		set, err := resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+		if err != nil || len(set.Routes()) != 1 || set.Routes()[0].TargetModel != "local-target" {
+			t.Fatalf("mixed references: set=%#v err=%v", set, err)
+		}
+	}
 }
 
 func TestResolve_NamespaceIsolation(t *testing.T) {
@@ -407,5 +449,34 @@ func TestResolvePath_MalformedBracesPassThrough(t *testing.T) {
 		if got != path {
 			t.Errorf("got %q, want %q (IPP pass-through parity)", got, path)
 		}
+	}
+}
+
+// TestResolveTwoModelsOneProvider verifies that two distinct ExternalModels
+// referencing the same ExternalProvider both resolve cleanly. The resolver
+// must not reject this topology; the envelope layer is responsible for
+// giving each candidate a unique stable_id.
+func TestResolveTwoModelsOneProvider(t *testing.T) {
+	shared := provider("ns1", "shared-prov", PhaseReady, "api.example.com", nil)
+	modelA := model("ns1", "model-a", ref("shared-prov", "gpt-4o", "/v1/chat/completions"))
+	modelB := model("ns1", "model-b", ref("shared-prov", "gpt-4o-mini", "/v1/chat/completions"))
+
+	set, err := Resolve([]*v1alpha1.ExternalModel{modelA, modelB}, []*v1alpha1.ExternalProvider{shared})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	routes := set.Routes()
+	if len(routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(routes))
+	}
+	if routes[0].Model != "model-a" || routes[1].Model != "model-b" {
+		t.Fatalf("models = [%q, %q], want [model-a, model-b]", routes[0].Model, routes[1].Model)
+	}
+	if routes[0].Cluster != routes[1].Cluster {
+		t.Fatalf("two models sharing a provider must have the same Cluster; got %q and %q",
+			routes[0].Cluster, routes[1].Cluster)
+	}
+	if routes[0].Cluster != "provider-shared-prov" {
+		t.Fatalf("cluster = %q, want provider-shared-prov", routes[0].Cluster)
 	}
 }
