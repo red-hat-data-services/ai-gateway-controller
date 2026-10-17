@@ -476,14 +476,8 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, err
 	}
-	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
-		reason := reasonReconcileFailed
-		if errors.Is(err, errCredentialNotReady) {
-			reason = reasonProviderNotReady
-		}
-		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
-			return reconcile.Result{}, statusErr
-		}
+	set, err = r.validateModelRouteSet(ctx, set, modelOwners, model, report)
+	if err != nil {
 		return reconcile.Result{}, err
 	}
 	// The selector/status/owner may have changed while provider inputs and
@@ -618,8 +612,12 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		}
 		return modelTenantContext{}, false, nil
 	}
-	if !tenant.IsActive(ait) || !tenant.StatusIsCurrent(ait) {
-		if err := report(false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
+	// DeployReady (current Ready stamp, not Failed) — not Active. maas writes
+	// gatewayRef before the exclusive gateway claim; Failed/GatewayClaimFailed
+	// still publishes the contested ref. Pending with a current stamp is enough
+	// so ExternalModel publish does not wait on Active↔MTC Ready.
+	if !tenant.DeployReady(ait) {
+		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant is not ready for ExternalModel publish (Failed or status not current for this generation)", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
@@ -681,11 +679,10 @@ func (r *Reconciler) reconcileDeletingModel(ctx context.Context, model *v1alpha1
 	}
 	if live.missingConfig || live.mtc == nil || live.aitenant == nil ||
 		!live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() ||
-		live.status != tenant.PayloadProcessingStatusSteady || !tenant.IsActive(live.aitenant) ||
-		!tenant.StatusIsCurrent(live.aitenant) {
+		live.status != tenant.PayloadProcessingStatusSteady {
 		return r.reconcileDeletedModelWithoutOwner(ctx, model)
 	}
-	if _, _, ready := tenant.GatewayRef(live.aitenant); !ready {
+	if _, _, ready := tenant.GatewayRef(live.aitenant); !ready || !tenant.DeployReady(live.aitenant) {
 		return r.reconcileDeletedModelWithoutOwner(ctx, model)
 	}
 	return r.reconcileDeletedModel(ctx, model, live.aitenant)
@@ -810,8 +807,28 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err != nil {
 		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
 	}
-	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
-		return fmt.Errorf("validate remaining ExternalModel credentials after deletion: %w", err)
+	set, rejected := excludeUnsupportedModelSelection(set)
+	if len(set.Routes()) == 0 && len(rejected) > 0 {
+		// No valid sibling can serve. Remove the deleted model's routes before
+		// releasing its finalizer; unsupported siblings remain unserved.
+		if err := r.deleteExternalModelRouteFiltersForTenant(ctx, deleted.Namespace); err != nil {
+			return err
+		}
+		if tenantID != "" {
+			if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
+				return err
+			}
+		}
+		if err := r.cleanupModelTransport(ctx, deleted.Namespace, nil); err != nil {
+			return err
+		}
+		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
+			return err
+		}
+		return r.removeExternalModelFinalizer(ctx, deleted)
+	}
+	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
+		return fmt.Errorf("validate remaining ExternalModel routes after deletion: %w", err)
 	}
 	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
@@ -1025,10 +1042,8 @@ func providerTenantReadinessMessage(live tenantResolution) string {
 		return "owning AITenant is being deleted"
 	case live.status != tenant.PayloadProcessingStatusSteady:
 		return fmt.Sprintf("MaasTenantConfig selects Praxis but payload-processing-status is %q, expected %q", live.status, tenant.PayloadProcessingStatusSteady)
-	case !tenant.IsActive(live.aitenant):
-		return "owning AITenant phase is not Active"
-	case !tenant.StatusIsCurrent(live.aitenant):
-		return "owning AITenant Ready condition does not observe its current generation"
+	case !tenant.DeployReady(live.aitenant):
+		return "owning AITenant is not DeployReady (Failed or Ready stamp not current for this generation)"
 	default:
 		return ""
 	}
@@ -1124,11 +1139,8 @@ func (r *Reconciler) livePraxisBeforeWrite(ctx context.Context, namespace string
 	if want.aitenantUID != "" && live.aitenant.GetUID() != want.aitenantUID {
 		return false, nil
 	}
-	if !tenant.IsActive(live.aitenant) || !tenant.StatusIsCurrent(live.aitenant) {
-		return false, nil
-	}
 	gatewayName, gatewayNamespace, ok := tenant.GatewayRef(live.aitenant)
-	return ok && gatewayName == want.gatewayName && gatewayNamespace == want.gatewayNamespace, nil
+	return ok && tenant.DeployReady(live.aitenant) && gatewayName == want.gatewayName && gatewayNamespace == want.gatewayNamespace, nil
 }
 
 // praxisTenantForNamespace is retained for callers/tests that need the
@@ -1210,6 +1222,88 @@ func (r *Reconciler) validateResolvedCredentials(ctx context.Context, routes []r
 		}
 	}
 	return nil
+}
+
+func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet) error {
+	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
+		return err
+	}
+	return envelope.ValidateSelectionMetadata(set)
+}
+
+// excludeUnsupportedModelSelection excludes every model contributing to a
+// conflicting client-visible capability. The overlay selects candidates by
+// client name, so unequal weights or repeated providers across model objects
+// must not affect unrelated models in the namespace.
+func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver.ResolvedRouteSet, map[string]error) {
+	valid := &resolver.ResolvedRouteSet{Models: make([]resolver.ModelRoutes, 0, len(set.Models))}
+	rejected := make(map[string]error)
+	weights := make(map[string]int)
+	weightConflicts := make(map[string]bool)
+	bindings := make(map[string]bool)
+	duplicateProviders := make(map[string]bool)
+	for _, model := range set.Models {
+		for _, route := range model.Routes {
+			if weight, seen := weights[route.ClientName]; seen && weight != route.Weight {
+				weightConflicts[route.ClientName] = true
+			} else {
+				weights[route.ClientName] = route.Weight
+			}
+			binding := route.ClientName + "\x00" + route.Provider
+			if bindings[binding] {
+				duplicateProviders[route.ClientName] = true
+			}
+			bindings[binding] = true
+		}
+	}
+	for _, model := range set.Models {
+		for _, route := range model.Routes {
+			if weightConflicts[route.ClientName] {
+				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s has unequal weights", envelope.ErrWeightUnsupported, route.ClientName)
+				break
+			}
+			if duplicateProviders[route.ClientName] {
+				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s repeats a provider", envelope.ErrDuplicateProvider, route.ClientName)
+				break
+			}
+		}
+		if rejected[model.ModelRef] == nil {
+			valid.Models = append(valid.Models, model)
+		}
+	}
+	return valid, rejected
+}
+
+func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet,
+	owners map[string]*v1alpha1.ExternalModel, current *v1alpha1.ExternalModel, report modelStatusReporter) (*resolver.ResolvedRouteSet, error) {
+	valid, rejected := excludeUnsupportedModelSelection(set)
+	for name, rejection := range rejected {
+		if owner := owners[name[strings.LastIndexByte(name, '/')+1:]]; owner != nil {
+			if owner.Namespace == current.Namespace && owner.Name == current.Name {
+				continue
+			}
+			if err := r.updateModelStatus(ctx, owner, false, reasonReconcileFailed, rejection.Error(), nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := rejected[current.Namespace+"/"+current.Name]; err != nil {
+		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+			return nil, statusErr
+		}
+		return nil, err
+	}
+	if err := r.validateResolvedRouteSet(ctx, valid); err != nil {
+		reason := reasonReconcileFailed
+		if errors.Is(err, errCredentialNotReady) {
+			reason = reasonProviderNotReady
+		}
+		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
+			return nil, statusErr
+		}
+		return nil, err
+	}
+	return valid, nil
 }
 
 func (r *Reconciler) namespaceAllowed(namespace string) bool {
