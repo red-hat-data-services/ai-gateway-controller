@@ -10,6 +10,7 @@ KATAN_DEFAULT_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c
 KATAN_DEFAULT_AMD64_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:a8bf18109e2db641ef4a63efe65f69d4d6554f1128a174053de89a8b81b4284d
 KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-$KATAN_DEFAULT_IMAGE}
 KATAN_KIND_IMAGE=${KATAN_IMAGE:-llm-katan:external-model-two-plane}
+PROVIDER_RECORDER_IMAGE=provider-recorder:issue28-kind
 if [[ "${BUILD_KATAN:-false}" == true ]]; then
   KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-llm-katan:e2e}
   KATAN_KIND_IMAGE=$KATAN_EFFECTIVE_IMAGE
@@ -26,6 +27,7 @@ APPLY_REAL_OPENAI_FIXTURE=${APPLY_REAL_OPENAI_FIXTURE:-false}
 KSERVE_REPO=${KSERVE_REPO:-"$DEPS_DIR/kserve"}
 KUADRANT_OPERATOR_REPO=${KUADRANT_OPERATOR_REPO:-"$DEPS_DIR/kuadrant-operator"}
 PRAXIS_EXTPROC_REPO=${PRAXIS_EXTPROC_REPO:-"$DEPS_DIR/praxis-extproc"}
+EXTPROC_IMAGE=${EXTPROC_IMAGE:-praxis-extproc:dev}
 ISTIOCTL=${ISTIOCTL:-/tmp/istio-1.27.3/bin/istioctl}
 EVIDENCE_ROOT=${LOCAL_ENV_EVIDENCE_ROOT:-"$ROOT/evidence"}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -176,6 +178,12 @@ if [[ "${BUILD_KATAN:-false}" == true ]]; then check_repo LLM_KATAN_REPO; fi
 check_repo MAAS_CONTROLLER_REPO
 check_repo KUADRANT_OPERATOR_REPO
 check_repo PRAXIS_EXTPROC_REPO
+if [[ -n "${EXPECTED_EXTPROC_MAIN_SHA:-}" ]]; then
+  extproc_branch=$(git -C "$PRAXIS_EXTPROC_REPO" branch --show-current)
+  extproc_head=$(git -C "$PRAXIS_EXTPROC_REPO" rev-parse HEAD)
+  [[ "$extproc_branch" == main && "$extproc_head" == "$EXPECTED_EXTPROC_MAIN_SHA" ]] || fail "ExtProc source must be clean main at $EXPECTED_EXTPROC_MAIN_SHA; got $extproc_branch@$extproc_head"
+  [[ -z "$(git -C "$PRAXIS_EXTPROC_REPO" status --porcelain)" ]] || fail "ExtProc main checkout is dirty"
+fi
 
 if rg -q 'For\(.*ExternalModel|ExternalModel.*Reconciler|SetupWithManager' "$ROOT/cmd" "$ROOT/pkg" 2>/dev/null; then
   echo "reconciler_source=present"
@@ -196,7 +204,7 @@ git -C "$ROOT" status --short >"$EVIDENCE/controller.status"
 for pair in \
   "controller|$ROOT|${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}|Dockerfile" \
   "katan|$LLM_KATAN_REPO|$KATAN_EFFECTIVE_IMAGE|Containerfile" \
-  "extproc|$PRAXIS_EXTPROC_REPO|${EXTPROC_IMAGE:-praxis-extproc:dev}|Containerfile" \
+  "extproc|$PRAXIS_EXTPROC_REPO|$EXTPROC_IMAGE|Containerfile" \
   "maas-api|$MAAS_CONTROLLER_REPO/maas-api|${MAAS_API_IMAGE:-maas-api:external-model-two-plane}|Dockerfile" \
   "maas-controller|$MAAS_CONTROLLER_REPO|${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}|maas-controller/Dockerfile"; do
   IFS='|' read -r label source image dockerfile <<<"$pair"
@@ -210,6 +218,9 @@ for pair in \
   printf '%s\n%s\n%s\n' "$source_sha" "$source_diff" "$dockerfile_sha" >"$EVIDENCE/${label}.inputs"
   printf '%s\n' "$source_sha" >"$EVIDENCE/${label}.sha"
   printf '%s\n' "$source_diff" >"$EVIDENCE/${label}.diff.sha256"
+  if [[ "$label" == extproc ]]; then
+    printf 'branch=%s\ncommit=%s\n' "$(git -C "$source" branch --show-current)" "$source_sha" >"$EVIDENCE/extproc-source.txt"
+  fi
   cache="$EVIDENCE_ROOT/.image-inputs/$label"
   rebuild=true
   if docker image inspect "$image" >/dev/null 2>&1 && [[ -f "$cache" ]] && cmp -s "$EVIDENCE/${label}.inputs" "$cache"; then
@@ -232,6 +243,15 @@ done
 
 git -C "$KSERVE_REPO" rev-parse HEAD >"$EVIDENCE/kserve.sha"
 git -C "$KSERVE_REPO" diff --no-ext-diff | sha256sum >"$EVIDENCE/kserve.diff.sha256"
+
+# Build only the HTTPS test backend here. Praxis ExtProc remains selected by
+# EXTPROC_IMAGE and is never rebuilt by this fixture setup.
+mkdir -p "$EVIDENCE/provider-recorder-build"
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$EVIDENCE/provider-recorder-build/provider-recorder" "$ROOT/test/kind-env/provider-recorder/main.go"
+cp "$ROOT/test/kind-env/provider-recorder/Dockerfile" "$EVIDENCE/provider-recorder-build/Dockerfile"
+sha256sum "$ROOT/test/kind-env/provider-recorder/main.go" "$ROOT/test/kind-env/provider-recorder/Dockerfile" >"$EVIDENCE/provider-recorder-source.sha256"
+timeout 600s docker build --platform linux/amd64 -t "$PROVIDER_RECORDER_IMAGE" -f "$EVIDENCE/provider-recorder-build/Dockerfile" "$EVIDENCE/provider-recorder-build"
+docker image inspect "$PROVIDER_RECORDER_IMAGE" --format '{{.Id}}' >"$EVIDENCE/provider-recorder-image-id.txt"
 
 if (( failures )); then
   printf '{\n  "status":"BLOCKED",\n  "failures":%d,\n  "cluster":"kind-%s",\n  "evidence":"%s"\n}\n' "$failures" "$CLUSTER" "$EVIDENCE" >"$EVIDENCE/result.json"
@@ -257,7 +277,8 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   for image in \
     "${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}" \
     "$KATAN_KIND_IMAGE" \
-    "${EXTPROC_IMAGE:-praxis-extproc:dev}" \
+    "$PROVIDER_RECORDER_IMAGE" \
+    "$EXTPROC_IMAGE" \
     "${MAAS_API_IMAGE:-maas-api:external-model-two-plane}" \
     "${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}"; do
     docker exec "${CLUSTER}-control-plane" crictl rmi "docker.io/library/$image" >/dev/null 2>&1 || true
@@ -271,7 +292,8 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
     docker tag "$KATAN_PULL_IMAGE" "$KATAN_KIND_IMAGE"
   fi
   kind load docker-image "$KATAN_KIND_IMAGE" --name "$CLUSTER"
-  kind load docker-image "${EXTPROC_IMAGE:-praxis-extproc:dev}" --name "$CLUSTER"
+  kind load docker-image "$PROVIDER_RECORDER_IMAGE" --name "$CLUSTER"
+  kind load docker-image "$EXTPROC_IMAGE" --name "$CLUSTER"
   kind load docker-image "${MAAS_API_IMAGE:-maas-api:external-model-two-plane}" --name "$CLUSTER"
   kind load docker-image "${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}" --name "$CLUSTER"
   timeout 120s "${KCTL[@]}" apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
@@ -410,6 +432,7 @@ EOF
   "${KCTL[@]}" -n kuadrant-system get authorino authorino -o yaml >"$EVIDENCE/authorino-ca-config.yaml"
   kustomize build "$MAAS_CONTROLLER_REPO/deployment/base/maas-api/rbac" | sed 's#namespace: opendatahub#namespace: maas-system#g' | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/31-maas-api-kind-rbac.yaml"
+  "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/32-maas-api-kind-network.yaml"
   # The webhook Secret is created after the OpenShift-only bundle is rendered;
   # restart so the projected certificate is present before manager startup.
   "${KCTL[@]}" -n maas-system rollout restart deployment/maas-controller
@@ -417,8 +440,32 @@ EOF
   # Let the current MaaS tenant pipeline create its canonical object so
   # server-side apply cannot merge stale OpenShift fields into the Kind spec.
   "${KCTL[@]}" -n maas-system delete deployment maas-api service maas-api --ignore-not-found
+  if [[ "${LOCAL_ENV_SKIP_UNSUPPORTED_AIGUARDRAIL_CRD:-false}" == true ]]; then
+    # The focused provider-selection fixture does not use AIGuardrail. Some
+    # Kind API server builds reject its isDuration CEL helper, so omit only
+    # that unrelated CRD when the caller explicitly opts in.
+    kustomize build "$ROOT/config/crd" \
+      | yq eval 'select(.metadata.name != "aiguardrails.aigateway.opendatahub.io")' - \
+      >"$EVIDENCE/aigc-kind-crds.yaml"
+    printf '%s\n' 'aiguardrails.aigateway.opendatahub.io: omitted by explicit Kind compatibility override; not used by this fixture' \
+      >"$EVIDENCE/kind-crd-exclusions.txt"
+    "${KCTL[@]}" apply --server-side -f "$EVIDENCE/aigc-kind-crds.yaml"
+  else
   kustomize build "$ROOT/config/crd" | "${KCTL[@]}" apply --server-side -f -
+  fi
   kustomize build "$ROOT/config/self/default" | "${KCTL[@]}" apply --server-side --force-conflicts -f -
+  if [[ "${LOCAL_ENV_PATCH_EXTERNALMODEL_FINALIZER_RBAC:-false}" == true ]]; then
+    # The source ClusterRole lacks patch on ExternalModels even though the
+    # current controller adds its cleanup finalizer with Patch. This fixture
+    # opt-in unblocks controller tests without changing the product manifest.
+    if ! "${KCTL[@]}" get clusterrole ai-gateway-controller-role -o json \
+      | jq -e 'any(.rules[]; (.apiGroups | index("inference.opendatahub.io")) and (.resources | index("externalmodels")) and (.verbs | index("patch")))' >/dev/null; then
+      "${KCTL[@]}" patch clusterrole ai-gateway-controller-role --type=json \
+        -p='[{"op":"add","path":"/rules/-","value":{"apiGroups":["inference.opendatahub.io"],"resources":["externalmodels"],"verbs":["patch"]}}]'
+    fi
+    printf '%s\n' 'added patch on inference.opendatahub.io/externalmodels to the run-owned Kind ClusterRole; product RBAC manifest unchanged' \
+      >"$EVIDENCE/kind-rbac-override.txt"
+  fi
   "${KCTL[@]}" -n opendatahub set image deployment/ai-gateway-controller manager="${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}"
   extra_known_json='[]'
   if [[ -n "${PRAXIS_EXTRA_KNOWN_CLUSTERS:-}" ]]; then
@@ -428,7 +475,7 @@ EOF
       extra_known_json=$(jq -c --arg cluster "$extra_cluster" '. + ["--known-cluster=" + $cluster]' <<<"$extra_known_json")
     done
   fi
-  controller_patch=$(jq -cn --arg extproc_image "${EXTPROC_IMAGE:-praxis-extproc:dev}" --argjson extra_known "$extra_known_json" '[
+  controller_patch=$(jq -cn --arg extproc_image "$EXTPROC_IMAGE" --argjson extra_known "$extra_known_json" '[
     {op:"replace",path:"/spec/template/spec/containers/0/imagePullPolicy",value:"Never"},
     {op:"replace",path:"/spec/template/spec/containers/0/args",value:([
       "--leader-elect",
@@ -437,6 +484,8 @@ EOF
       "--gateway-namespace=maas-system",
       "--known-cluster=provider-provider-a",
       "--known-cluster=provider-provider-b",
+      "--known-cluster=provider-provider-proof-a",
+      "--known-cluster=provider-provider-proof-b",
       "--known-cluster=provider-transition-provider",
       ("--image=" + $extproc_image)
     ] + $extra_known)}
@@ -568,6 +617,8 @@ EOF
   }
   make_katan_tls provider-a-tls provider-a provider-a-ext
   make_katan_tls provider-b-tls provider-b provider-b-ext
+  make_katan_tls provider-proof-a-tls provider-proof-a-ext
+  make_katan_tls provider-proof-b-tls provider-proof-b-ext
   make_katan_tls provider-a-tenant-b-tls provider-a-tenant-b
   make_katan_tls provider-b-tenant-b-tls provider-b-tenant-b
   make_katan_tls provider-transition-tls provider-a-legacy
@@ -602,7 +653,7 @@ EOF
   # not let the disabled IPP deployment observe the Praxis ExternalModels.
   for manifest in "$ROOT/test/kind-env/manifests"/*.yaml; do
     case "$(basename "$manifest")" in
-      20-fixtures.yaml|21-fixtures-tenant-b.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml) continue ;;
+      20-fixtures.yaml|21-fixtures-tenant-b.yaml|31-maas-api-kind-rbac.yaml|32-maas-api-kind-network.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml|provider-proof-external-providers.yaml|provider-selection-proof.yaml) continue ;;
       45-real-openai-policies.yaml|60-client-kind-patch.yaml) continue ;;
     esac
     if [[ "$(basename "$manifest")" == 00-backends.yaml ]]; then
@@ -807,15 +858,54 @@ EOF
       -p='{"spec":{"template":{"spec":{"securityContext":{"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532}}}}}'
   }
   wait_for_extproc maas-system payload-pre-processing
-  wait_for_extproc models-as-a-service payload-processing
+  wait_for_extproc models-as-a-service payload-processing-external-model
   patch_kind_extproc_identity maas-system payload-pre-processing
-  patch_kind_extproc_identity models-as-a-service payload-processing
-  for extproc_ref in maas-system/payload-pre-processing models-as-a-service/payload-processing; do
+  patch_kind_extproc_identity models-as-a-service payload-processing-external-model
+  for extproc_ref in maas-system/payload-pre-processing models-as-a-service/payload-processing-external-model; do
     extproc_namespace=${extproc_ref%/*}
     extproc_name=${extproc_ref#*/}
+    # The Kind identity patch above changes the pod template and can start a
+    # second rollout. Wait for that rollout before recording the image, then
+    # select only Ready pods owned by the Deployment's current ReplicaSet.
+    "${KCTL[@]}" -n "$extproc_namespace" rollout status "deployment/$extproc_name" --timeout=180s
     deployed_image=$("${KCTL[@]}" -n "$extproc_namespace" get deployment "$extproc_name" -o jsonpath='{.spec.template.spec.containers[0].image}')
-    [[ "$deployed_image" == "${EXTPROC_IMAGE:-praxis-extproc:dev}" ]] || { fail "ExtProc image mismatch for $extproc_ref: requested=${EXTPROC_IMAGE:-praxis-extproc:dev} deployed=$deployed_image"; exit 2; }
-    "${KCTL[@]}" -n "$extproc_namespace" get pods -l app=payload-processing -o json | jq --arg requested "${EXTPROC_IMAGE:-praxis-extproc:dev}" --arg deployment "$extproc_name" '{requestedImage:$requested,deployment:$deployment,pods:[.items[]|{name:.metadata.name,uid:.metadata.uid,image:.spec.containers[0].image,imageID:.status.containerStatuses[0].imageID,ready:([.status.conditions[]?|select(.type=="Ready" and .status=="True")]|length==1)}]}' >"$EVIDENCE/extproc-image-${extproc_namespace}.json"
+    [[ "$deployed_image" == "$EXTPROC_IMAGE" ]] || { fail "ExtProc image mismatch for $extproc_ref: requested=$EXTPROC_IMAGE deployed=$deployed_image"; exit 2; }
+    deployment_json=$("${KCTL[@]}" -n "$extproc_namespace" get deployment "$extproc_name" -o json)
+    deployment_selector=$(jq -r '.spec.selector.matchLabels | to_entries | map(.key + "=" + .value) | join(",")' <<<"$deployment_json")
+    [[ -n "$deployment_selector" ]] || { fail "ExtProc Deployment $extproc_ref has no selector"; exit 2; }
+    deployment_uid=$(jq -r '.metadata.uid' <<<"$deployment_json")
+    extproc_container=$(jq -r '.spec.template.spec.containers[0].name' <<<"$deployment_json")
+    generation=$(jq -r '.metadata.generation' <<<"$deployment_json")
+    observed_generation=$(jq -r '.status.observedGeneration // 0' <<<"$deployment_json")
+    desired_replicas=$(jq -r '.spec.replicas // 1' <<<"$deployment_json")
+    updated_replicas=$(jq -r '.status.updatedReplicas // 0' <<<"$deployment_json")
+    available_replicas=$(jq -r '.status.availableReplicas // 0' <<<"$deployment_json")
+    revision=$(jq -r '.metadata.annotations["deployment.kubernetes.io/revision"] // empty' <<<"$deployment_json")
+    [[ "$observed_generation" -ge "$generation" && "$updated_replicas" -eq "$desired_replicas" && "$available_replicas" -ge "$desired_replicas" && -n "$revision" ]] || {
+      fail "ExtProc Deployment $extproc_ref has not observed and completed its current generation (generation=$generation observed=$observed_generation updated=$updated_replicas available=$available_replicas desired=$desired_replicas revision=${revision:-absent})"
+      exit 2
+    }
+    replica_sets=$("${KCTL[@]}" -n "$extproc_namespace" get replicasets -l "$deployment_selector" -o json)
+    current_replica_sets=$(jq -c --arg revision "$revision" --arg deploymentUID "$deployment_uid" '[.items[] | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $revision) | select(any(.metadata.ownerReferences[]?; .kind == "Deployment" and .uid == $deploymentUID)) | .metadata.name]' <<<"$replica_sets")
+    [[ "$(jq 'length' <<<"$current_replica_sets")" -gt 0 ]] || { fail "ExtProc Deployment $extproc_ref has no ReplicaSet for current revision $revision"; exit 2; }
+    pods=$("${KCTL[@]}" -n "$extproc_namespace" get pods -l "$deployment_selector" -o json)
+    ready_current_pods=$(jq -c \
+      --argjson replicaSets "$current_replica_sets" \
+      --arg requested "$EXTPROC_IMAGE" \
+      --arg container "$extproc_container" \
+      '[.items[]
+        | select(.metadata.deletionTimestamp == null)
+        | select(any(.metadata.ownerReferences[]?; .kind == "ReplicaSet" and (.name as $owner | ($replicaSets | index($owner)) != null)))
+        | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+        | select(any(.spec.containers[]?; .name == $container and .image == $requested))
+        | select(any(.status.containerStatuses[]?; .name == $container and (.imageID // "") != ""))
+        | {name:.metadata.name,uid:.metadata.uid,ownerReplicaSet:([.metadata.ownerReferences[]? | select(.kind == "ReplicaSet") | .name] | first),image:([.spec.containers[]? | select(.name == $container) | .image] | first),imageID:([.status.containerStatuses[]? | select(.name == $container) | .imageID] | first),ready:true}]' <<<"$pods")
+    ready_current_count=$(jq 'length' <<<"$ready_current_pods")
+    [[ "$ready_current_count" -eq "$desired_replicas" ]] || {
+      fail "ExtProc Deployment $extproc_ref has $ready_current_count Ready pods with image IDs from current revision $revision; expected $desired_replicas"
+      exit 2
+    }
+    jq -n --arg requestedImage "$EXTPROC_IMAGE" --arg deployment "$extproc_name" --arg revision "$revision" --argjson generation "$generation" --argjson observedGeneration "$observed_generation" --argjson desiredReplicas "$desired_replicas" --argjson pods "$ready_current_pods" '{requestedImage:$requestedImage,deployment:$deployment,generation:$generation,observedGeneration:$observedGeneration,replicaSetRevision:$revision,desiredReplicas:$desiredReplicas,pods:$pods}' >"$EVIDENCE/extproc-image-${extproc_namespace}.json"
   done
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-a-tenant-b --timeout=180s
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-b-tenant-b --timeout=180s
