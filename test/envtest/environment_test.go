@@ -29,6 +29,12 @@ import (
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 )
 
+// controllerIdentity is the ServiceAccount bound by the shipped ClusterRoleBinding.
+var controllerIdentity = envtest.User{
+	Name:   "system:serviceaccount:opendatahub:ai-gateway-controller",
+	Groups: []string{"system:serviceaccounts", "system:serviceaccounts:opendatahub", "system:authenticated"},
+}
+
 func TestMain(m *testing.M) {
 	// SetLogger only takes effect once per process, so its sink must outlive each test.
 	ctrl.SetLogger(zap.New())
@@ -47,7 +53,13 @@ func startEnvironment(t *testing.T, setupControllers func(ctrl.Manager)) client.
 	environment := &envtest.Environment{
 		BinaryAssetsDirectory: assets,
 		UseExistingCluster:    ptr.To(false),
-		CRDDirectoryPaths:     []string{"testdata/crds", filepath.Join(repoRoot, "config/crd/bases")},
+		// Two bases dirs because generation is split by API group: the aigateway
+		// group ships in the self bundle, the inference group does not.
+		CRDDirectoryPaths: []string{
+			"testdata/crds",
+			filepath.Join(repoRoot, "config/self/crd/bases"),
+			filepath.Join(repoRoot, "config/crd/bases"),
+		},
 		ErrorIfCRDPathMissing: true,
 	}
 	apiServer := environment.ControlPlane.GetAPIServer().Configure()
@@ -77,10 +89,7 @@ func startEnvironment(t *testing.T, setupControllers func(ctrl.Manager)) client.
 			require.NoError(t, admin.Create(t.Context(), &resource))
 		}
 	}
-	controllerUser, err := environment.AddUser(envtest.User{
-		Name:   "system:serviceaccount:opendatahub:ai-gateway-controller",
-		Groups: []string{"system:serviceaccounts", "system:serviceaccounts:opendatahub", "system:authenticated"},
-	}, &rest.Config{QPS: -1})
+	controllerUser, err := environment.AddUser(controllerIdentity, &rest.Config{QPS: -1})
 	require.NoError(t, err)
 	mgr, err := ctrl.NewManager(controllerUser.Config(), ctrl.Options{
 		Scheme:                  scheme,

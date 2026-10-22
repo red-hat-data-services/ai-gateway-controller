@@ -30,12 +30,20 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	inferencev1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/controller"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/guardrail"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
+)
+
+const (
+	// metricsCertDir is where OpenShift service-ca mounts the metrics serving cert.
+	// Must match the Deployment volumeMount added for SecureServing.
+	metricsCertDir = "/tmp/k8s-metrics-server/metrics-certs"
 )
 
 var setupLog = ctrl.Log.WithName("setup")
@@ -48,6 +56,7 @@ var buildVersion = "dev"
 func main() {
 	var (
 		metricsAddr          string
+		metricsSecure        bool
 		probeAddr            string
 		enableLeaderElection bool
 		image                string
@@ -64,7 +73,9 @@ func main() {
 		skipNetworkPolicy    bool
 	)
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to.")
+	flag.BoolVar(&metricsSecure, "metrics-secure", true,
+		"Serve metrics over HTTPS with authentication and authorization. Set false for non-OpenShift environments.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. Enable this when running multiple replicas.")
@@ -117,10 +128,8 @@ func main() {
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: clientgoscheme.Scheme,
-		Metrics: metricsserver.Options{
-			BindAddress: metricsAddr,
-		},
+		Scheme:                 clientgoscheme.Scheme,
+		Metrics:                buildMetricsServerOptions(metricsAddr, metricsSecure),
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "ai-gateway-controller-leader.opendatahub.io",
@@ -166,11 +175,39 @@ func main() {
 		os.Exit(1)
 	}
 
+	guardrailReconciler := &guardrail.Reconciler{
+		Client:         mgr.GetClient(),
+		APIReader:      mgr.GetAPIReader(),
+		Scheme:         mgr.GetScheme(),
+		ResyncInterval: resyncInterval,
+		Log:            ctrl.Log.WithName("aiguardrail"),
+		Recorder:       mgr.GetEventRecorder("aiguardrail"),
+	}
+	if err := guardrailReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up AIGuardrail reconciler")
+		os.Exit(1)
+	}
+
 	setupLog.Info("starting ai-gateway-controller", "manifestPath", manifestPath, "image", image)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// buildMetricsServerOptions configures the controller-runtime metrics endpoint.
+// When secureMetrics is true, metrics are served over HTTPS with authn/authz
+// filters using the serving cert mounted at metricsCertDir.
+func buildMetricsServerOptions(bindAddress string, secureMetrics bool) metricsserver.Options {
+	opts := metricsserver.Options{
+		BindAddress:   bindAddress,
+		SecureServing: secureMetrics,
+	}
+	if secureMetrics {
+		opts.CertDir = metricsCertDir
+		opts.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
+	return opts
 }
 
 // resolveExtprocImage returns the praxis-extproc container image.
