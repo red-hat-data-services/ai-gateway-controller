@@ -20,12 +20,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
@@ -116,6 +119,36 @@ func getUnstructured(r *Reconciler, gvk schema.GroupVersionKind, namespace, name
 
 var destinationRuleGVK = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
 
+// gatewayResult returns the model's status.gateways result for gateway.
+func gatewayResult(t *testing.T, model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) v1alpha1.ExternalModelGatewayStatus {
+	t.Helper()
+	for _, result := range model.Status.Gateways {
+		if result.NamespacedObjectReference == gateway {
+			return result
+		}
+	}
+	t.Fatalf("no status.gateways result for %s: %#v", gatewayKey(gateway), model.Status.Gateways)
+	return v1alpha1.ExternalModelGatewayStatus{}
+}
+
+// assertTransportCollected checks that the namespace keeps no provider
+// transport or selection sink of the given models.
+func assertTransportCollected(t *testing.T, r *Reconciler, namespace string, models ...string) {
+	t.Helper()
+	if _, err := getUnstructured(r, schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "ServiceEntry"}, namespace, "provider-openai"); !apierrors.IsNotFound(err) {
+		t.Fatalf("ServiceEntry %s/provider-openai remains: %v", namespace, err)
+	}
+	services := []string{"provider-openai"}
+	for _, model := range models {
+		services = append(services, providerSelectionSinkName(model))
+	}
+	for _, name := range services {
+		if _, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, namespace, name); !apierrors.IsNotFound(err) {
+			t.Fatalf("Service %s/%s remains: %v", namespace, name, err)
+		}
+	}
+}
+
 // setRouteParentStatus writes the Gateway's parent status on an attachment
 // HTTPRoute, as the Gateway controller would.
 func setRouteParentStatus(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference, status metav1.ConditionStatus, reason string) {
@@ -165,6 +198,34 @@ func routeFilterNames(t *testing.T, r *Reconciler, tenantID, gatewayNamespace st
 	return names
 }
 
+func assertExactSelectedPathRule(t *testing.T, route *unstructured.Unstructured, path, stableID string) {
+	t.Helper()
+	rules := nestedSlice(t, route.Object, "spec", "rules")
+	for ruleIndex := range rules {
+		matches := nestedSlice(t, nestedMapAt(t, rules, ruleIndex), "matches")
+		for _, rawMatch := range matches {
+			match, ok := rawMatch.(map[string]any)
+			if !ok {
+				continue
+			}
+			pathType, hasPath, pathErr := unstructured.NestedString(match, "path", "type")
+			pathValue, _, valueErr := unstructured.NestedString(match, "path", "value")
+			if pathErr != nil || valueErr != nil {
+				t.Fatalf("read exact target path match: type error=%v value error=%v", pathErr, valueErr)
+			}
+			if !hasPath || pathType != "Exact" || pathValue != path {
+				continue
+			}
+			headers := nestedSlice(t, match, "headers")
+			if len(headers) == 1 && nestedString(t, nestedMapAt(t, headers, 0), "name") == selectedProviderHeader &&
+				nestedString(t, nestedMapAt(t, headers, 0), "value") == stableID {
+				return
+			}
+		}
+	}
+	t.Fatalf("no exact target-path match for %q gated by %s=%q", path, selectedProviderHeader, stableID)
+}
+
 func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
@@ -191,7 +252,7 @@ func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 		t.Fatalf("model-namespace provider Service: %v", err)
 	}
 	ruleName := attachmentDestinationRuleName(gatewayB, "team", "openai")
-	copyName := credentialCopyName("tenant-b", "team", "openai-key", "api-key")
+	copyName := credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")
 	assertAttachmentUnpublished := func() {
 		t.Helper()
 		if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", ruleName); !apierrors.IsNotFound(err) {
@@ -268,9 +329,6 @@ func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 	got := getModel(t, r, model)
 	if got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != routeName {
 		t.Fatalf("served status = %#v", got.Status)
-	}
-	if len(got.Status.Gateways) != 0 {
-		t.Fatalf("status.gateways belongs to RHOAIENG-90802, got %#v", got.Status.Gateways)
 	}
 }
 
@@ -383,8 +441,9 @@ func TestModelNameConflictKeepsTenantModelThenOldest(t *testing.T) {
 			t.Fatalf("conflict loser %s received a route: %v", loser.Name, err)
 		}
 	}
-	if msg := apiMeta.FindStatusCondition(getModel(t, r, conflicting).Status.Conditions, conditionReady).Message; !strings.Contains(msg, "tenant-b/own") {
-		t.Fatalf("conflict message %q does not name the winner", msg)
+	conflict := apiMeta.FindStatusCondition(gatewayResult(t, getModel(t, r, conflicting), gatewayB).Conditions, conditionReady)
+	if conflict == nil || conflict.Reason != reasonModelNameConflict || !strings.Contains(conflict.Message, "tenant-b/own") {
+		t.Fatalf("conflict result %#v does not name the winner", conflict)
 	}
 	env := overlayEnvelope(t, r, "tenant-b")
 	var ids []string
@@ -580,9 +639,85 @@ func TestOwnTenantGatewayRefChangesNoResources(t *testing.T) {
 	if legacyEnv, gotEnv := overlayEnvelope(t, legacy, "tenant-b"), overlayEnvelope(t, attached, "tenant-b"); legacyEnv.Revision != gotEnv.Revision {
 		t.Fatalf("overlay digest differs: %s vs %s", legacyEnv.Revision.Value, gotEnv.Revision.Value)
 	}
-	if got := getModel(t, attached, attachedModel); got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != "external-model-chat" {
+	got := getModel(t, attached, attachedModel)
+	if got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != "external-model-chat" {
 		t.Fatalf("own-gateway status = %#v", got.Status)
 	}
+	// Only the home attachment's result is added; its deletion stays the
+	// existing home path.
+	result := gatewayResult(t, got, gatewayB)
+	if result.HTTPRouteRef == nil || *result.HTTPRouteRef != (v1alpha1.NamespacedObjectReference{Name: "external-model-chat", Namespace: "tenant-b"}) ||
+		!apiMeta.IsStatusConditionTrue(result.Conditions, conditionReady) || !slices.Equal(got.Finalizers, []string{externalModelFinalizer}) {
+		t.Fatalf("own-gateway result = %#v, finalizers %v", result, got.Finalizers)
+	}
+}
+
+func TestGatewayStatusReportsEachAttachment(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	objects := []client.Object{provider, secret, model}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	objects = append(objects, attachmentTenantObjects("tenant-c", "tenant-c", gatewayC, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	setRefs := func(refs ...v1alpha1.NamespacedObjectReference) *v1alpha1.ExternalModel {
+		t.Helper()
+		got := getModel(t, r, model)
+		got.Spec.GatewayRefs = refs
+		if err := r.Update(context.Background(), got); err != nil {
+			t.Fatal(err)
+		}
+		reconcileModel(t, r, model)
+		return getModel(t, r, model)
+	}
+	routeB := &v1alpha1.NamespacedObjectReference{Name: attachmentRouteName(model, gatewayB), Namespace: "team"}
+	assertResult := func(got *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference, reason string, route *v1alpha1.NamespacedObjectReference) {
+		t.Helper()
+		result := gatewayResult(t, got, gateway)
+		ready := apiMeta.FindStatusCondition(result.Conditions, conditionReady)
+		routeMatches := (route == nil) == (result.HTTPRouteRef == nil) && (route == nil || *route == *result.HTTPRouteRef)
+		if ready == nil || ready.Reason != reason || ready.ObservedGeneration != got.Generation ||
+			(ready.Status == metav1.ConditionTrue) != (route != nil) || !routeMatches {
+			t.Fatalf("%s result = %#v, want reason %q and route %v", gatewayKey(gateway), result, reason, route)
+		}
+	}
+
+	got := getModel(t, r, model)
+	assertResult(got, gatewayB, reasonReconciled, routeB)
+	if got.Status.HTTPRouteName != routeB.Name {
+		t.Fatalf("single attachment httpRouteName = %q, want %q", got.Status.HTTPRouteName, routeB.Name)
+	}
+
+	// A second attachment: the served one keeps its result while the new one
+	// is pending, and the single-attachment alias is cleared.
+	got = setRefs(gatewayB, gatewayC)
+	if len(got.Status.Gateways) != 2 || got.Status.HTTPRouteName != "" || readyReason(got) != reasonAttachmentPending {
+		t.Fatalf("status = %#v, want two results, no httpRouteName and the pending attachment reported", got.Status)
+	}
+	assertResult(got, gatewayB, reasonReconciled, routeB)
+	assertResult(got, gatewayC, reasonAttachmentPending, nil)
+
+	// Partial failure: only the rejected attachment fails.
+	setRouteParentStatus(t, r, model, gatewayC, metav1.ConditionFalse, "NotAllowedByListeners")
+	reconcileModel(t, r, model)
+	got = getModel(t, r, model)
+	assertResult(got, gatewayB, reasonReconciled, routeB)
+	assertResult(got, gatewayC, "NotAllowedByListeners", nil)
+
+	// Removing an attachment removes its result.
+	got = setRefs(gatewayC)
+	if len(got.Status.Gateways) != 1 {
+		t.Fatalf("status.gateways = %#v, want only gw-c", got.Status.Gateways)
+	}
+	assertResult(got, gatewayC, "NotAllowedByListeners", nil)
+
+	got = setRefs()
+	if len(got.Status.Gateways) != 0 || len(got.Finalizers) != 0 {
+		t.Fatalf("detached model keeps results %#v or finalizers %v", got.Status.Gateways, got.Finalizers)
+	}
+	assertTransportCollected(t, r, "team", "chat")
 }
 
 func mustJSON(t *testing.T, v any) string {
@@ -598,15 +733,325 @@ func TestModelWithoutTenantOrGatewayRefsIsTenantNotResolved(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
 	r := attachmentReconciler(t, provider, secret, model)
+	// A route name another writer (legacy IPP) published is left alone.
+	written := getModel(t, r, model)
+	written.Status.HTTPRouteName = "chat"
+	if err := r.Status().Update(context.Background(), written); err != nil {
+		t.Fatal(err)
+	}
 	reconcileModel(t, r, model)
 	got := getModel(t, r, model)
 	condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
 	if got.Status.Phase != modelPhasePending || condition == nil || condition.Status != metav1.ConditionFalse ||
-		condition.Reason != reasonTenantNotResolved || !strings.Contains(condition.Message, "spec.gatewayRefs") {
+		condition.Reason != reasonTenantNotResolved || !strings.Contains(condition.Message, "spec.gatewayRefs") || got.Status.HTTPRouteName != "chat" {
 		t.Fatalf("status = %#v", got.Status)
 	}
 	if _, err := getUnstructured(r, httpRouteGVK, "team", "external-model-chat"); !apierrors.IsNotFound(err) {
 		t.Fatalf("serving state created without a tenant: %v", err)
+	}
+}
+
+var defaultGateway = v1alpha1.NamespacedObjectReference{Name: "maas-default-gateway", Namespace: "openshift-ingress"}
+
+// implicitAttachmentFixture reconciles a model without gatewayRefs, from a
+// namespace with no MaasTenantConfig, next to the given default tenant.
+func implicitAttachmentFixture(t *testing.T, defaultTenant ...client.Object) (*Reconciler, *v1alpha1.ExternalModel) {
+	t.Helper()
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
+	r := attachmentReconciler(t, append([]client.Object{provider, secret, model}, defaultTenant...)...)
+	reconcileModel(t, r, model)
+	return r, model
+}
+
+// servedImplicitFixture serves that model through the default tenant's Gateway.
+func servedImplicitFixture(t *testing.T) (*Reconciler, *v1alpha1.ExternalModel) {
+	t.Helper()
+	r, model := implicitAttachmentFixture(t, attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "praxis")...)
+	setRouteParentStatus(t, r, model, defaultGateway, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	return r, model
+}
+
+func assertImplicitAttachmentRemoved(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel) {
+	t.Helper()
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, defaultGateway)); !apierrors.IsNotFound(err) {
+		t.Fatalf("implicit attachment route remains: %v", err)
+	}
+	if _, err := getUnstructured(r, destinationRuleGVK, "openshift-ingress", attachmentDestinationRuleName(defaultGateway, "team", "openai")); !apierrors.IsNotFound(err) {
+		t.Fatalf("implicit attachment DestinationRule remains: %v", err)
+	}
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "models-as-a-service", Name: credentialCopyName("models-as-a-service", "team", "openai-key", "api-key", "")}, &copied); !apierrors.IsNotFound(err) {
+		t.Fatalf("implicit attachment credential copy remains: %v", err)
+	}
+	if got := getModel(t, r, model); controllerutil.ContainsFinalizer(got, attachmentFinalizer) || len(got.Status.Gateways) > 0 {
+		t.Fatalf("model keeps its implicit attachment: finalizers %v, gateways %#v", got.Finalizers, got.Status.Gateways)
+	}
+}
+
+func TestModelWithoutGatewayRefsIsServedByTheDefaultTenant(t *testing.T) {
+	r, model := servedImplicitFixture(t)
+	got := getModel(t, r, model)
+	routeName := attachmentRouteName(model, defaultGateway)
+	if got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != routeName || len(got.Spec.GatewayRefs) != 0 {
+		t.Fatalf("model = %#v", got)
+	}
+	if ref := gatewayResult(t, got, defaultGateway).HTTPRouteRef; ref == nil || ref.Name != routeName {
+		t.Fatalf("default Gateway result routes through %#v, want %s", ref, routeName)
+	}
+	if !controllerutil.ContainsFinalizer(got, attachmentFinalizer) || controllerutil.ContainsFinalizer(got, externalModelFinalizer) {
+		t.Fatalf("finalizers = %v, want only the attachment finalizer", got.Finalizers)
+	}
+	candidates := overlayEnvelope(t, r, "models-as-a-service").Overlay.Candidates
+	if len(candidates) != 1 || candidates[0].StableID != "team/chat/team/openai" ||
+		candidates[0].Credential.SecretRef.Name != credentialCopyName("models-as-a-service", "team", "openai-key", "api-key", "") {
+		t.Fatalf("default tenant overlay = %#v", candidates)
+	}
+	if _, err := getUnstructured(r, destinationRuleGVK, "openshift-ingress", attachmentDestinationRuleName(defaultGateway, "team", "openai")); err != nil {
+		t.Fatalf("attachment DestinationRule: %v", err)
+	}
+}
+
+func TestImplicitModelWaitsForASteadyDefaultTenant(t *testing.T) {
+	for name, mutate := range map[string]func(ait, mtc *unstructured.Unstructured) []client.Object{
+		"not steady": func(ait, mtc *unstructured.Unstructured) []client.Object {
+			annotations := mtc.GetAnnotations()
+			annotations[tenant.AnnotationPayloadProcessingStatus] = tenant.PayloadProcessingStatusCleanupComplete
+			mtc.SetAnnotations(annotations)
+			return []client.Object{ait, mtc}
+		},
+		"deleting": func(ait, mtc *unstructured.Unstructured) []client.Object {
+			now := metav1.Now()
+			ait.SetFinalizers([]string{"maas.opendatahub.io/test"})
+			ait.SetDeletionTimestamp(&now)
+			return []client.Object{ait, mtc}
+		},
+		"config missing": func(ait, _ *unstructured.Unstructured) []client.Object { return []client.Object{ait} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ait := controllerAITenant(tenant.DefaultAITenantName, "models-as-a-service", "models-as-a-service", defaultGateway.Name, defaultGateway.Namespace)
+			mtc := controllerMaasTenantConfig("models-as-a-service", tenant.DefaultAITenantName, "models-as-a-service", "praxis")
+			// An explicit attachment to the same tenant waits the same way.
+			explicit := attachmentModel("explicit", "team", "explicit-model", time.Unix(100, 0), defaultGateway)
+			r, model := implicitAttachmentFixture(t, append(mutate(ait, mtc), explicit)...)
+			reconcileModel(t, r, explicit)
+			for _, m := range []*v1alpha1.ExternalModel{model, explicit} {
+				got := getModel(t, r, m)
+				if got.Status.Phase != modelPhasePending || readyReason(got) != reasonTenantNotSteady || gatewayResult(t, got, defaultGateway).HTTPRouteRef != nil {
+					t.Fatalf("%s status = %#v", m.Name, got.Status)
+				}
+				if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(m, defaultGateway)); !apierrors.IsNotFound(err) {
+					t.Fatalf("%s attached to a default tenant that is not steady: %v", m.Name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDefaultTenantOnIPPLeavesImplicitModelAlone(t *testing.T) {
+	r, model := implicitAttachmentFixture(t, attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "ipp")...)
+	if got := getModel(t, r, model); got.Status.Phase != "" || len(got.Status.Conditions) > 0 || len(got.Finalizers) > 0 {
+		t.Fatalf("model left to IPP was changed: finalizers %v, status %#v", got.Finalizers, got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, defaultGateway)); !apierrors.IsNotFound(err) {
+		t.Fatalf("attached to a default tenant on IPP: %v", err)
+	}
+
+	// A switch to IPP removes a served implicit attachment.
+	r, model = servedImplicitFixture(t)
+	mtc := tenant.NewMaasTenantConfig()
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "models-as-a-service", Name: tenant.MaasTenantConfigInstanceName}, mtc); err != nil {
+		t.Fatal(err)
+	}
+	annotations := mtc.GetAnnotations()
+	annotations[tenant.AnnotationPayloadProcessingType] = tenant.PayloadProcessingBackendIPP
+	mtc.SetAnnotations(annotations)
+	if err := r.Update(context.Background(), mtc); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	assertImplicitAttachmentRemoved(t, r, model)
+}
+
+func TestImplicitAttachmentIsReplacedByGatewayRefsOrTenantConfig(t *testing.T) {
+	t.Run("gatewayRefs", func(t *testing.T) {
+		r, model := servedImplicitFixture(t)
+		for _, object := range attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis") {
+			if err := r.Create(context.Background(), object); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got := getModel(t, r, model)
+		got.Spec.GatewayRefs = []v1alpha1.NamespacedObjectReference{gatewayB}
+		if err := r.Update(context.Background(), got); err != nil {
+			t.Fatal(err)
+		}
+		reconcileModel(t, r, model)
+		if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, defaultGateway)); !apierrors.IsNotFound(err) {
+			t.Fatalf("implicit attachment route remains: %v", err)
+		}
+		if !attachmentRouteExists(t, r, model) {
+			t.Fatal("explicit attachment route missing")
+		}
+		if _, err := getUnstructured(r, destinationRuleGVK, "openshift-ingress", attachmentDestinationRuleName(defaultGateway, "team", "openai")); !apierrors.IsNotFound(err) {
+			t.Fatalf("implicit attachment DestinationRule remains: %v", err)
+		}
+	})
+	t.Run("MaasTenantConfig", func(t *testing.T) {
+		r, model := servedImplicitFixture(t)
+		for _, object := range attachmentTenantObjects("team", "team", gatewayB, "praxis") {
+			if err := r.Create(context.Background(), object); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The provider serves the new tenant's own model only once the
+		// tenant has applied its transport.
+		if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); !errors.Is(err, resolver.ErrNoRoutes) {
+			t.Fatalf("reconcile before the provider's tenant transport = %v, want %v", err, resolver.ErrNoRoutes)
+		}
+		assertImplicitAttachmentRemoved(t, r, model)
+		if _, err := getUnstructured(r, httpRouteGVK, "team", modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+			t.Fatalf("home route published before the provider's tenant transport: %v", err)
+		}
+		if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "team", Name: "openai"}}); err != nil {
+			t.Fatal(err)
+		}
+		reconcileModel(t, r, model)
+		if _, err := getUnstructured(r, httpRouteGVK, "team", modelRouteName(model.Name)); err != nil {
+			t.Fatalf("home route: %v", err)
+		}
+	})
+}
+
+func TestDefaultTenantEventsEnqueueImplicitModels(t *testing.T) {
+	implicit := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
+	implicit.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
+	home := attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0))
+	defaultTenant := controllerAITenant(tenant.DefaultAITenantName, "models-as-a-service", "models-as-a-service", defaultGateway.Name, defaultGateway.Namespace)
+	tenantB := controllerAITenant("tenant-b", "models-as-a-service", "tenant-b", gatewayB.Name, gatewayB.Namespace)
+	r := controllerTestClient(t, implicit, home, defaultTenant, tenantB,
+		controllerMaasTenantConfig("models-as-a-service", tenant.DefaultAITenantName, "models-as-a-service", "ipp"),
+		controllerMaasTenantConfig("tenant-b", "tenant-b", "models-as-a-service", "praxis"))
+	want := []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(implicit)}}
+	// Enqueued whatever the default tenant selects, so a switch to IPP releases it.
+	if got := r.gatewayAttachedModels(context.Background(), defaultTenant); !slices.Equal(got, want) {
+		t.Fatalf("default tenant event enqueued %v, want %v", got, want)
+	}
+	if got := r.gatewayAttachedModels(context.Background(), tenantB); len(got) != 0 {
+		t.Fatalf("another tenant's event enqueued %v", got)
+	}
+	if got := r.sameNameModels(context.Background(), home); !slices.Equal(got, want) {
+		t.Fatalf("model-name event enqueued %v, want %v", got, want)
+	}
+	// Its credential copy follows the override Secret.
+	if got := r.secretModels(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "model-key", Namespace: "team"}}); !slices.Equal(got, want) {
+		t.Fatalf("override Secret event enqueued %v, want %v", got, want)
+	}
+}
+
+func TestTenantNamespacesAndSingleNamespaceControllersAttachNothingImplicitly(t *testing.T) {
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
+	objects := append(attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "praxis"), model)
+	implicit := func(r *Reconciler) bool {
+		t.Helper()
+		attached, err := r.implicitlyAttached(context.Background(), model)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return attached
+	}
+	if !implicit(controllerTestClient(t, objects...)) {
+		t.Fatal("model outside tenant namespaces is not attached implicitly")
+	}
+	// An AITenant claims the namespace before its MaasTenantConfig exists.
+	if implicit(controllerTestClient(t, append(objects, controllerAITenant("team", "models-as-a-service", "team", gatewayB.Name, gatewayB.Namespace))...)) {
+		t.Fatal("a tenant namespace without its MaasTenantConfig attached to the default tenant")
+	}
+	r := controllerTestClient(t, objects...)
+	r.Namespace = "team"
+	if implicit(r) {
+		t.Fatal("a single-namespace controller attached a model")
+	}
+}
+
+func TestModelIneligibleForImplicitAttachmentIsTenantNotResolved(t *testing.T) {
+	for name, setup := range map[string]func() (*Reconciler, *v1alpha1.ExternalModel){
+		// The default tenant's IPP does not report a model of a namespace an
+		// AITenant claims before its MaasTenantConfig exists.
+		"claimed namespace, default tenant on IPP": func() (*Reconciler, *v1alpha1.ExternalModel) {
+			provider, secret := attachmentProvider("team")
+			model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
+			return attachmentReconciler(t, append(attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "ipp"),
+				provider, secret, model, controllerAITenant("team", "models-as-a-service", "team", gatewayB.Name, gatewayB.Namespace))...), model
+		},
+		"single-namespace controller, no default tenant": func() (*Reconciler, *v1alpha1.ExternalModel) {
+			provider, secret := attachmentProvider("team")
+			model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
+			r := attachmentReconciler(t, provider, secret, model)
+			r.Namespace = "team"
+			return r, model
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, model := setup()
+			reconcileModel(t, r, model)
+			got := getModel(t, r, model)
+			condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+			if got.Status.Phase != modelPhasePending || condition == nil || condition.Reason != reasonTenantNotResolved || strings.Contains(condition.Message, "default tenant") {
+				t.Fatalf("status = %#v", got.Status)
+			}
+		})
+	}
+}
+
+func TestProviderOutsideTenantNamespacesReportsItsOwnConfiguration(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	r := attachmentReconciler(t, provider, secret)
+	providerStatus := func() (string, string) {
+		t.Helper()
+		var got v1alpha1.ExternalProvider
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
+			t.Fatal(err)
+		}
+		condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+		if condition == nil {
+			t.Fatalf("provider status = %#v", got.Status)
+		}
+		return got.Status.Phase, condition.Reason
+	}
+	reconcileProvider := func() {
+		t.Helper()
+		if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if phase, reason := providerStatus(); phase != resolver.PhaseReady || reason != reasonValidated {
+		t.Fatalf("provider = %s/%s, want Ready/%s", phase, reason, reasonValidated)
+	}
+	// Without tenant-local transport it is no input to a tenant's own models.
+	if inputs, err := r.providerInputs(context.Background(), "team"); err != nil || len(inputs) != 0 {
+		t.Fatalf("providerInputs = %v, %v", inputs, err)
+	}
+	if err := r.Delete(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	reconcileProvider()
+	if phase, _ := providerStatus(); phase != providerPhaseFailed {
+		t.Fatalf("provider without its Secret = %s, want %s", phase, providerPhaseFailed)
+	}
+	// A provider a tenant served keeps waiting for that tenant's MaasTenantConfig.
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
+		t.Fatal(err)
+	}
+	controllerutil.AddFinalizer(&got, externalProviderFinalizer)
+	if err := r.Update(context.Background(), &got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileProvider()
+	if phase, reason := providerStatus(); phase != providerPhasePending || reason != reasonTenantNotReady {
+		t.Fatalf("tenant provider without its MaasTenantConfig = %s/%s, want Pending/%s", phase, reason, reasonTenantNotReady)
 	}
 }
 
@@ -650,6 +1095,62 @@ func TestTooManyProvidersExcludesOnlyThatModel(t *testing.T) {
 	}
 }
 
+func TestSevenMessagesProvidersFitAttachmentRouteLimit(t *testing.T) {
+	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+	model := attachmentModel("wide", "team", "wide-model", time.Unix(100, 0), gatewayB)
+	model.Spec.ExternalProviderRefs = nil
+	for _, name := range []string{"p1", "p2", "p3", "p4", "p5", "p6", "p7"} {
+		provider, secret := attachmentProvider("team")
+		provider.Name, provider.UID = name, types.UID("uid-"+name)
+		provider.Spec.Provider = "anthropic"
+		objects = append(objects, provider)
+		if name == "p1" {
+			objects = append(objects, secret)
+		}
+		model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
+			Ref: v1alpha1.ExternalProviderReference{Name: name}, TargetModel: "claude", APIFormat: "messages", Path: "/v1/messages",
+		})
+	}
+	r := attachmentReconciler(t, append(objects, model)...)
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("seven Messages providers should fit 16 rules: phase=%q reason=%q", got.Status.Phase, readyReason(got))
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); err != nil {
+		t.Fatalf("16-rule Messages attachment has no route: %v", err)
+	}
+}
+
+func TestEightMessagesProvidersExceedAttachmentRouteLimit(t *testing.T) {
+	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+	model := attachmentModel("wide", "team", "wide-model", time.Unix(100, 0), gatewayB)
+	model.Spec.ExternalProviderRefs = nil
+	for _, name := range []string{"p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"} {
+		provider, secret := attachmentProvider("team")
+		provider.Name, provider.UID = name, types.UID("uid-"+name)
+		provider.Spec.Provider = "anthropic"
+		objects = append(objects, provider)
+		if name == "p1" {
+			objects = append(objects, secret)
+		}
+		model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
+			Ref: v1alpha1.ExternalProviderReference{Name: name}, TargetModel: "claude", APIFormat: "messages", Path: "/v1/messages",
+		})
+	}
+	r := attachmentReconciler(t, append(objects, model)...)
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); readyReason(got) != reasonTooManyProviders {
+		t.Fatalf("reason = %q, want %q for 18 HTTPRoute rules", readyReason(got), reasonTooManyProviders)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
+		t.Fatalf("over-budget Messages attachment received a route: %v", err)
+	}
+}
+
 func TestUnservedHomeAttachmentBlocksAggregateReady(t *testing.T) {
 	gatewayA := v1alpha1.NamespacedObjectReference{Name: "gw-a", Namespace: "gateway-a"}
 	provider, secret := attachmentProvider("tenant-a")
@@ -666,6 +1167,55 @@ func TestUnservedHomeAttachmentBlocksAggregateReady(t *testing.T) {
 	}
 	if got := getModel(t, r, model); got.Status.Phase == resolver.PhaseReady || readyReason(got) != reasonTenantNotPraxis {
 		t.Fatalf("status = %q/%q, want the unserved home attachment reported", got.Status.Phase, readyReason(got))
+	}
+	// The provider's IPP cleanup keeps the transport the attachment route uses,
+	// read live even while its cache has not seen the route yet.
+	cached, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the test client must support watches")
+	}
+	r.Client = interceptor.NewClient(cached, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if routes, ok := list.(*unstructured.UnstructuredList); ok && routes.GetKind() == "HTTPRouteList" {
+				return nil
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatal(err)
+	}
+	r.Client = cached
+	if _, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, "tenant-a", "provider-openai"); err != nil {
+		t.Fatalf("provider Service removed while the attachment route uses it: %v", err)
+	}
+
+	// Only attachments create transport in a non-Praxis tenant namespace, so
+	// removing the last one collects it.
+	got := getModel(t, r, model)
+	got.Spec.GatewayRefs = []v1alpha1.NamespacedObjectReference{gatewayA}
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	assertTransportCollected(t, r, "tenant-a", "chat")
+}
+
+func TestAttachmentRouteIsAppliedBeforeItsTransport(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	r := attachmentReconciler(t, append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)...)
+	var applied []string
+	r.ApplyResource = func(ctx context.Context, c client.Client, obj unstructured.Unstructured) error {
+		applied = append(applied, obj.GetKind()+"/"+obj.GetName())
+		return render.Apply(ctx, c, []unstructured.Unstructured{obj})
+	}
+	reconcileModel(t, r, model)
+	route := slices.Index(applied, "HTTPRoute/"+attachmentRouteName(model, gatewayB))
+	for _, backend := range []string{"Service/provider-openai", "ServiceEntry/provider-openai", "Service/" + providerSelectionSinkName("chat")} {
+		if i := slices.Index(applied, backend); route < 0 || i < route {
+			t.Fatalf("apply order = %v, want the attachment route before %s", applied, backend)
+		}
 	}
 }
 
@@ -711,6 +1261,22 @@ func TestHomeAttachmentReportsOnlyItsOwnFailure(t *testing.T) {
 	got := getModel(t, r, model)
 	if readyReason(got) != reasonReconcileFailed || got.Status.Phase != modelPhaseFailed {
 		t.Fatalf("status = %q/%q, want %q", got.Status.Phase, readyReason(got), reasonReconcileFailed)
+	}
+}
+
+func TestHomeAttachmentReportsItsTenantNotReady(t *testing.T) {
+	gatewayA := v1alpha1.NamespacedObjectReference{Name: "gw-a", Namespace: "gateway-a"}
+	provider, secret := attachmentProvider("tenant-a")
+	model := attachmentModel("chat", "tenant-a", "chat-model", time.Unix(100, 0), gatewayA, gatewayB)
+	tenantA := attachmentTenantObjects("tenant-a", "tenant-a", gatewayA, "praxis")
+	// The AITenant's Ready stamp is for an older generation: not DeployReady.
+	tenantA[0].SetGeneration(2)
+	objects := append([]client.Object{provider, secret, model}, tenantA...)
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	if ready := apiMeta.FindStatusCondition(gatewayResult(t, getModel(t, r, model), gatewayA).Conditions, conditionReady); ready == nil || ready.Reason != reasonTenantNotReady {
+		t.Fatalf("home result = %#v, want %q", ready, reasonTenantNotReady)
 	}
 }
 
@@ -938,7 +1504,7 @@ func assertAttachmentWithdrawn(t *testing.T, r *Reconciler) {
 		t.Fatalf("attachment DestinationRule remains: %v", err)
 	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); !apierrors.IsNotFound(err) {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); !apierrors.IsNotFound(err) {
 		t.Fatalf("credential copy remains: %v", err)
 	}
 }
@@ -957,8 +1523,8 @@ func TestRevokedAcceptanceWithdrawsAttachment(t *testing.T) {
 	reconcileModel(t, r, model)
 	assertAttachmentWithdrawn(t, r)
 	assertNoTenantOverlay(t, r)
-	if got := getModel(t, r, model); readyReason(got) != "NotAllowedByListeners" {
-		t.Fatalf("reason = %q", readyReason(got))
+	if got := getModel(t, r, model); readyReason(got) != "NotAllowedByListeners" || got.Status.HTTPRouteName != "" {
+		t.Fatalf("reason = %q, httpRouteName = %q; want the Gateway's reason and no route", readyReason(got), got.Status.HTTPRouteName)
 	}
 }
 
@@ -973,6 +1539,93 @@ func TestRemovedGatewayRefCollectsAttachmentState(t *testing.T) {
 	if attachmentRouteExists(t, r, model) {
 		t.Fatal("detached model keeps its attachment route")
 	}
+	assertAttachmentWithdrawn(t, r)
+	if got := getModel(t, r, model); got.Status.HTTPRouteName != "" {
+		t.Fatalf("httpRouteName = %q names the deleted attachment route", got.Status.HTTPRouteName)
+	}
+}
+
+func TestFailedDetachCleanupIsRetried(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	failed := false
+	fakeClient, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the test client must support watches")
+	}
+	r.Client = interceptor.NewClient(fakeClient, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == "DestinationRule" && !failed {
+				failed = true
+				return apierrors.NewServiceUnavailable("etcd is unavailable")
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	got := getModel(t, r, model)
+	got.Spec.GatewayRefs = nil
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err == nil {
+		t.Fatal("a failed cleanup must be retried")
+	}
+	// The route is withdrawn before its backends.
+	if attachmentRouteExists(t, r, model) {
+		t.Fatal("the attachment route outlives a failed backend cleanup")
+	}
+	// The attachment finalizer stays until the cleanup succeeds, so the retry
+	// collects what the deleted route used.
+	reconcileModel(t, r, model)
+	assertAttachmentWithdrawn(t, r)
+}
+
+func TestDeletingModelCollectsStateOfItsAlreadyDeletedRoute(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	// Foreground deletion removes the model-owned route and selection sink
+	// before the model's finalizer runs; the provider transport is not
+	// model-owned.
+	route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, "team", providerSelectionSinkName("chat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, owned := range []client.Object{route, sink} {
+		if err := r.Delete(context.Background(), owned); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Delete(context.Background(), getModel(t, r, model)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	assertAttachmentWithdrawn(t, r)
+	assertTransportCollected(t, r, "team", "chat")
+}
+
+func TestModelDeletedWithoutAttachmentFinalizerCollectsItsState(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	// A model created before the attachment finalizer existed is deleted at
+	// once; Kubernetes then garbage collects its route.
+	got := getModel(t, r, model)
+	got.Finalizers = nil
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	// The route deletion requeues the deleted model.
+	reconcileModel(t, r, model)
 	assertAttachmentWithdrawn(t, r)
 }
 
@@ -1025,11 +1678,179 @@ func TestTransientCredentialReadKeepsServedAttachment(t *testing.T) {
 		t.Fatal("a failed Secret read withdrew the served attachment")
 	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); err != nil {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); err != nil {
 		t.Fatalf("a failed Secret read deleted the credential copy: %v", err)
 	}
 	if got := getModel(t, r, model); readyReason(got) != reasonReconcileFailed {
 		t.Fatalf("reason = %q, want %q", readyReason(got), reasonReconcileFailed)
+	}
+}
+
+func TestServedAzureAttachmentStampsCredentialHeaderAnnotation(t *testing.T) {
+	// Azure apikey auth qualifies to strategy apikey + api-key header. The
+	// header is json:"-" on Credential and cannot survive the overlay
+	// round-trip, so attach time stamps it on the credential copy Secret for
+	// the tenant reconciler to restore. See envelope.StrategyFor /
+	// tenant.AnnotationCredentialHeader.
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure", Namespace: "team", UID: types.UID("provider-azure-team")},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "azure", Endpoint: "azure.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "azure-key"}},
+		},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "azure-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("azure-secret")}}
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "team", UID: types.UID("uid-team-azure-chat"), CreationTimestamp: metav1.NewTime(time.Unix(100, 0))},
+		Spec: v1alpha1.ExternalModelSpec{
+			ModelName: "chat-model",
+			ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+				Ref: v1alpha1.ExternalProviderReference{Name: "azure"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			}},
+			GatewayRefs: []v1alpha1.NamespacedObjectReference{gatewayB},
+		},
+	}
+	objects := append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("azure attachment is not served")
+	}
+
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "azure-key", "api-key", "api-key")}, &copied); err != nil {
+		t.Fatalf("credential copy: %v", err)
+	}
+	if got := copied.GetAnnotations()[tenant.AnnotationCredentialHeader]; got != "api-key" {
+		t.Fatalf("credential-header annotation = %q, want %q", got, "api-key")
+	}
+}
+
+func TestSharedSecretWithDivergentHeadersGetsDistinctCopies(t *testing.T) {
+	// The injected header is provider-scoped and part of the credential copy
+	// identity (credentialCopyName), so a source Secret qualified under two
+	// different headers yields two distinct copies, each with its own header
+	// annotation, rather than one copy whose single annotation a later apply
+	// could overwrite. credentialCopyName is a pure function of (tenant, source
+	// Secret, header), so the guarantee holds across separate attached models
+	// that share the Secret too. Here one model binds azure (api-key) and openai
+	// (bearer_token, no header) to the same Secret; each gets its own copy.
+	azure := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure", Namespace: "team", UID: types.UID("provider-azure-team")},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "azure", Endpoint: "azure.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "shared-key"}}},
+	}
+	openai := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "openai", Namespace: "team", UID: types.UID("provider-openai-team")},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "openai.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "shared-key"}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "shared-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("k")}}
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "team", UID: types.UID("uid-team-shared-chat"), CreationTimestamp: metav1.NewTime(time.Unix(100, 0))},
+		Spec: v1alpha1.ExternalModelSpec{
+			ModelName: "chat-model",
+			ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
+				{Ref: v1alpha1.ExternalProviderReference{Name: "azure"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+				{Ref: v1alpha1.ExternalProviderReference{Name: "openai"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			},
+			GatewayRefs: []v1alpha1.NamespacedObjectReference{gatewayB},
+		},
+	}
+	objects := append([]client.Object{azure, openai, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+
+	if got := getModel(t, r, model); readyReason(got) == reasonReconcileFailed {
+		t.Fatalf("model sharing a Secret under distinct headers must be served, got %+v", got.Status.Conditions)
+	}
+
+	// azure qualifies to the api-key header; openai to bearer_token with none.
+	// The header is part of the identity, so the two copies have distinct names.
+	azureCopyName := credentialCopyName("tenant-b", "team", "shared-key", "api-key", "api-key")
+	openaiCopyName := credentialCopyName("tenant-b", "team", "shared-key", "api-key", "")
+	if azureCopyName == openaiCopyName {
+		t.Fatal("divergent headers must produce distinct copy names")
+	}
+	var azureCopy corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: azureCopyName}, &azureCopy); err != nil {
+		t.Fatalf("azure credential copy: %v", err)
+	}
+	if got := azureCopy.GetAnnotations()[tenant.AnnotationCredentialHeader]; got != "api-key" {
+		t.Fatalf("azure copy header annotation = %q, want api-key", got)
+	}
+	var openaiCopy corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: openaiCopyName}, &openaiCopy); err != nil {
+		t.Fatalf("openai credential copy: %v", err)
+	}
+	if got, ok := openaiCopy.GetAnnotations()[tenant.AnnotationCredentialHeader]; ok {
+		t.Fatalf("bearer_token copy must carry no header annotation, got %q", got)
+	}
+}
+
+func TestCrossNamespaceAzureOverrideSecretGetsHeaderedCopy(t *testing.T) {
+	// A tenant's own model references a cross-namespace Azure provider but brings
+	// its own credential with a model-local override Secret. The override Secret
+	// lives in the tenant namespace, so it would otherwise be mounted directly —
+	// but azure+openai-chat qualifies to the api-key header, which survives the
+	// overlay round-trip only on a copy Secret's annotation (Credential.Header is
+	// not serialized). localizeRoutes must still copy such a tenant-local Secret
+	// so attachedOverlayCandidates can restore the header; skipping the copy would
+	// drop the api-key header and break Azure auth.
+	azure := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure", Namespace: "shared", UID: types.UID("provider-azure-shared")},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "azure", Endpoint: "azure.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-key"}}},
+	}
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	model.Spec.ExternalProviderRefs[0].Ref.Name = "azure"
+	// A model-local override: the resolver leaves SecretNamespace empty, so the
+	// Secret is read from the model (tenant) namespace.
+	model.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
+	modelSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "model-key", Namespace: "tenant-b"}, Data: map[string][]byte{"api-key": []byte("sk-model-local")}}
+	objects := append([]client.Object{azure, modelSecret, model, referenceGrant("shared", "tenant-b", "azure")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("status = %q/%q %q", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+
+	// Source namespace is the tenant namespace (model-local override), yet the
+	// headered credential is still copied, carrying its header annotation.
+	copyName := credentialCopyName("tenant-b", "tenant-b", "model-key", "api-key", "api-key")
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: copyName}, &copied); err != nil {
+		t.Fatalf("model-local override copy for a cross-namespace Azure provider: %v", err)
+	}
+	if got := copied.GetAnnotations()[tenant.AnnotationCredentialHeader]; got != "api-key" {
+		t.Fatalf("copy header annotation = %q, want api-key", got)
+	}
+	if string(copied.Data["api-key"]) != "sk-model-local" {
+		t.Fatalf("copy value = %q, want the model-local override", copied.Data["api-key"])
+	}
+	candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates
+	if len(candidates) != 1 || candidates[0].StableID != "tenant-b/chat/shared/azure" ||
+		candidates[0].Credential == nil || candidates[0].Credential.SecretRef.Name != copyName {
+		t.Fatalf("overlay candidates = %#v, want the headered copy", candidates)
+	}
+}
+
+func TestServedBearerAttachmentOmitsCredentialHeaderAnnotation(t *testing.T) {
+	// openai + openai-chat qualifies to bearer_token, whose header is fixed
+	// data-plane side; no header annotation is stamped on the copy Secret.
+	r, _ := servedAttachmentFixture(t)
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); err != nil {
+		t.Fatalf("credential copy: %v", err)
+	}
+	if got, ok := copied.GetAnnotations()[tenant.AnnotationCredentialHeader]; ok {
+		t.Fatalf("bearer_token copy must not carry a credential-header annotation, got %q", got)
 	}
 }
 
@@ -1044,7 +1865,7 @@ func publishOwnCandidates(t *testing.T, r *Reconciler, namespace string, gateway
 			Model: model, ClientName: model, Namespace: namespace, Provider: "local", Cluster: "provider-local", Weight: 1,
 		}}})
 	}
-	if _, err := r.publishTenantOverlay(context.Background(), namespace, gateway.Name, set, nil, nil, "tenant-source"); err != nil {
+	if _, err := r.publishTenantOverlay(context.Background(), namespace, gateway.Name, set, nil, nil, "tenant-source", false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1140,6 +1961,84 @@ func TestTenantKeepsAttachmentsWhenItsOwnModelsServeNothing(t *testing.T) {
 	assertServed("last own model deleted")
 }
 
+func TestTranslationDisabledHomeModelKeepsAttachmentServing(t *testing.T) {
+	r, attachment := servedAttachmentFixture(t)
+	provider, secret := attachmentProvider("tenant-b")
+	provider.Spec.Provider = "anthropic"
+	provider.Spec.Endpoint = "api.anthropic.com"
+	if err := r.Create(context.Background(), provider); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("reconcile Anthropic provider: %v", err)
+	}
+	own := attachmentModel("messages", "tenant-b", "anthropic-model", time.Unix(300, 0))
+	own.Spec.ExternalProviderRefs[0].APIFormat = "messages"
+	own.Spec.ExternalProviderRefs[0].Path = "/v1/messages"
+	if err := r.Create(context.Background(), own); err != nil {
+		t.Fatal(err)
+	}
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+	reconcileModel(t, r, own)
+	if got := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(got) != 2 {
+		t.Fatalf("serving candidates before disabling translation = %#v, want home model and attachment", got)
+	}
+
+	setControllerTranslationEnabled(t, r, "tenant-b", false)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(own)}); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("reconcile with translation disabled = %v, want ErrNoRoutes", err)
+	}
+	if got := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(got) != 1 || got[0].StableID != "team/chat/team/openai" {
+		t.Fatalf("remaining candidates = %#v, want the cross-namespace attachment", got)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-b", modelRouteName(own.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("home HTTPRoute survived translation disable: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(attachment, gatewayB)); err != nil {
+		t.Fatalf("attachment HTTPRoute was removed with the home route: %v", err)
+	}
+	if names := routeFilterNames(t, r, "tenant-b", "gateway-b"); len(names) != 4 || names[0] != "team."+attachmentRouteName(attachment, gatewayB)+".0" {
+		t.Fatalf("remaining route filter patches = %v, want the attachment's five route rules", names)
+	}
+}
+
+func TestNewAttachmentCarriesEnabledTranslationInHandoff(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Spec.Provider = "anthropic"
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	model.Spec.ExternalProviderRefs[0].APIFormat = "messages"
+	model.Spec.ExternalProviderRefs[0].Path = "/v1/messages"
+	objects := []client.Object{provider, secret, model}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+
+	got := getModel(t, r, model)
+	condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	if got.Status.Phase != resolver.PhaseReady || condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("attached model status = %#v, want Ready after translation-enabled handoff", got.Status)
+	}
+	env := overlayEnvelope(t, r, "tenant-b")
+	if len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].StableID != "team/chat/team/openai" {
+		t.Fatalf("overlay candidates = %#v, want the accepted attachment", env.Overlay.Candidates)
+	}
+	if env.Overlay.Candidates[0].APIFormat != "messages" {
+		t.Fatalf("attachment API format = %q, want messages", env.Overlay.Candidates[0].APIFormat)
+	}
+	route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertExactSelectedPathRule(t, route, "/v1/messages", env.Overlay.Candidates[0].StableID)
+}
+
 func TestAttachmentKeepsTenantSelectionPolicy(t *testing.T) {
 	tenantProvider, tenantSecret := attachmentProvider("tenant-b")
 	tenantAlt, tenantAltSecret := namedProvider("tenant-b", "alt")
@@ -1196,37 +2095,87 @@ func TestSharedProviderStateStaysWhileAnAttachmentUsesIt(t *testing.T) {
 	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", attachmentDestinationRuleName(gatewayB, "team", "openai")); err != nil {
 		t.Fatalf("shared DestinationRule removed while another attachment uses it: %v", err)
 	}
+	if _, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, "team", "provider-openai"); err != nil {
+		t.Fatalf("shared provider Service removed while another attachment uses it: %v", err)
+	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); err != nil {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); err != nil {
 		t.Fatalf("shared credential copy removed while another attachment uses it: %v", err)
 	}
 	detach(other)
 	assertAttachmentWithdrawn(t, r)
+	assertTransportCollected(t, r, "team", "chat", "other")
 }
 
-func TestDeletedAttachedOnlyModelCollectsItsCredentialCopy(t *testing.T) {
+func TestDeletingAttachedOnlyModelCompletesWithoutItsTenant(t *testing.T) {
 	r, model := servedAttachmentFixture(t)
 	got := getModel(t, r, model)
-	if len(got.Finalizers) != 0 {
-		t.Fatalf("a model with only extra attachments has finalizers %v", got.Finalizers)
+	if !slices.Equal(got.Finalizers, []string{attachmentFinalizer}) {
+		t.Fatalf("finalizers = %v, want only %s", got.Finalizers, attachmentFinalizer)
+	}
+	// The attached tenant is torn down first.
+	for _, object := range attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis") {
+		if err := r.Delete(context.Background(), object); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := r.Delete(context.Background(), got); err != nil {
 		t.Fatal(err)
 	}
-	// Kubernetes garbage collects the attachment route after the model; while
-	// it remains, it still references the copy and DestinationRule.
 	reconcileModel(t, r, model)
-	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", attachmentDestinationRuleName(gatewayB, "team", "openai")); err != nil {
-		t.Fatalf("DestinationRule collected while the route still references it: %v", err)
+	if attachmentRouteExists(t, r, model) {
+		t.Fatal("deleted model keeps its attachment route")
 	}
-	route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Delete(context.Background(), route); err != nil {
-		t.Fatal(err)
-	}
-	// The route deletion requeues the deleted model.
-	reconcileModel(t, r, model)
 	assertAttachmentWithdrawn(t, r)
+	assertTransportCollected(t, r, "team", "chat")
+	var deleted v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &deleted); !apierrors.IsNotFound(err) {
+		t.Fatalf("model deletion did not complete: %v", err)
+	}
+}
+
+func TestDeletingModelRemovesExtraAttachmentsWhileItsHomeWaits(t *testing.T) {
+	gatewayA := v1alpha1.NamespacedObjectReference{Name: "gw-a", Namespace: "gateway-a"}
+	provider, secret := attachmentProvider("tenant-a")
+	model := attachmentModel("chat", "tenant-a", "chat-model", time.Unix(100, 0), gatewayA, gatewayB)
+	sibling := attachmentModel("other", "tenant-a", "other-model", time.Unix(100, 0))
+	objects := []client.Object{provider, secret, model, sibling}
+	objects = append(objects, attachmentTenantObjects("tenant-a", "tenant-a", gatewayA, "praxis")...)
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, sibling)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	got := getModel(t, r, model)
+	if !controllerutil.ContainsFinalizer(got, externalModelFinalizer) || !controllerutil.ContainsFinalizer(got, attachmentFinalizer) {
+		t.Fatalf("finalizers = %v, want the home and attachment finalizers", got.Finalizers)
+	}
+
+	// Without its MaasTenantConfig the home path keeps its existing
+	// conservative wait while a sibling remains; the extra attachment does not.
+	mtc := tenant.NewMaasTenantConfig()
+	mtc.SetNamespace("tenant-a")
+	mtc.SetName(tenant.MaasTenantConfigInstanceName)
+	if err := r.Delete(context.Background(), mtc); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err == nil {
+		t.Fatal("the home path must wait for a steady tenant while a sibling remains")
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
+		t.Fatalf("extra attachment route remains: %v", err)
+	}
+	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", attachmentDestinationRuleName(gatewayB, "tenant-a", "openai")); !apierrors.IsNotFound(err) {
+		t.Fatalf("extra attachment DestinationRule remains: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", "external-model-chat"); err != nil {
+		t.Fatalf("home route removed while the home path waits: %v", err)
+	}
+	if got := getModel(t, r, model); !slices.Equal(got.Finalizers, []string{externalModelFinalizer}) {
+		t.Fatalf("finalizers = %v, want only the home finalizer", got.Finalizers)
+	}
 }

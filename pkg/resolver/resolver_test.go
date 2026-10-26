@@ -90,6 +90,193 @@ func TestResolveRejectsDuplicateActiveProviderBindings(t *testing.T) {
 	}
 }
 
+func TestResolveGatesAnthropicMessagesOnTenantPermission(t *testing.T) {
+	modelRef := ref("prov-anthropic", "claude", "/v1/messages")
+	modelRef.APIFormat = "messages"
+	model := model("ns1", "my-model", modelRef)
+	provider := provider("ns1", "prov-anthropic", PhaseReady, "api.anthropic.com", nil)
+	provider.Spec.Provider = "anthropic"
+	set, err := Resolve(
+		[]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider},
+	)
+	if !errors.Is(err, ErrNoRoutes) || len(set.Models) != 1 || len(set.Models[0].Routes) != 0 || len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipTranslationDisabled {
+		t.Fatalf("Resolve() = (%+v, %v), want no route with APITranslationDisabled skip", set, err)
+	}
+	enabled, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, true)
+	if err != nil || len(enabled.Routes()) != 1 || enabled.Routes()[0].APIFormat != "messages" {
+		t.Fatalf("ResolveWithAPITranslation() = (%+v, %v), want one Messages candidate", enabled, err)
+	}
+}
+
+func TestAPITranslationPermissionPreservesOpenAIAndGatesAnthropicSelection(t *testing.T) {
+	openAIRef := ref("openai", "gpt-mock", "/v1/chat/completions")
+	messageRef := ref("anthropic", "claude-mock", "/v1/messages")
+	messageRef.APIFormat = "messages"
+	model := model("ns1", "model", openAIRef, messageRef)
+	providers := []*v1alpha1.ExternalProvider{
+		provider("ns1", "openai", PhaseReady, "openai.example.com", nil),
+		provider("ns1", "anthropic", PhaseReady, "anthropic.example.com", nil),
+	}
+	providers[1].Spec.Provider = "anthropic"
+
+	defaultOff, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, false)
+	if err != nil || len(defaultOff.Routes()) != 1 || defaultOff.Routes()[0].Provider != "openai" {
+		t.Fatalf("default-off routes = %+v, err=%v; want OpenAI pass-through only", defaultOff, err)
+	}
+	if len(defaultOff.Models[0].Skips) != 1 || defaultOff.Models[0].Skips[0].Reason != SkipTranslationDisabled {
+		t.Fatalf("default-off skips = %+v, want the Messages candidate gated by permission", defaultOff.Models[0].Skips)
+	}
+
+	enabled, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
+	if err != nil || len(enabled.Routes()) != 2 {
+		t.Fatalf("enabled routes = %+v, err=%v; want OpenAI and Anthropic candidates", enabled, err)
+	}
+	if enabled.Routes()[0].Provider != "openai" || enabled.Routes()[1].Provider != "anthropic" {
+		t.Fatalf("enabled route order = %+v; permission must not choose a translator", enabled.Routes())
+	}
+}
+
+func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
+	cases := []struct {
+		name         string
+		providerType string
+		apiFormat    string
+	}{
+		{name: "Vertex OpenAI", providerType: "vertex-openai", apiFormat: "openai-chat"},
+		{name: "Bedrock OpenAI", providerType: "bedrock-openai", apiFormat: "openai-chat"},
+		{name: "custom provider", providerType: "custom", apiFormat: "openai-chat"},
+		{name: "custom format", providerType: "openai", apiFormat: "vendor-chat"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			modelRef := ref("provider", "target", "/v1/chat/completions")
+			modelRef.APIFormat = tc.apiFormat
+			model := model("ns1", "model", modelRef)
+			provider := provider("ns1", "provider", PhaseReady, "provider.example.com", nil)
+			provider.Spec.Provider = tc.providerType
+
+			_, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, true)
+			if !errors.Is(err, ErrProviderCapabilityUnsupported) {
+				t.Fatalf("ResolveWithAPITranslation() error = %v, want ErrProviderCapabilityUnsupported", err)
+			}
+			for _, want := range []string{tc.providerType, tc.apiFormat, "provider ref provider"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not identify %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestUnsupportedMessagesBindingFailsClosedBeforeTranslationPermission(t *testing.T) {
+	cases := []struct {
+		name         string
+		providerType string
+	}{
+		{name: "Azure OpenAI", providerType: "azure-openai"},
+		{name: "Vertex OpenAI", providerType: "vertex-openai"},
+		{name: "Bedrock OpenAI", providerType: "bedrock-openai"},
+		{name: "custom provider", providerType: "custom"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			modelRef := ref("provider", "target", "/v1/messages")
+			modelRef.APIFormat = "messages"
+			model := model("ns1", "model", modelRef)
+			provider := provider("ns1", "provider", PhaseReady, "provider.example.com", nil)
+			provider.Spec.Provider = tc.providerType
+
+			set, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+			if !errors.Is(err, ErrProviderCapabilityUnsupported) {
+				t.Fatalf("ResolveWithAPITranslation(default-off) error = %v, want ErrProviderCapabilityUnsupported", err)
+			}
+			if len(set.Models) != 1 || len(set.Models[0].Routes) != 0 || len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipAPIFormatUnsupported {
+				t.Fatalf("ResolveWithAPITranslation(default-off) result = %+v, want APIFormatUnsupported diagnostic without a publishable route", set)
+			}
+			if !strings.Contains(err.Error(), string(SkipAPIFormatUnsupported)) {
+				t.Fatalf("ResolveWithAPITranslation(default-off) error = %v, want reported %s reason", err, SkipAPIFormatUnsupported)
+			}
+		})
+	}
+}
+
+func TestResolveAllReportsUnsupportedMessagesSeparatelyFromTranslationDisabled(t *testing.T) {
+	modelRef := withWeight(ref("provider", "target", "/v1/messages"), 0)
+	modelRef.APIFormat = "messages"
+	model := model("ns1", "model", modelRef)
+	provider := provider("ns1", "provider", PhaseReady, "provider.example.com", nil)
+	provider.Spec.Provider = "custom"
+
+	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+	if !errors.Is(err, ErrNoRoutes) || len(set.Models) != 1 || len(set.Models[0].Routes) != 0 || len(set.Models[0].Skips) != 1 {
+		t.Fatalf("ResolveAllWithAPITranslation(default-off) = (%+v, %v), want one skipped unsupported candidate", set, err)
+	}
+	if got := set.Models[0].Skips[0].Reason; got != SkipAPIFormatUnsupported {
+		t.Fatalf("unsupported Messages candidate skip reason = %q, want %q", got, SkipAPIFormatUnsupported)
+	}
+}
+
+func TestResolveAllSkipsUnqualifiedDisabledBinding(t *testing.T) {
+	active := ref("active", "target-a", "/v1/chat/completions")
+	disabled := withWeight(ref("vertex", "target-b", "/v1/chat/completions"), 0)
+	disabled.APIFormat = "openai-chat"
+	model := model("ns1", "model", active, disabled)
+	providers := []*v1alpha1.ExternalProvider{
+		provider("ns1", "active", PhaseReady, "openai.example.com", nil),
+		provider("ns1", "vertex", PhaseReady, "vertex.example.com", nil),
+	}
+	providers[1].Spec.Provider = "vertex-openai"
+
+	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
+	if err != nil {
+		t.Fatalf("ResolveAllWithAPITranslation() error = %v, want inactive unqualified binding to be omitted", err)
+	}
+	if got := len(set.Routes()); got != 1 || set.Routes()[0].Provider != "active" {
+		t.Fatalf("preloaded routes = %+v, want only active qualified provider", set.Routes())
+	}
+	if len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipAPIFormatUnsupported {
+		t.Fatalf("inactive unqualified binding skips = %+v, want APIFormatUnsupported", set.Models[0].Skips)
+	}
+}
+
+func TestResolveAllSkipsNegativeWeightUnsupportedBinding(t *testing.T) {
+	active := ref("active", "target-a", "/v1/chat/completions")
+	disabled := withWeight(ref("vertex", "target-b", "/v1/chat/completions"), -1)
+	model := model("ns1", "model", active, disabled)
+	providers := []*v1alpha1.ExternalProvider{
+		provider("ns1", "active", PhaseReady, "openai.example.com", nil),
+		provider("ns1", "vertex", PhaseReady, "vertex.example.com", nil),
+	}
+	providers[1].Spec.Provider = "vertex-openai"
+
+	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
+	if err != nil {
+		t.Fatalf("ResolveAllWithAPITranslation() error = %v, want negative-weight unsupported binding treated as disabled", err)
+	}
+	if got := len(set.Routes()); got != 1 || set.Routes()[0].Provider != "active" {
+		t.Fatalf("preloaded routes = %+v, want only the active qualified provider", set.Routes())
+	}
+	if len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipAPIFormatUnsupported {
+		t.Fatalf("negative-weight unsupported binding skips = %+v, want APIFormatUnsupported", set.Models[0].Skips)
+	}
+}
+
+func TestResolveAllDoesNotPreloadMessagesWhenTenantPermissionIsOff(t *testing.T) {
+	modelRef := withWeight(ref("prov-anthropic", "claude", "/v1/messages"), 0)
+	modelRef.APIFormat = "messages"
+	model := model("ns1", "my-model", modelRef)
+	provider := provider("ns1", "prov-anthropic", PhaseReady, "api.anthropic.com", nil)
+	provider.Spec.Provider = "anthropic"
+
+	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+	if !errors.Is(err, ErrNoRoutes) || len(set.Models) != 1 || len(set.Models[0].Routes) != 0 || len(set.Models[0].Skips) != 1 {
+		t.Fatalf("ResolveAllWithAPITranslation() = (%+v, %v), want no preloaded Messages candidate", set, err)
+	}
+	if set.Models[0].Skips[0].Reason != SkipTranslationDisabled {
+		t.Fatalf("Messages candidate skip reason = %q, want %q", set.Models[0].Skips[0].Reason, SkipTranslationDisabled)
+	}
+}
+
 func TestResolveAllIncludesUnselectedProviderBindings(t *testing.T) {
 	m := model("ns1", "my-model",
 		withWeight(ref("prov-a", "a", "/v1"), 1),
@@ -235,15 +422,23 @@ func TestResolve_ProviderNamespace(t *testing.T) {
 						provider("models", "provider", PhaseReady, "local.example.com", nil),
 						provider("shared", "provider", PhaseReady, "foreign.example.com", nil),
 					})
-					if namespace == "shared" {
-						if !errors.Is(err, ErrNoRoutes) || len(set.Routes()) != 0 {
-							t.Fatalf("foreign reference resolved: set=%#v err=%v", set, err)
+					if err != nil || len(set.Routes()) != 1 {
+						t.Fatalf("set=%#v err=%v", set, err)
+					}
+					route := set.Routes()[0]
+					if namespace != "shared" {
+						if route.Endpoint != "local.example.com" || route.CrossNamespace() || route.Cluster != "provider-provider" || route.SecretRefNamespace() != "models" {
+							t.Fatalf("local reference = %#v", route)
 						}
-						if len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipRefNamespaceUnsupported {
-							t.Fatalf("foreign reference skips = %#v", set.Models[0].Skips)
-						}
-					} else if err != nil || len(set.Routes()) != 1 || set.Routes()[0].Endpoint != "local.example.com" {
-						t.Fatalf("local reference: set=%#v err=%v", set, err)
+						return
+					}
+					// Never the same-named local provider; the inherited
+					// credential stays in the provider namespace.
+					if route.Endpoint != "foreign.example.com" || route.ProviderNamespace != "shared" || route.SecretRefNamespace() != "shared" {
+						t.Fatalf("foreign reference = %#v", route)
+					}
+					if route.Cluster != route.ServiceName() || !strings.HasPrefix(route.Cluster, "provider-provider-") || len(route.Cluster) != len("provider-provider-")+12 {
+						t.Fatalf("foreign cluster = %q, want the hashed Service name", route.Cluster)
 					}
 				})
 			}
@@ -251,7 +446,7 @@ func TestResolve_ProviderNamespace(t *testing.T) {
 	}
 }
 
-func TestResolve_UnsupportedNamespaceKeepsLocalRefs(t *testing.T) {
+func TestResolve_UnpermittedNamespaceKeepsLocalRefs(t *testing.T) {
 	foreign := ref("provider", "foreign-target", "/v1/chat/completions")
 	foreign.Ref.Namespace = "shared"
 	m := model("models", "model", foreign, ref("provider", "local-target", "/v1/chat/completions"))
@@ -261,6 +456,60 @@ func TestResolve_UnsupportedNamespaceKeepsLocalRefs(t *testing.T) {
 		if err != nil || len(set.Routes()) != 1 || set.Routes()[0].TargetModel != "local-target" {
 			t.Fatalf("mixed references: set=%#v err=%v", set, err)
 		}
+		skips := set.Models[0].Skips
+		if len(skips) != 1 || skips[0].Reason != SkipRefNotPermitted || !strings.Contains(skips[0].Message, "shared/provider is not found or not permitted") {
+			t.Fatalf("unpermitted reference skips = %#v", skips)
+		}
+	}
+}
+
+func TestResolve_SameNamedProvidersFromTwoNamespaces(t *testing.T) {
+	a, b := ref("openai", "gpt", "/v1/chat/completions"), ref("openai", "gpt", "/v1/chat/completions")
+	a.Ref.Namespace, b.Ref.Namespace = "ns-a", "ns-b"
+	overridden := v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
+	b.Auth = &overridden
+	set, err := Resolve([]*v1alpha1.ExternalModel{model("models", "model", a, b)}, []*v1alpha1.ExternalProvider{
+		provider("ns-a", "openai", PhaseReady, "a.example.com", nil),
+		provider("ns-b", "openai", PhaseReady, "b.example.com", nil),
+	})
+	if err != nil || len(set.Routes()) != 2 {
+		t.Fatalf("set=%#v err=%v", set, err)
+	}
+	routeA, routeB := set.Routes()[0], set.Routes()[1]
+	if routeA.Cluster == routeB.Cluster || routeA.Endpoint != "a.example.com" || routeB.Endpoint != "b.example.com" {
+		t.Fatalf("same-named providers are not distinct: %#v %#v", routeA, routeB)
+	}
+	// Inherited auth uses the provider namespace; an override the model namespace.
+	if routeA.SecretName != "openai-key" || routeA.SecretRefNamespace() != "ns-a" || routeB.SecretName != "model-key" || routeB.SecretRefNamespace() != "models" {
+		t.Fatalf("credential sources = %s/%s and %s/%s", routeA.SecretRefNamespace(), routeA.SecretName, routeB.SecretRefNamespace(), routeB.SecretName)
+	}
+}
+
+func TestResolve_SimpleAuthIsAPIKey(t *testing.T) {
+	inherited, overridden := ref("prov-a", "gpt", "/v1/chat/completions"), ref("prov-b", "gpt", "/v1/chat/completions")
+	overridden.Auth = &v1alpha1.AuthConfig{Type: "simple", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
+	providerA := provider("ns1", "prov-a", PhaseReady, "a.example.com", nil)
+	providerA.Spec.Auth.Type = "simple"
+	set, err := Resolve([]*v1alpha1.ExternalModel{model("ns1", "my-model", inherited, overridden)},
+		[]*v1alpha1.ExternalProvider{providerA, provider("ns1", "prov-b", PhaseReady, "b.example.com", nil)})
+	if err != nil || len(set.Routes()) != 2 {
+		t.Fatalf("set=%#v err=%v", set, err)
+	}
+	for _, route := range set.Routes() {
+		if route.AuthType != "apikey" {
+			t.Fatalf("route %s auth type = %q, want apikey", route.Provider, route.AuthType)
+		}
+	}
+}
+
+func TestRouteServiceNameFitsServiceNameLimit(t *testing.T) {
+	route := Route{Namespace: "models", ProviderNamespace: "shared", Provider: strings.Repeat("p", 253)}
+	if name := route.ServiceName(); len(name) != 63 || !strings.HasPrefix(name, "provider-ppp") {
+		t.Fatalf("ServiceName() = %q (%d characters)", name, len(name))
+	}
+	route.ProviderNamespace = "other"
+	if other := route.ServiceName(); other == (Route{Namespace: "models", ProviderNamespace: "shared", Provider: route.Provider}).ServiceName() {
+		t.Fatalf("providers from different namespaces share Service name %q", other)
 	}
 }
 
