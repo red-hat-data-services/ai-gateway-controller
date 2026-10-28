@@ -1,0 +1,31 @@
+# Only the tenant Gateway and Authorino may reach the auth proxy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: maas-consumer-portal-auth-proxy
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal-auth-proxy
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: maas-consumer-portal-auth-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: CONSUMER_PORTAL_GATEWAY_NAMESPACE
+          podSelector:
+            matchLabels:
+              gateway.networking.k8s.io/gateway-name: CONSUMER_PORTAL_GATEWAY_NAME
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: CONSUMER_PORTAL_AUTHORINO_NAMESPACE
+          podSelector:
+            matchLabels:
+              authorino-resource: authorino
+      ports:
+        - protocol: TCP
+          port: 4180

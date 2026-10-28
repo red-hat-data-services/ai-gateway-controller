@@ -1,0 +1,10 @@
+# MaaS consumer portal OIDC auth proxy (kube-auth-proxy), reconciled by
+# pkg/consumerportal for the default AITenant. CONSUMER_PORTAL_* tokens are
+# replaced at render time; see pkg/consumerportal/render.go.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml

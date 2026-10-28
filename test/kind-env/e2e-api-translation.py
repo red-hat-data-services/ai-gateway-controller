@@ -2230,7 +2230,7 @@ def selected_provider_route_precedence(label, profiles):
                        and "provider-selection-required-demo-model" in (row.get("cluster") or "")]
     fallback_routes_stream_responses = (
         len(fallback_routes) == 2
-        and all(row.get("external_model_processing_mode", {}).get("requestBodyMode") == "STREAMED"
+        and all(row.get("external_model_processing_mode", {}).get("requestBodyMode") == "BUFFERED"
                 and row.get("external_model_effective_response_body_mode") == "STREAMED"
                 and row.get("external_model_pre_request_body_mode") == "BUFFERED"
                 for row in fallback_routes)
@@ -2311,7 +2311,7 @@ def selected_provider_route_precedence(label, profiles):
             ),
             "body_modes_match_provider_contract": (
                 len(candidate_routes) == expected_candidate_route_count
-                and all(row.get("external_model_processing_mode", {}).get("requestBodyMode") == "STREAMED"
+                and all(row.get("external_model_processing_mode", {}).get("requestBodyMode") == "BUFFERED"
                         and row.get("external_model_effective_response_body_mode") == response_body_mode
                         and row.get("external_model_pre_request_body_mode") == "BUFFERED"
                         for row in candidate_routes)
@@ -2526,15 +2526,15 @@ def test_externalmodel_provider_aware_translation(auth_file):
     capture_envoy("externalmodel-pre-traffic")
     route_precedence = selected_provider_route_precedence("externalmodel-pre-traffic", profiles)
     send_body_before_header = externalmodel_send_body_before_header_flags("externalmodel-pre-traffic")
-    streamed_request_contract = (
+    buffered_request_contract = (
         len(route_precedence) == 2
         and all(check["body_modes_match_provider_contract"] for check in route_precedence)
         and all(check["fallback_routes_stream_response_bodies"] for check in route_precedence)
         and send_body_before_header
-        and all(flag is True for flag in send_body_before_header)
+        and all(flag is not True for flag in send_body_before_header)
     )
-    record("externalmodel_pre_auth_model_extraction_and_post_auth_stream_modes",
-           streamed_request_contract,
+    record("externalmodel_pre_auth_model_extraction_and_post_auth_body_modes",
+           buffered_request_contract,
            {"route_request_modes": [
                {"route": check.get("selected_provider_route", {}).get("name"),
                 "pre_request_body_mode": check.get("selected_provider_route", {}).get("external_model_pre_request_body_mode"),

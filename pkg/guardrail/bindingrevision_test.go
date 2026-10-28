@@ -48,6 +48,32 @@ func revisionProvider(names ...string) *unstructured.Unstructured {
 	return u
 }
 
+// nemoConfigEntry is one spec.nemoConfigs entry: the id a check selects
+// through configId, and the ConfigMaps composing it.
+type nemoConfigEntry struct {
+	name       string
+	configMaps []string
+}
+
+// revisionProviderWithConfigs builds a provider declaring configurations along
+// with their ConfigMaps. revisionProvider sets names only, which is all the
+// cases that are not about composition need.
+func revisionProviderWithConfigs(configs ...nemoConfigEntry) *unstructured.Unstructured {
+	entries := make([]any, 0, len(configs))
+	for _, config := range configs {
+		mounted := make([]any, 0, len(config.configMaps))
+		for _, configMap := range config.configMaps {
+			mounted = append(mounted, configMap)
+		}
+		entries = append(entries, map[string]any{"name": config.name, "configMaps": mounted})
+	}
+	u := revisionProvider()
+	if err := unstructured.SetNestedSlice(u.Object, entries, "spec", "nemoConfigs"); err != nil {
+		panic(err)
+	}
+	return u
+}
+
 // revisionEndpoint is the discovered endpoint the cases that are not about
 // the endpoint hold constant. It is passed explicitly rather than derived
 // from the provider: rebuilding TrustyAI's URL formula here would make the
@@ -183,6 +209,94 @@ func TestComputeBindingRevisionChangesWithDependencies(t *testing.T) {
 				t.Fatalf("revision is unchanged at %q, but %s; the dependency change is invisible to consumers", got, c.why)
 			}
 		})
+	}
+}
+
+// TestComputeBindingRevisionTracksDeclaredConfigMaps covers the composition of
+// a configuration rather than just its id. Every edit below leaves each
+// check's configId resolving to a declared name, so Compatible stays True and
+// no generation moves anywhere; the revision is the only thing that can
+// notice that the configuration now mounts different rules.
+func TestComputeBindingRevisionTracksDeclaredConfigMaps(t *testing.T) {
+	policy := allowedConsumers{Mode: consumerModeSame}
+	provider := func(configMaps ...string) *unstructured.Unstructured {
+		return revisionProviderWithConfigs(nemoConfigEntry{name: guardrailConfig, configMaps: configMaps})
+	}
+	base := mustComputeRevision(t, provider("base-rails", "pii-rails"), revisionEndpoint, policy, nil)
+
+	cases := []struct {
+		name       string
+		configMaps []string
+		wantChange bool
+		// why records what the case stands for, so a failure says what went
+		// unnoticed rather than just that two hashes matched.
+		why string
+	}{
+		{
+			name:       "a ConfigMap is added to the configuration",
+			configMaps: []string{"base-rails", "pii-rails", "jailbreak-rails"},
+			wantChange: true,
+			why:        "the configuration mounts rules it did not before",
+		},
+		{
+			name:       "a ConfigMap is removed from the configuration",
+			configMaps: []string{"base-rails"},
+			wantChange: true,
+			why:        "rules the binding was accepted against are no longer mounted",
+		},
+		{
+			name:       "a ConfigMap is swapped for another",
+			configMaps: []string{"base-rails", "relaxed-rails"},
+			wantChange: true,
+			why:        "the same configId now resolves to different content",
+		},
+		{
+			name:       "the ConfigMaps are reordered",
+			configMaps: []string{"pii-rails", "base-rails"},
+			wantChange: true,
+			why:        "every file lands in one directory, so order decides which copy of a duplicate filename wins",
+		},
+		{
+			name:       "the ConfigMaps are unchanged",
+			configMaps: []string{"base-rails", "pii-rails"},
+			wantChange: false,
+			why:        "an unchanged provider must not churn the revision and roll every downstream generation",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := mustComputeRevision(t, provider(c.configMaps...), revisionEndpoint, policy, nil)
+			if c.wantChange && got == base {
+				t.Fatalf("revision is unchanged at %q, but %s", got, c.why)
+			}
+			if !c.wantChange && got != base {
+				t.Fatalf("revision = %q, want the unchanged %q: %s", got, base, c.why)
+			}
+		})
+	}
+}
+
+// TestComputeBindingRevisionBindsConfigMapsToTheirConfiguration proves the
+// pairing is digested, not a flat pool. Swapping the ConfigMaps between two
+// declared configurations leaves the set of names and the set of ConfigMaps
+// both identical, changing only which composes which — so a digest that
+// flattened them would report no change while every check resolved to the
+// other configuration's rules.
+func TestComputeBindingRevisionBindsConfigMapsToTheirConfiguration(t *testing.T) {
+	policy := allowedConsumers{Mode: consumerModeSame}
+	before := mustComputeRevision(t, revisionProviderWithConfigs(
+		nemoConfigEntry{name: "strict", configMaps: []string{"strict-rails"}},
+		nemoConfigEntry{name: "relaxed", configMaps: []string{"relaxed-rails"}},
+	), revisionEndpoint, policy, nil)
+
+	after := mustComputeRevision(t, revisionProviderWithConfigs(
+		nemoConfigEntry{name: "strict", configMaps: []string{"relaxed-rails"}},
+		nemoConfigEntry{name: "relaxed", configMaps: []string{"strict-rails"}},
+	), revisionEndpoint, policy, nil)
+
+	if before == after {
+		t.Fatalf("revision is unchanged at %q after the two configurations exchanged their ConfigMaps; "+
+			"the digest is flattening names and ConfigMaps instead of pairing them", before)
 	}
 }
 

@@ -43,6 +43,13 @@ spec:
                 key: praxis-extproc-image
                 name: ai-gateway-controller-parameters
                 optional: true
+          # Consumer portal OIDC auth proxy image, supplied the same way.
+          - name: RELATED_IMAGE_ODH_KUBE_AUTH_PROXY_IMAGE
+            valueFrom:
+              configMapKeyRef:
+                key: kube-auth-proxy-image
+                name: ai-gateway-controller-parameters
+                optional: true
         image: ai-gateway-controller
         name: manager
         imagePullPolicy: Always
