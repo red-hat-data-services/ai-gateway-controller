@@ -470,6 +470,33 @@ omitted or equal namespace stays local and needs no grant.
   the tenant's own. Model-namespace transport is collected after the reconcile,
   once no HTTPRoute in the namespace uses it.
 
+### Consumer portal auth proxy
+
+`pkg/consumerportal` reconciles the MaaS consumer portal OIDC auth proxy
+(`kube-auth-proxy`) described in ODH-ADR-MS-0008. It watches
+`MaasTenantConfig` and the default `AITenant`, independent of the RHOAI
+Platform `GatewayConfig`. The MVP scope is limited to the default `AITenant`
+in OIDC mode. OpenShift OAuth mode continues to use the existing consumer
+portal route on the RHOAI Platform Gateway and requires no resources from this
+controller.
+
+When the default `AITenant` is ready, has a `status.gatewayRef`, sets
+`spec.oidc.issuerUrl`, and does not set `spec.consumerPortal.enabled: false`,
+the controller applies `config/manifests/consumer-portal/base` into
+`MaasTenantConfig.status.infraNamespace`: a ServiceAccount, Deployment,
+Service, and NetworkPolicy named `maas-consumer-portal-auth-proxy`. The proxy serves
+TLS on port 4180 with a service-ca certificate, trusts
+`odh-trusted-ca-bundle` for the OIDC issuer, and accepts traffic only from the
+tenant Gateway and Authorino. Its OIDC callback is
+`https://<Gateway HTTPS listener hostname>/oauth2/callback`.
+
+The proxy reads its client and cookie secrets from
+`maas-consumer-portal-auth-proxy-creds` in the same namespace. Until that Secret
+exists the controller does not apply the proxy. Because the proxy lives in
+another namespace than its `MaasTenantConfig`, cleanup uses the
+`ai-gateway-controller.opendatahub.io/consumer-portal-cleanup` finalizer and
+deletes only objects labeled as managed by this controller.
+
 ## Scope
 
 ### Phase 1 — `praxis-extproc` install (implemented)
@@ -621,6 +648,9 @@ ai-gateway-controller/
 | `--maas-api-route-name` | `maas-api-route` | Base name; suffixed per tenant like every other resource. Best-effort — exact fidelity depends on maas-api's real HTTPRoute name and Istio's route-naming scheme |
 | `--resync-interval` | `5m` | `RequeueAfter` once a tenant's resources are applied, so drift gets corrected periodically even without a new `AITenant` watch event |
 | `--deletion-timeout` | `10m` | Maximum time to retry praxis-extproc cleanup for a tenant before force-removing `PraxisCleanupFinalizer` without confirming cleanup succeeded; `0` disables the timeout and retries indefinitely |
+| `--kube-auth-proxy-image` | `RELATED_IMAGE_ODH_KUBE_AUTH_PROXY_IMAGE`, else `quay.io/opendatahub/odh-kube-auth-proxy:odh-stable` | Consumer portal auth proxy image |
+| `--consumer-portal-manifest-path` | `/config/manifests/consumer-portal/base` | Kustomize entrypoint for the consumer portal auth proxy |
+| `--authorino-namespace` | `kuadrant-system` | Authorino namespace allowed through the auth proxy NetworkPolicy |
 | `--leader-elect` | `false` | Enable when running multiple replicas |
 | `--metrics-bind-address`, `--health-probe-bind-address` | `:8080`, `:8081` | Standard controller-runtime endpoints |
 

@@ -32,6 +32,7 @@ RUN chmod +x /manager
 # fetch it itself so image builds stay reproducible from a pinned checkout.
 COPY config/manifests/praxis-extproc /config/manifests/praxis-extproc
 COPY config/manifests/external-model /config/manifests/external-model
+COPY config/manifests/consumer-portal /config/manifests/consumer-portal
 RUN chmod -R g=u /config
 
 # Use a non-root user (OpenShift will assign random UID)

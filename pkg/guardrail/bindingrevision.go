@@ -71,11 +71,22 @@ type bindingInputs struct {
 	// ConsumerLabels are the consumer Namespace labels the selector reads.
 	ConsumerLabels map[string]*string `json:"consumerLabels,omitempty"`
 
-	// DeclaredConfigs is every configuration name the provider declares,
-	// sorted. The full set is recorded, not just the ones this policy's checks
+	// DeclaredConfigs is every configuration the provider declares, sorted by
+	// name. The full set is recorded, not just the ones this policy's checks
 	// select: a provider whose configuration list was edited is a changed
 	// dependency, and over-invalidating is the safe direction.
-	DeclaredConfigs []string `json:"declaredConfigs"`
+	DeclaredConfigs []declaredConfig `json:"declaredConfigs"`
+}
+
+// declaredConfig is one entry of the provider's spec.nemoConfigs: the id a
+// check selects through configId, and the ConfigMaps composing it.
+type declaredConfig struct {
+	Name string `json:"name"`
+	// ConfigMaps is recorded in spec order rather than sorted. Every file from
+	// every entry is mounted into one /app/config/<name> directory, so the
+	// order decides which copy of a duplicate filename wins — a reorder is a
+	// behaviour change and must move the digest.
+	ConfigMaps []string `json:"configMaps,omitempty"`
 }
 
 // selectorLabels records the consumer Namespace labels the selector reads.
@@ -126,28 +137,29 @@ func selectorLabels(selector *metav1.LabelSelector, consumerNS *corev1.Namespace
 // bindingInputs — the same construction pkg/envelope uses for content
 // addressing.
 //
-// configs are the provider's declared configuration names, already parsed by
-// evaluateCompatible. endpoint is the provider's discovered checks endpoint,
-// as returned by evaluateNemoReady. consumerNS is the consumer namespace's
-// Namespace object, or nil outside Selector mode, where no labels are read.
+// configs are the provider's declared configurations and the ConfigMaps
+// composing each, already parsed by evaluateCompatible. endpoint is the
+// provider's discovered checks endpoint, as returned by evaluateNemoReady.
+// consumerNS is the consumer namespace's Namespace object, or nil outside
+// Selector mode, where no labels are read.
 //
-// This does not detect every remote change, and must not be documented as if
-// it did. The content of a ConfigMap behind a declared configuration name is
-// not observable from either CR, so editing one changes effective safety
-// while this digest, and every generation in sight, stays constant. Version
-// configuration resources immutably where that distinction matters.
+// Which ConfigMaps compose a configuration is digested; their content is not,
+// and is not observable from either CR. Editing one changes effective safety
+// while this digest, and every generation in sight, stays constant.
 func computeBindingRevision(
 	nemo *unstructured.Unstructured,
-	configs map[string]bool,
+	configs map[string][]string,
 	endpoint string,
 	policy allowedConsumers,
 	consumerNS *corev1.Namespace,
 ) (string, error) {
-	declared := make([]string, 0, len(configs))
-	for name := range configs {
-		declared = append(declared, name)
+	declared := make([]declaredConfig, 0, len(configs))
+	for name, configMaps := range configs {
+		declared = append(declared, declaredConfig{Name: name, ConfigMaps: configMaps})
 	}
-	sort.Strings(declared)
+	// By name only: map iteration is random, while each entry's ConfigMaps
+	// keep the provider's own ordering.
+	sort.Slice(declared, func(i, j int) bool { return declared[i].Name < declared[j].Name })
 
 	payload, err := json.Marshal(bindingInputs{
 		ProviderUID:       string(nemo.GetUID()),

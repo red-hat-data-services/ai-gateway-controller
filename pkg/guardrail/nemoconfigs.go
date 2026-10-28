@@ -26,15 +26,20 @@ import (
 	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 )
 
-// parseNemoConfigs reads the configuration names a provider declares in
-// spec.nemoConfigs[].name. These are the IDs a check selects through
+// parseNemoConfigs reads the configurations a provider declares in
+// spec.nemoConfigs, as a map from each configuration name to the ConfigMaps
+// that compose it. The names are the IDs a check selects through
 // spec.checks[].configId, and the strings Praxis later sends as
 // guardrails.config_ids.
+//
+// The ConfigMap names are read for computeBindingRevision, not for
+// compatibility: changing which ConfigMaps compose a configuration changes
+// effective behaviour under an unchanged configId.
 //
 // An absent spec.nemoConfigs yields an empty set rather than an error. The
 // caller reports that as a provider declaring no configurations, which is a
 // more useful verdict than a parse failure.
-func parseNemoConfigs(nemo *unstructured.Unstructured) (map[string]bool, error) {
+func parseNemoConfigs(nemo *unstructured.Unstructured) (map[string][]string, error) {
 	entries, found, err := unstructured.NestedSlice(nemo.Object, "spec", "nemoConfigs")
 	if err != nil {
 		return nil, fmt.Errorf("spec.nemoConfigs is malformed: %w", err)
@@ -43,7 +48,7 @@ func parseNemoConfigs(nemo *unstructured.Unstructured) (map[string]bool, error) 
 		return nil, nil
 	}
 
-	configs := make(map[string]bool, len(entries))
+	configs := make(map[string][]string, len(entries))
 	for i, entry := range entries {
 		config, ok := entry.(map[string]any)
 		if !ok {
@@ -53,7 +58,13 @@ func parseNemoConfigs(nemo *unstructured.Unstructured) (map[string]bool, error) 
 		if err != nil {
 			return nil, fmt.Errorf("spec.nemoConfigs[%d].name is malformed: %w", i, err)
 		}
-		configs[name] = true
+		// Names only, read off the provider CR already in hand; the ConfigMaps
+		// themselves are never fetched.
+		configMaps, _, err := unstructured.NestedStringSlice(config, "configMaps")
+		if err != nil {
+			return nil, fmt.Errorf("spec.nemoConfigs[%d].configMaps is malformed: %w", i, err)
+		}
+		configs[name] = configMaps
 	}
 	return configs, nil
 }
@@ -66,9 +77,10 @@ type compatibility struct {
 	Compatible bool
 	Reason     string
 	Message    string
-	// Configs are the names the provider declares, set whenever the parse
-	// succeeded. computeBindingRevision digests them.
-	Configs map[string]bool
+	// Configs maps each configuration name the provider declares to the
+	// ConfigMaps composing it, set whenever the parse succeeded. Only the
+	// names are compared here; computeBindingRevision digests both.
+	Configs map[string][]string
 	// Err is the parse failure behind reasonInvalidProviderConfigs, for the
 	// caller to log. It must not reach Message: apimachinery accessor errors
 	// embed the value they rejected, which is the provider's own spec.
@@ -104,7 +116,7 @@ func evaluateCompatible(guardrail *aigatewayv1alpha1.AIGuardrail, nemo *unstruct
 	var unknown []string
 	reported := make(map[string]bool)
 	for _, check := range guardrail.Spec.Checks {
-		if configs[check.ConfigID] || reported[check.ConfigID] {
+		if _, declared := configs[check.ConfigID]; declared || reported[check.ConfigID] {
 			continue
 		}
 		reported[check.ConfigID] = true

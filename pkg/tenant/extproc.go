@@ -247,7 +247,7 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, tenant
 	if err := unstructured.SetNestedStringMap(configMap.Object, data, "data"); err != nil {
 		return fmt.Errorf("write post-auth ExtProc ConfigMap data: %w", err)
 	}
-	if err := configureExternalModelRequestOrdering(resources, tenantID, apiTranslationEnabled); err != nil {
+	if err := configureExternalModelRequestOrdering(resources, tenantID); err != nil {
 		return err
 	}
 	configHash := sha256.Sum256([]byte(config))
@@ -311,10 +311,10 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, tenant
 	return nil
 }
 
-// configureExternalModelRequestOrdering enables early body delivery only for
-// translation-enabled tenants. Flag-off tenants retain the main Envoy request
-// ordering, including during a translation on-to-off reconciliation.
-func configureExternalModelRequestOrdering(resources []unstructured.Unstructured, tenantID string, apiTranslationEnabled bool) error {
+// configureExternalModelRequestOrdering removes early body delivery. The route
+// uses BUFFERED mode when translation is enabled, so Envoy supplies a complete
+// body without deferring its header response.
+func configureExternalModelRequestOrdering(resources []unstructured.Unstructured, tenantID string) error {
 	wantFilter := PayloadProcessingExternalModelFilterNameForTenant(tenantID)
 	filterFound := false
 	patched := 0
@@ -343,13 +343,7 @@ func configureExternalModelRequestOrdering(resources []unstructured.Unstructured
 			if !found || name != "envoy.filters.http.ext_proc.external-model" {
 				continue
 			}
-			if apiTranslationEnabled {
-				if err := unstructured.SetNestedField(patch, true, "patch", "value", "typed_config", "send_body_without_waiting_for_header_response"); err != nil {
-					return fmt.Errorf("enable early ExternalModel body delivery in patch %d: %w", patchIndex, err)
-				}
-			} else {
-				unstructured.RemoveNestedField(patch, "patch", "value", "typed_config", "send_body_without_waiting_for_header_response")
-			}
+			unstructured.RemoveNestedField(patch, "patch", "value", "typed_config", "send_body_without_waiting_for_header_response")
 			patched++
 		}
 		if err := unstructured.SetNestedSlice(filter.Object, patches, "spec", "configPatches"); err != nil {

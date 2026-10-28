@@ -18,6 +18,7 @@ package guardrail
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -184,6 +185,45 @@ func TestEvaluateCompatibleMessageIsStable(t *testing.T) {
 	}
 }
 
+// TestParseNemoConfigsReadsConfigMapsPerConfiguration pins what the parse
+// hands to computeBindingRevision. The ConfigMaps are kept against the
+// configuration they compose and in the provider's own order, because the
+// digest treats a reorder as a change: every file is mounted into one
+// directory, so the order decides which copy of a duplicate filename wins.
+func TestParseNemoConfigsReadsConfigMapsPerConfiguration(t *testing.T) {
+	provider := nemoWithRawConfigs([]any{
+		map[string]any{"name": "strict", "configMaps": []any{"base-rails", "pii-rails"}},
+		map[string]any{"name": "relaxed", "configMaps": []any{"relaxed-rails"}},
+		// Valid against the CRD only as a degenerate case, but the parse reads
+		// unstructured and must not invent an entry or fail the whole provider.
+		map[string]any{"name": "declared-without-configmaps"},
+	})
+
+	configs, err := parseNemoConfigs(provider)
+	if err != nil {
+		t.Fatalf("parseNemoConfigs: %v", err)
+	}
+
+	want := map[string][]string{
+		"strict":                      {"base-rails", "pii-rails"},
+		"relaxed":                     {"relaxed-rails"},
+		"declared-without-configmaps": nil,
+	}
+	if len(configs) != len(want) {
+		t.Fatalf("parsed %d configurations, want %d: %v", len(configs), len(want), configs)
+	}
+	for name, wantConfigMaps := range want {
+		gotConfigMaps, declared := configs[name]
+		if !declared {
+			t.Errorf("configuration %q is missing; checks selecting it would be reported as unknown", name)
+			continue
+		}
+		if !slices.Equal(gotConfigMaps, wantConfigMaps) {
+			t.Errorf("configuration %q composed of %v, want %v", name, gotConfigMaps, wantConfigMaps)
+		}
+	}
+}
+
 // TestEvaluateCompatibleRejectsProvidersDeclaringNothing keeps a provider with
 // no configurations from being read as "nothing to check, therefore fine".
 func TestEvaluateCompatibleRejectsProvidersDeclaringNothing(t *testing.T) {
@@ -222,6 +262,18 @@ func TestEvaluateCompatibleRejectsMalformedConfigs(t *testing.T) {
 		{"spec.nemoConfigs is not a list", nemoWithRawConfigs(providerSecret)},
 		{"an entry is not an object", nemoWithRawConfigs([]any{providerSecret})},
 		{"a name is not a string", nemoWithRawConfigs([]any{map[string]any{"name": []any{providerSecret}}})},
+		{
+			name: "configMaps is not a list",
+			provider: nemoWithRawConfigs([]any{
+				map[string]any{"name": "jailbreak-v1", "configMaps": providerSecret},
+			}),
+		},
+		{
+			name: "a configMaps entry is not a string",
+			provider: nemoWithRawConfigs([]any{
+				map[string]any{"name": "jailbreak-v1", "configMaps": []any{map[string]any{"name": providerSecret}}},
+			}),
+		},
 		{
 			name:     "a later entry is malformed",
 			provider: nemoWithRawConfigs([]any{map[string]any{"name": "jailbreak-v1"}, providerSecret}),

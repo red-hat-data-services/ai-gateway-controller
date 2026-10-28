@@ -90,7 +90,7 @@ func TestConfigureExternalModelExtProcProjectsReferencesAndTrustedHandoff(t *tes
 	if strings.Contains(config, "allow_unbounded_body: true") {
 		t.Fatal("dedicated ExternalModel ExtProc must enforce its configured body accumulation ceiling")
 	}
-	assertExternalModelEarlyBodyDelivery(t, resources[2], true)
+	assertExternalModelEarlyBodyDelivery(t, resources[2], false)
 	volumes, _, err := unstructured.NestedSlice(resources[1].Object, "spec", "template", "spec", "volumes")
 	if err != nil {
 		t.Fatal(err)
@@ -470,7 +470,7 @@ func TestTranslationSettingsToggleWithoutStaleRenderedState(t *testing.T) {
 		if strings.Contains(sharedConfig, "anthropic_messages_to_chat_completions") != enabled {
 			t.Fatalf("shared translation filters stale for enabled=%t:\n%s", enabled, sharedConfig)
 		}
-		assertExternalModelEarlyBodyDelivery(t, resources[5], enabled)
+		assertExternalModelEarlyBodyDelivery(t, resources[5], false)
 		if strings.Contains(externalConfig, "api_translation_enabled: true") != enabled ||
 			strings.Contains(externalConfig, "openai_chat_completions_to_anthropic_stream") != enabled ||
 			strings.Contains(externalConfig, "openai_chat_completions_to_anthropic\n") != enabled {

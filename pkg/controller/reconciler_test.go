@@ -125,7 +125,12 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes[:1]); err != nil {
 		t.Fatal(err)
 	}
-	assertOpenAIOnlyRouteResponseMode(t, nestedSlice(t, applied.Object, "spec", "configPatches"))
+	assertOpenAIOnlyRouteModes(t, nestedSlice(t, applied.Object, "spec", "configPatches"), "STREAMED")
+	routes[0].APITranslationEnabled = true
+	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes[:1]); err != nil {
+		t.Fatal(err)
+	}
+	assertOpenAIOnlyRouteModes(t, nestedSlice(t, applied.Object, "spec", "configPatches"), "BUFFERED")
 }
 
 func assertExternalModelRoutePatches(
@@ -154,7 +159,7 @@ func assertExternalModelRoutePatches(
 		}
 		expectedRoutes[match] = true
 		routePatchCount++
-		assertExternalModelRouteExtProcPatch(t, patch, match, expectedResponseModeByRoute[match])
+		assertExternalModelRouteExtProcPatch(t, patch, match, "BUFFERED", expectedResponseModeByRoute[match])
 	}
 	if routePatchCount != expectedCount {
 		t.Fatalf("ExternalModel route patches = %d, generated HTTPRoute rules = %d", routePatchCount, expectedCount)
@@ -177,7 +182,7 @@ func assertExternalModelRoutePatches(
 	}
 }
 
-func assertOpenAIOnlyRouteResponseMode(t *testing.T, patches []any) {
+func assertOpenAIOnlyRouteModes(t *testing.T, patches []any, wantRequestMode string) {
 	t.Helper()
 	for _, raw := range patches {
 		patch, ok := raw.(map[string]any)
@@ -188,10 +193,14 @@ func assertOpenAIOnlyRouteResponseMode(t *testing.T, patches []any) {
 		if err != nil || !found || mode != "NONE" {
 			t.Fatalf("OpenAI-only route response mode = %q found=%t err=%v, want NONE", mode, found, err)
 		}
+		requestMode, found, err := unstructured.NestedString(patch, "patch", "value", "typed_per_filter_config", externalModelExtProcFilter, "overrides", "processing_mode", "request_body_mode")
+		if err != nil || !found || requestMode != wantRequestMode {
+			t.Fatalf("OpenAI request mode = %q found=%t err=%v, want %s", requestMode, found, err, wantRequestMode)
+		}
 	}
 }
 
-func assertExternalModelRouteExtProcPatch(t *testing.T, patch map[string]any, routeName, responseMode string) {
+func assertExternalModelRouteExtProcPatch(t *testing.T, patch map[string]any, routeName, requestMode, responseMode string) {
 	t.Helper()
 	overrides, found, err := unstructured.NestedMap(patch, "patch", "value", "typed_per_filter_config", externalModelExtProcFilter, "overrides")
 	if err != nil || !found {
@@ -199,8 +208,8 @@ func assertExternalModelRouteExtProcPatch(t *testing.T, patch map[string]any, ro
 	}
 	mode, found, err := unstructured.NestedMap(overrides, "processing_mode")
 	if err != nil || !found || mode["request_header_mode"] != "SEND" ||
-		mode["request_body_mode"] != "STREAMED" || mode["response_body_mode"] != responseMode {
-		t.Fatalf("route %q processing mode=%#v found=%t err=%v, want streamed requests and provider-scoped response mode", routeName, mode, found, err)
+		mode["request_body_mode"] != requestMode || mode["response_body_mode"] != responseMode {
+		t.Fatalf("route %q processing mode=%#v found=%t err=%v, want request=%s response=%s", routeName, mode, found, err, requestMode, responseMode)
 	}
 	sharedDisabled, found, err := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp", "disabled")
 	if err != nil || !found || !sharedDisabled {
