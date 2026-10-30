@@ -16,9 +16,17 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+)
+
+const (
+	// ProviderPortAnnotation configures the TLS port for an ExternalProvider
+	// endpoint.
+	ProviderPortAnnotation = "inference.opendatahub.io/port"
+	defaultProviderPort    = int64(443)
 )
 
 // SkipReason classifies why a single provider ref was excluded from a
@@ -92,6 +100,10 @@ type Route struct {
 	Cluster string
 	// Endpoint is the provider FQDN (for HTTPRoute Host rewrite).
 	Endpoint string
+	// Port is the validated provider transport port. Zero means unset:
+	// ProviderPort never returns 0, so this only occurs in hand-built
+	// Route literals, and renders as the endpoint/default port.
+	Port int64
 	// TLSCACertificates is an optional absolute path already mounted in the
 	// calling proxy. It is a file path only; the controller never reads or
 	// stores certificate bytes. This supports private test/provider CAs while
@@ -115,6 +127,23 @@ type Route struct {
 	// inherited auth of a provider in another namespace, or the tenant
 	// namespace for a controller-owned credential copy. Empty means Namespace.
 	SecretNamespace string
+}
+
+// ProviderPort returns the validated ExternalProvider transport port. An
+// omitted annotation retains the HTTPS default of 443.
+func ProviderPort(provider *v1alpha1.ExternalProvider) (int64, error) {
+	if provider == nil || provider.Annotations == nil {
+		return defaultProviderPort, nil
+	}
+	raw, found := provider.Annotations[ProviderPortAnnotation]
+	if !found {
+		return defaultProviderPort, nil
+	}
+	port, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("%s must be an integer from 1 to 65535", ProviderPortAnnotation)
+	}
+	return port, nil
 }
 
 // AuthType returns the auth strategy of a CRD auth.type. "simple", which the
@@ -226,6 +255,39 @@ func ResolveAllWithAPITranslation(models []*v1alpha1.ExternalModel, providers []
 	return resolve(models, providers, true, enabled)
 }
 
+// resolveRefTransport validates and resolves the transport-level config for
+// one ExternalProviderRef: the shared provider TLS CA, the templated
+// request path, and the provider's transport port.
+func resolveRefTransport(prov *v1alpha1.ExternalProvider, ref v1alpha1.ExternalProviderRef) (path, caCertificates string, port int64, err error) {
+	providerCA := strings.TrimSpace(prov.Spec.Config["tls.caCertificates"])
+	if modelCA, configured := ref.Config["tls.caCertificates"]; configured && strings.TrimSpace(modelCA) != providerCA {
+		return "", "", 0, fmt.Errorf("tls.caCertificates cannot override ExternalProvider %s because provider transport is shared; configure it on the ExternalProvider", prov.Name)
+	}
+
+	cfg := mergeConfig(prov.Spec.Config, ref.Config)
+	caCertificates = strings.TrimSpace(cfg["tls.caCertificates"])
+	if caCertificates != "" && (!strings.HasPrefix(caCertificates, "/") || strings.Contains(caCertificates, "..")) {
+		return "", "", 0, errors.New("tls.caCertificates must be an absolute mounted file path")
+	}
+	path, err = resolvePath(ref.Path, ref.TargetModel, cfg)
+	if err != nil {
+		// IPP #368: unresolved placeholders are a reconcile-time
+		// error, never a request-time surprise. Hard-fail the call.
+		return "", "", 0, err
+	}
+	if strings.TrimSpace(ref.TargetModel) == "" || len(ref.TargetModel) > 256 || strings.ContainsAny(ref.TargetModel, "\r\n\x00") {
+		return "", "", 0, errors.New("targetModel must be 1-256 printable bytes")
+	}
+	if path == "" || len(path) > 2048 || !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "?#\r\n\x00") {
+		return "", "", 0, errors.New("resolved path must be a valid absolute path")
+	}
+	port, err = ProviderPort(prov)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return path, caCertificates, port, nil
+}
+
 func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider, includeDisabled, translationEnabled bool) (*ResolvedRouteSet, error) {
 	type provKey struct{ ns, name string }
 	byKey := make(map[provKey]*v1alpha1.ExternalProvider, len(providers))
@@ -310,27 +372,9 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				activeProviders[key] = true
 			}
 
-			providerCA := strings.TrimSpace(prov.Spec.Config["tls.caCertificates"])
-			if modelCA, configured := ref.Config["tls.caCertificates"]; configured && strings.TrimSpace(modelCA) != providerCA {
-				return nil, fmt.Errorf("resolver: model %s ref %s: tls.caCertificates cannot override ExternalProvider %s because provider transport is shared; configure it on the ExternalProvider", mref, ref.Ref.Name, prov.Name)
-			}
-
-			cfg := mergeConfig(prov.Spec.Config, ref.Config)
-			caCertificates := strings.TrimSpace(cfg["tls.caCertificates"])
-			if caCertificates != "" && (!strings.HasPrefix(caCertificates, "/") || strings.Contains(caCertificates, "..")) {
-				return nil, fmt.Errorf("resolver: model %s ref %s: tls.caCertificates must be an absolute mounted file path", mref, ref.Ref.Name)
-			}
-			path, err := resolvePath(ref.Path, ref.TargetModel, cfg)
+			path, caCertificates, port, err := resolveRefTransport(prov, ref)
 			if err != nil {
-				// IPP #368: unresolved placeholders are a reconcile-time
-				// error, never a request-time surprise. Hard-fail the call.
 				return nil, fmt.Errorf("resolver: model %s ref %s: %w", mref, ref.Ref.Name, err)
-			}
-			if strings.TrimSpace(ref.TargetModel) == "" || len(ref.TargetModel) > 256 || strings.ContainsAny(ref.TargetModel, "\r\n\x00") {
-				return nil, fmt.Errorf("resolver: model %s ref %s: targetModel must be 1-256 printable bytes", mref, ref.Ref.Name)
-			}
-			if path == "" || len(path) > 2048 || !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "?#\r\n\x00") {
-				return nil, fmt.Errorf("resolver: model %s ref %s: resolved path must be a valid absolute path", mref, ref.Ref.Name)
 			}
 
 			// Inherited auth uses the provider-local Secret; a model override
@@ -349,6 +393,7 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				ProviderNamespace:     prov.Namespace,
 				ProviderType:          prov.Spec.Provider,
 				Endpoint:              prov.Spec.Endpoint,
+				Port:                  port,
 				TLSCACertificates:     caCertificates,
 				TargetModel:           ref.TargetModel,
 				APIFormat:             ref.APIFormat,
