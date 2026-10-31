@@ -4,10 +4,11 @@ approvers:
   - ishitasequeira
   - chaitanya1731
   - ryancham715
-  - shaneutt
   - aslakknutsen
   - pierDipi
   - bartoszmajsak
+  - didierofrivia
+  - crstrn13
 reviewers:
   - nerdalert
   - jland-redhat
@@ -18,3 +19,5 @@ reviewers:
   - aslakknutsen
   - pierDipi
   - bartoszmajsak
+  - didierofrivia
+  - crstrn13

@@ -8,10 +8,59 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
+
+func TestMaasTenantConfigSchemaPreservesAPITranslation(t *testing.T) {
+	admin := startEnvironment(t, func(ctrl.Manager) {})
+	createNamespace(t, admin, "translation-schema")
+	mtc := tenant.NewMaasTenantConfig()
+	mtc.SetName(tenant.MaasTenantConfigInstanceName)
+	mtc.SetNamespace("translation-schema")
+	mtc.Object["spec"] = map[string]any{"apiTranslation": map[string]any{"enabled": true}}
+	require.NoError(t, admin.Create(t.Context(), mtc))
+	stored := tenant.NewMaasTenantConfig()
+	require.NoError(t, admin.Get(t.Context(), client.ObjectKeyFromObject(mtc), stored))
+	enabled, err := tenant.APITranslationEnabled(stored)
+	require.NoError(t, err)
+	require.True(t, enabled, "API server pruned spec.apiTranslation.enabled")
+}
+
+func TestAITenantSchemaPreservesCookieExpire(t *testing.T) {
+	admin := startEnvironment(t, func(ctrl.Manager) {})
+	createNamespace(t, admin, "cookie-expire-schema")
+	ait := tenant.NewAITenant()
+	ait.SetName("cookie-expire-tenant")
+	ait.SetNamespace(maasNamespace)
+	ait.Object["spec"] = map[string]any{
+		"oidc": map[string]any{
+			"issuerUrl":    "https://keycloak.example.com/realms/maas",
+			"clientId":     "maas-consumer-portal",
+			"cookieExpire": "8h",
+		},
+	}
+	require.NoError(t, admin.Create(t.Context(), ait))
+	stored := tenant.NewAITenant()
+	require.NoError(t, admin.Get(t.Context(), client.ObjectKeyFromObject(ait), stored))
+	expire, _, err := unstructured.NestedString(stored.Object, "spec", "oidc", "cookieExpire")
+	require.NoError(t, err)
+	require.Equal(t, "8h", expire, "API server pruned spec.oidc.cookieExpire")
+
+	// The cross-field rule compares effective defaults: a cookie lifetime at
+	// or below the 4m default refresh interval must be rejected.
+	ait.Object["spec"] = map[string]any{
+		"oidc": map[string]any{
+			"issuerUrl":    "https://keycloak.example.com/realms/maas",
+			"clientId":     "maas-consumer-portal",
+			"cookieExpire": "2m",
+		},
+	}
+	err = admin.Update(t.Context(), ait)
+	require.ErrorContains(t, err, "cookieExpire must be longer than refreshInterval")
+}
 
 // maasFixture supplies the external tenant state consumed by this controller.
 // It emits API objects; it does not run or simulate MaaS reconciliation.

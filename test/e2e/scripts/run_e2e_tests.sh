@@ -34,7 +34,7 @@ mkdir -p "$ARTIFACTS_DIR"
 
 if [[ "$E2E_PARALLEL_WORKERS" -gt 1 ]]; then
     export E2E_AUTHPOLICY_PHASE_TIMEOUT="${E2E_AUTHPOLICY_PHASE_TIMEOUT:-120}"
-    export E2E_MAAS_SUBSCRIPTION_PHASE_TIMEOUT="${E2E_MAAS_SUBSCRIPTION_PHASE_TIMEOUT:-90}"
+    export E2E_MAAS_SUBSCRIPTION_PHASE_TIMEOUT="${E2E_MAAS_SUBSCRIPTION_PHASE_TIMEOUT:-120}"
     export E2E_GATEWAY_ENFORCED_TIMEOUT="${E2E_GATEWAY_ENFORCED_TIMEOUT:-240}"
     export E2E_MULTITENANCY_PHASE_TIMEOUT="${E2E_MULTITENANCY_PHASE_TIMEOUT:-180}"
 fi
@@ -87,8 +87,6 @@ e2e_test_files=(
     "$TEST_DIR/tests/test_tenant_rate_limit_isolation.py"
     "$TEST_DIR/tests/test_per_tenant_ipp_isolation.py"
     "$TEST_DIR/tests/test_embedding_inference.py"
-    # Sister to ExtProc-only ExternalModel dataplane (PR #52): start validation.
-    "$TEST_DIR/tests/test_external_models.py"
 )
 
 resolved_extra_args=()

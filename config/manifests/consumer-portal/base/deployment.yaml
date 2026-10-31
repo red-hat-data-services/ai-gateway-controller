@@ -1,0 +1,127 @@
+# OIDC session service for the consumer portal. Authorino validates browser
+# sessions against its /oauth2/auth endpoint; the Gateway routes /oauth2
+# sign-in, callback, and logout traffic to it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maas-consumer-portal-auth-proxy
+  labels:
+    app.kubernetes.io/name: maas-consumer-portal-auth-proxy
+    app.kubernetes.io/part-of: maas-consumer-portal
+spec:
+  # replicas is omitted so admins can scale the proxy without the controller
+  # reverting it; the API server defaults a new Deployment to 1.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: maas-consumer-portal-auth-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: maas-consumer-portal-auth-proxy
+        app.kubernetes.io/part-of: maas-consumer-portal
+    spec:
+      serviceAccountName: maas-consumer-portal-auth-proxy
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kube-auth-proxy
+          image: CONSUMER_PORTAL_AUTH_PROXY_IMAGE
+          args:
+            - --https-address=0.0.0.0:4180
+            # Plain HTTP stays on loopback; only TLS is reachable in-cluster.
+            - --http-address=127.0.0.1:4181
+            - --metrics-address=0.0.0.0:9000
+            - --tls-cert-file=/etc/tls/private/tls.crt
+            - --tls-key-file=/etc/tls/private/tls.key
+            - --tls-min-version=TLS1.2
+            - --provider=oidc
+            - --oidc-issuer-url=CONSUMER_PORTAL_OIDC_ISSUER_URL
+            - --scope=openid email profile
+            - --oidc-email-claim=email
+            - --oidc-groups-claim=groups
+            - --email-domain=*
+            - --upstream=static://200
+            - --reverse-proxy=true
+            - --skip-provider-button
+            - --pass-access-token=true
+            - --set-xauthrequest=true
+            # --provider-ca-file is added per non-empty odh-trusted-ca-bundle key
+            # at render time; an empty CA file stops the proxy from starting.
+            - --use-system-trust-store=true
+            - --ssl-insecure-skip-verify=false
+            - --redirect-url=CONSUMER_PORTAL_REDIRECT_URL
+            - --cookie-domain=CONSUMER_PORTAL_COOKIE_DOMAIN
+            - --cookie-name=_maas_consumer_proxy
+            - --cookie-expire=CONSUMER_PORTAL_COOKIE_EXPIRE
+            - --cookie-refresh=CONSUMER_PORTAL_COOKIE_REFRESH
+            - --cookie-secure=true
+            - --cookie-httponly=true
+            - --cookie-samesite=lax
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: maas-consumer-portal-auth-proxy-creds
+                  key: OAUTH2_PROXY_CLIENT_ID
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: maas-consumer-portal-auth-proxy-creds
+                  key: OAUTH2_PROXY_CLIENT_SECRET
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: maas-consumer-portal-auth-proxy-creds
+                  key: OAUTH2_PROXY_COOKIE_SECRET
+          ports:
+            - name: https
+              containerPort: 4180
+            - name: metrics
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: https
+              scheme: HTTPS
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: https
+              scheme: HTTPS
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/tls/private
+              readOnly: true
+            - name: trusted-ca
+              mountPath: /etc/pki/odh-trusted-ca
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tls
+          secret:
+            secretName: maas-consumer-portal-auth-proxy-tls
+        - name: trusted-ca
+          configMap:
+            name: odh-trusted-ca-bundle
+            optional: true
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 10Mi

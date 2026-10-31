@@ -19,6 +19,8 @@ package tenant
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -38,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
@@ -139,7 +142,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 		}
 	}
 	writeOverlay(live)
-	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system")
+	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +155,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	if err := fakeClient.Create(ctx, later); err != nil {
 		t.Fatal(err)
 	}
-	_, required, err = r.providersForTenant(ctx, namespace, "gateway", "gateway-system")
+	_, required, err = r.providersForTenant(ctx, namespace, "gateway", "gateway-system", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,9 +169,103 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	if ready, reason, err := r.routingOverlayReady(ctx, namespace, required); err != nil || !ready {
 		t.Fatalf("overlay after later provider publication: ready=%t reason=%q err=%v", ready, reason, err)
 	}
-	candidates, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system")
+	candidates, _, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system", false)
 	if err != nil || len(candidates) != 2 {
 		t.Fatalf("ExtProc runtime candidates = %#v, err=%v; want live and later", candidates, err)
+	}
+}
+
+func TestDisabledAnthropicTranslationDoesNotBlockAttachmentOnlyOverlay(t *testing.T) {
+	ctx := context.Background()
+	const namespace = "tenant-ns"
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "home-model", Namespace: namespace},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref:         v1alpha1.ExternalProviderReference{Name: "anthropic"},
+			TargetModel: "claude", APIFormat: "messages", Path: "/v1/messages",
+		}}},
+	}
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic", Namespace: namespace},
+		Spec:       v1alpha1.ExternalProviderSpec{Provider: "anthropic", Endpoint: "anthropic.example.com"},
+		Status:     v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	attachment := envelope.Candidate{
+		Cluster: "provider-openai", StableID: "attached/model/provider-openai",
+		Kind: "inference_model", Name: "attached", Site: "local", Fresh: true,
+		APIFormat: "openai-chat", Path: "/v1/chat/completions", TargetModel: "mock-openai-model",
+	}
+	rendered, err := envelope.Render(&resolver.ResolvedRouteSet{}, envelope.Scope{
+		Network: "external-model", Gateway: "gateway", Namespace: namespace, LocalSite: "local",
+	}, envelope.Revision{}, envelope.Options{PreservedCandidates: []envelope.Candidate{attachment}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: praxisOverlayName, Namespace: namespace,
+			Labels: map[string]string{managedByLabel: render.FieldOwner}},
+		Data: map[string]string{praxisOverlayDataKey: string(raw)},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, provider, configMap).Build()
+	r := &Reconciler{Client: fakeClient}
+
+	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(required) != 0 {
+		t.Fatalf("disabled Anthropic binding required in overlay = %#v, want no home providers", required)
+	}
+	ready, reason, err := r.routingOverlayReady(ctx, namespace, required)
+	if err != nil || !ready {
+		t.Fatalf("attachment-only overlay readiness with translation disabled: ready=%t reason=%q err=%v", ready, reason, err)
+	}
+
+	_, required, err = r.providersForTenant(ctx, namespace, "gateway", "gateway-system", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(required) != 1 || !required["anthropic"] {
+		t.Fatalf("enabled Anthropic binding required providers = %#v, want anthropic", required)
+	}
+	ready, reason, err = r.routingOverlayReady(ctx, namespace, required)
+	if err != nil || ready || !strings.Contains(reason, "provider anthropic") {
+		t.Fatalf("enabled Anthropic binding without its candidate: ready=%t reason=%q err=%v, want not ready", ready, reason, err)
+	}
+
+	// The tenant still has an ExternalModel, so it enters the serving path. Its
+	// only home binding is intentionally skipped while translation is disabled;
+	// the published attachment must still drive the tenant ExtProc config.
+	homeCandidates, policyExcludedOnly, homeErr := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system", false)
+	if !errors.Is(homeErr, resolver.ErrNoRoutes) || !policyExcludedOnly {
+		t.Fatalf("disabled Anthropic runtime candidates error = %v, policyExcludedOnly = %t; want ErrNoRoutes from policy exclusion", homeErr, policyExcludedOnly)
+	}
+	runtimeCandidates, err := combineRuntimeCandidates(homeCandidates, []envelope.Candidate{attachment}, homeErr, policyExcludedOnly)
+	if err != nil || len(runtimeCandidates) != 1 || runtimeCandidates[0].StableID != attachment.StableID {
+		t.Fatalf("attachment-only ExtProc runtime candidates = %#v, err=%v; want the served attachment", runtimeCandidates, err)
+	}
+	if candidates, err := combineRuntimeCandidates(homeCandidates, nil, homeErr, policyExcludedOnly); err != nil || len(candidates) != 0 {
+		t.Fatalf("disabled home binding without an attachment = %#v, error = %v; want empty candidate set for cleanup", candidates, err)
+	}
+}
+
+func TestMissingHomeProviderKeepsRuntimeConfiguration(t *testing.T) {
+	set, err := resolver.ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{{
+		ObjectMeta: metav1.ObjectMeta{Name: "home", Namespace: "tenant-ns"},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: "missing"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}},
+	}}, nil, false)
+	if !errors.Is(err, resolver.ErrNoRoutes) || allRuntimeRoutesExcludedByPolicy(set) {
+		t.Fatalf("missing provider: error = %v, policyExcludedOnly = %t", err, allRuntimeRoutesExcludedByPolicy(set))
+	}
+	attachment := []envelope.Candidate{{StableID: "attached/model/provider"}}
+	if _, err := combineRuntimeCandidates(nil, attachment, err, allRuntimeRoutesExcludedByPolicy(set)); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("missing home provider with attachment error = %v, want ErrNoRoutes to retain last config", err)
 	}
 }
 
@@ -194,7 +291,7 @@ func TestCleanupExternalModelResourcesRemovesCredentialWorkload(t *testing.T) {
 		owned(gvkEnvoyFilter, PayloadProcessingExternalModelEnvoyFilterName(tenantID), gatewayNamespace),
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
-	r := &Reconciler{Client: fakeClient}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
 	if err := r.cleanupExternalModelResources(context.Background(), tenantID, gatewayNamespace, tenantNamespace); err != nil {
 		t.Fatalf("cleanupExternalModelResources: %v", err)
 	}
@@ -320,6 +417,7 @@ func withDeletionTimestamp(u *unstructured.Unstructured) *unstructured.Unstructu
 type recorder struct {
 	mu                 sync.Mutex
 	resourcePatchNames []string
+	resourcePatchKinds []string
 	mtcPatches         int
 	mtcUpdates         int
 	deletedNames       []string
@@ -342,6 +440,7 @@ func (r *recorder) funcs() interceptor.Funcs {
 			}
 			r.mu.Lock()
 			r.resourcePatchNames = append(r.resourcePatchNames, obj.GetName())
+			r.resourcePatchKinds = append(r.resourcePatchKinds, obj.GetObjectKind().GroupVersionKind().Kind)
 			r.mu.Unlock()
 			return nil
 		},
@@ -370,6 +469,12 @@ func (r *recorder) snapshot() (resourcePatchNames []string, mtcPatches int, dele
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.resourcePatchNames...), r.mtcPatches, append([]string(nil), r.deletedNames...)
+}
+
+func (r *recorder) kindSnapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.resourcePatchKinds...)
 }
 
 func requireManifests(t *testing.T) {
@@ -435,8 +540,8 @@ func TestReconcileAddsFinalizerAndRequeuesWhenGatewayRefMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, mtcPatches, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -492,6 +597,43 @@ func TestReconcileAppliesWhenPendingWithGatewayRef(t *testing.T) {
 	}
 }
 
+func TestReconcileAppliesSharedResourcesWithOnlyDisabledMessagesModel(t *testing.T) {
+	requireManifests(t)
+	const namespace = "tenant-ns"
+	mtc := withMarker(newMTC(namespace, "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	if err := unstructured.SetNestedMap(mtc.Object, map[string]any{"enabled": false}, "spec", "apiTranslation"); err != nil {
+		t.Fatal(err)
+	}
+	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", namespace, namespace)
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "messages-only", Namespace: namespace},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: "anthropic"}, TargetModel: "claude", APIFormat: "messages", Path: "/v1/messages",
+		}}},
+	}
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic", Namespace: namespace},
+		Spec:       v1alpha1.ExternalProviderSpec{Provider: "anthropic", Endpoint: "anthropic.example.com"},
+		Status:     v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).
+		WithObjects(mtc, aitenant, newGateway("my-gateway", namespace), model, provider).
+		WithInterceptorFuncs(rec.funcs()).Build()
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
+	res, err := r.Reconcile(context.Background(), mtcRequest(namespace))
+	if err != nil || res.RequeueAfter != time.Hour {
+		t.Fatalf("Messages-only tenant reconcile: result=%#v err=%v, want shared resources applied", res, err)
+	}
+	patched, _, _ := rec.snapshot()
+	if !slices.Contains(patched, PayloadProcessingPluginsConfigMapForTenant("redteam")) {
+		t.Fatalf("shared ExtProc config was not applied: %v", patched)
+	}
+	if slices.Contains(patched, PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam")) {
+		t.Fatalf("disabled Messages model unexpectedly installed ExternalModel ExtProc: %v", patched)
+	}
+}
+
 func TestReconcileRequeuesShortlyWhenActiveButGatewayRefNotReady(t *testing.T) {
 	scheme := mtcSchemeForTests()
 	mtc := newMTC("ai-tenant-redteam", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants")
@@ -504,8 +646,8 @@ func TestReconcileRequeuesShortlyWhenActiveButGatewayRefNotReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -528,8 +670,8 @@ func TestReconcileRequeuesWhenGatewayObjectMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -552,8 +694,8 @@ func TestReconcileRequeuesWhenAITenantStatusIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -576,8 +718,8 @@ func TestReconcileRequeuesWhenAITenantFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -610,7 +752,6 @@ func TestAITenantStillValidForApply(t *testing.T) {
 		u.SetUID(types.UID(uid))
 		return u
 	}
-
 	cases := []struct {
 		name    string
 		objects []client.Object
@@ -632,6 +773,10 @@ func TestAITenantStillValidForApply(t *testing.T) {
 		{"gateway dropped (live gatewayRef unset)", []client.Object{mtc, withUID(newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "", "", "tenant-ns"), "uid-1")}, mtc, "uid-1", false},
 		{"ownership bind lost (live tenantNamespace differs)", []client.Object{mtc,
 			withUID(newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "other-ns"), "uid-1")}, mtc, "uid-1", false},
+		// Phase alone does not invalidate: "matching uid, terminating" above
+		// stays valid, because the phase only flips once maas observes the
+		// delete. Here every signal but deletionTimestamp still reports a
+		// healthy owner, which is the window a fresh install could slip through.
 		{"owner terminating (live deletionTimestamp set)", []client.Object{mtc, withDeletionTimestamp(ownerWithUID("uid-1"))}, mtc, "uid-1", false},
 	}
 	for _, c := range cases {
@@ -685,8 +830,8 @@ func TestReconcileRefusesWhenAITenantReplacedBeforeApply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant replaced mid-reconcile)", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant replaced mid-reconcile)", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -718,8 +863,8 @@ func TestReconcileUsesLiveReadNotStaleCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (AITenant deleted; only the live read can see it)", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (AITenant deleted; only the live read can see it)", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -744,8 +889,8 @@ func TestReconcileRequeuesWhenAITenantDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant deleted)", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant deleted)", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -773,8 +918,8 @@ func TestReconcileWaitsForBlockedMigrationMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	names, _, _ := rec.snapshot()
 	if len(names) != 0 {
@@ -901,6 +1046,68 @@ func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 	assertContains(t, names, "payload-pre-processing")
 	assertContains(t, names, "payload-processing-plugins")
 	assertContains(t, names, "payload-processing-reader")
+	for _, kind := range rec.kindSnapshot() {
+		if kind == "HorizontalPodAutoscaler" {
+			t.Fatal("unexpected HPA apply when autoscaling is not configured")
+		}
+	}
+}
+
+func TestReconcileAppliesHPAsWhenAutoscalingConfigured(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc.Object["spec"] = map[string]any{
+		"payloadProcessing": map[string]any{
+			"replicas":    int64(2),
+			"autoscaling": map[string]any{"maxReplicas": int64(6)},
+		},
+		"payloadPreProcessing": map[string]any{
+			"autoscaling": map[string]any{},
+		},
+	}
+	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "openshift-ingress", "tenant-ns")
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	names, _, _ := rec.snapshot()
+	assertContains(t, names, "payload-processing-redteam")
+	assertContains(t, names, "payload-pre-processing-redteam")
+	hpaCount := 0
+	for _, kind := range rec.kindSnapshot() {
+		if kind == "HorizontalPodAutoscaler" {
+			hpaCount++
+		}
+	}
+	if hpaCount != 2 {
+		t.Fatalf("HPA applies = %d, want 2; kinds=%v names=%v", hpaCount, rec.kindSnapshot(), names)
+	}
+}
+
+func TestReconcileDeletesOrphanedHPAsWhenAutoscalingRemoved(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "openshift-ingress", "tenant-ns")
+	orphan := &unstructured.Unstructured{}
+	orphan.SetGroupVersionKind(gvkHPA)
+	orphan.SetName(PayloadProcessingHPAName("redteam"))
+	orphan.SetNamespace("openshift-ingress")
+	orphan.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController})
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, orphan, newGateway("my-gateway", "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	_, _, deleted := rec.snapshot()
+	assertContains(t, deleted, PayloadProcessingHPAName("redteam"))
 }
 
 // TestReconcileRejectsSpoofedOwningAITenantAnnotations covers CWE-639:
@@ -975,6 +1182,8 @@ func expectedCleanupNames(tenantID string) []string {
 		PayloadProcessingNetworkPolicyName(tenantID),
 		PayloadProcessingEnvoyFilterName(tenantID),
 		PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID),
+		PayloadProcessingHPAName(tenantID),
+		PayloadPreProcessingHPAName(tenantID),
 	}
 }
 
@@ -1002,6 +1211,8 @@ func seedPraxisOwnedForCleanup(tenantID, namespace string) []client.Object {
 		mk(gvkDestinationRule, PayloadProcessingServiceName(tenantID), namespace),
 		mk(gvkDestinationRule, PayloadPreProcessingServiceName(tenantID), namespace),
 		mk(gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID), ""),
+		mk(gvkHPA, PayloadProcessingHPAName(tenantID), namespace),
+		mk(gvkHPA, PayloadPreProcessingHPAName(tenantID), namespace),
 	}
 }
 
@@ -1189,8 +1400,8 @@ func TestReconcileDeleteRequeuesWhenGatewayRefNeverPopulated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v (keep finalizer until gatewayRef is known or DeletionTimeout)", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v (keep finalizer until gatewayRef is known or DeletionTimeout)", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 
 	_, mtcPatches, deleted := rec.snapshot()
@@ -1222,8 +1433,8 @@ func TestReconcileSwitchAwayRequeuesWhenAITenantNotReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	_, mtcPatches, deleted := rec.snapshot()
 	if mtcPatches != 0 || len(deleted) != 0 {
