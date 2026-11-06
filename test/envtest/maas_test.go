@@ -6,18 +6,72 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
+
+func TestMaasTenantConfigSchemaPreservesAPITranslation(t *testing.T) {
+	admin := startEnvironment(t, func(ctrl.Manager) {})
+	createNamespace(t, admin, "translation-schema")
+	mtc := tenant.NewMaasTenantConfig()
+	mtc.SetName(tenant.MaasTenantConfigInstanceName)
+	mtc.SetNamespace("translation-schema")
+	mtc.Object["spec"] = map[string]any{"apiTranslation": map[string]any{"enabled": true}}
+	require.NoError(t, admin.Create(t.Context(), mtc))
+	stored := tenant.NewMaasTenantConfig()
+	require.NoError(t, admin.Get(t.Context(), client.ObjectKeyFromObject(mtc), stored))
+	enabled, err := tenant.APITranslationEnabled(stored)
+	require.NoError(t, err)
+	require.True(t, enabled, "API server pruned spec.apiTranslation.enabled")
+}
+
+func TestAITenantSchemaPreservesCookieExpire(t *testing.T) {
+	admin := startEnvironment(t, func(ctrl.Manager) {})
+	createNamespace(t, admin, "cookie-expire-schema")
+	ait := tenant.NewAITenant()
+	ait.SetName("cookie-expire-tenant")
+	ait.SetNamespace(maasNamespace)
+	ait.Object["spec"] = map[string]any{
+		"oidc": map[string]any{
+			"issuerUrl":    "https://keycloak.example.com/realms/maas",
+			"clientId":     "maas-consumer-portal",
+			"cookieExpire": "8h",
+		},
+	}
+	require.NoError(t, admin.Create(t.Context(), ait))
+	stored := tenant.NewAITenant()
+	require.NoError(t, admin.Get(t.Context(), client.ObjectKeyFromObject(ait), stored))
+	expire, _, err := unstructured.NestedString(stored.Object, "spec", "oidc", "cookieExpire")
+	require.NoError(t, err)
+	require.Equal(t, "8h", expire, "API server pruned spec.oidc.cookieExpire")
+
+	// The cross-field rule compares effective defaults: a cookie lifetime at
+	// or below the 4m default refresh interval must be rejected.
+	ait.Object["spec"] = map[string]any{
+		"oidc": map[string]any{
+			"issuerUrl":    "https://keycloak.example.com/realms/maas",
+			"clientId":     "maas-consumer-portal",
+			"cookieExpire": "2m",
+		},
+	}
+	err = admin.Update(t.Context(), ait)
+	require.ErrorContains(t, err, "cookieExpire must be longer than refreshInterval")
+}
 
 // maasFixture supplies the external tenant state consumed by this controller.
 // It emits API objects; it does not run or simulate MaaS reconciliation.
 type maasFixture struct {
 	client client.Client
 }
+
+// infraNamespace is the infrastructure namespace every fixture tenant publishes.
+const infraNamespace = "odh-ai-gateway-infra"
 
 // existingPraxisTenant establishes the currently supported selection precondition.
 // Backend opt-in and migration are outside the model-publication scenario.
@@ -38,7 +92,9 @@ func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 			}},
 		},
 	}}
-	require.NoError(t, m.client.Create(t.Context(), gateway))
+	if err := m.client.Create(t.Context(), gateway); err != nil && !apierrors.IsAlreadyExists(err) {
+		require.NoError(t, err)
+	}
 
 	ait := tenant.NewAITenant()
 	ait.SetName(namespace)
@@ -72,4 +128,17 @@ func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 	})
 	mtc.Object["spec"] = map[string]any{}
 	require.NoError(t, m.client.Create(t.Context(), mtc))
+	// The praxis reconcile waits for the infrastructure namespace before
+	// rendering: maas-controller publishes it early in tenant bring-up, and
+	// the EnvoyFilter's maas-api route-name matches are qualified with it.
+	// NeMo Services are only accepted in an AI Gateway infrastructure
+	// namespace, so the tenant publishes the ODH one. The tenant controller
+	// can add its finalizer between the create and this status update, so
+	// retry on conflict with the latest object.
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		latest := tenant.NewMaasTenantConfig()
+		require.NoError(collect, m.client.Get(t.Context(), client.ObjectKeyFromObject(mtc), latest))
+		latest.Object["status"] = map[string]any{"infraNamespace": infraNamespace}
+		require.NoError(collect, m.client.Status().Update(t.Context(), latest))
+	}, 10*time.Second, time.Second, "publish status.infraNamespace on the MaasTenantConfig")
 }

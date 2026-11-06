@@ -16,7 +16,15 @@ limitations under the License.
 
 package tenant
 
-import "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
 
 // NewMaasTenantConfig returns an empty unstructured object with the
 // MaasTenantConfig GVK set, ready for Get or for use with the controller-
@@ -45,6 +53,55 @@ func UsesPraxis(mtc *unstructured.Unstructured) bool {
 	default:
 		return true
 	}
+}
+
+// APITranslationEnabled reads the authoritative MaaS-owned translation
+// permission. Missing fields are default-off. Malformed fields fail closed so
+// an older or incomplete installed CRD cannot silently enable translation.
+func APITranslationEnabled(mtc *unstructured.Unstructured) (bool, error) {
+	if mtc == nil {
+		return false, errors.New("MaasTenantConfig is required to read apiTranslation")
+	}
+	value, found, err := unstructured.NestedFieldNoCopy(mtc.Object, "spec", "apiTranslation")
+	if err != nil {
+		return false, fmt.Errorf("read spec.apiTranslation: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+	settings, ok := value.(map[string]any)
+	if !ok {
+		return false, fmt.Errorf("spec.apiTranslation must be an object, got %T", value)
+	}
+	enabled, found := settings["enabled"]
+	if !found {
+		return false, nil
+	}
+	flag, ok := enabled.(bool)
+	if !ok {
+		return false, fmt.Errorf("spec.apiTranslation.enabled must be a boolean, got %T", enabled)
+	}
+	return flag, nil
+}
+
+// OutputChecksUnsupported returns why the tenant configured in namespace
+// cannot enforce Output-phase guardrail checks, or "" if it can. With API
+// translation enabled the shared post-auth ExtProc streams responses, and the
+// shipped Praxis image skips response checks in that mode.
+func OutputChecksUnsupported(ctx context.Context, reader client.Reader, namespace string) (string, error) {
+	mtc := NewMaasTenantConfig()
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: MaasTenantConfigInstanceName}, mtc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get MaasTenantConfig %s/%s: %w", namespace, MaasTenantConfigInstanceName, err)
+	}
+	translated, err := APITranslationEnabled(mtc)
+	if err != nil || !translated {
+		return "", err
+	}
+	return "API translation is enabled for this tenant, so its ExtProc streams responses, which the current " +
+		"Praxis release does not check; use Input-phase checks only, or disable API translation", nil
 }
 
 // IdentifierFor derives the per-tenant resource-naming identifier from

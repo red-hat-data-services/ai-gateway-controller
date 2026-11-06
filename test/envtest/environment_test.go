@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -28,6 +29,12 @@ import (
 	inferencev1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 )
+
+// controllerIdentity is the ServiceAccount bound by the shipped ClusterRoleBinding.
+var controllerIdentity = envtest.User{
+	Name:   "system:serviceaccount:opendatahub:ai-gateway-controller",
+	Groups: []string{"system:serviceaccounts", "system:serviceaccounts:opendatahub", "system:authenticated"},
+}
 
 func TestMain(m *testing.M) {
 	// SetLogger only takes effect once per process, so its sink must outlive each test.
@@ -47,8 +54,18 @@ func startEnvironment(t *testing.T, setupControllers func(ctrl.Manager)) client.
 	environment := &envtest.Environment{
 		BinaryAssetsDirectory: assets,
 		UseExistingCluster:    ptr.To(false),
-		CRDDirectoryPaths:     []string{"testdata/crds", filepath.Join(repoRoot, "config/crd/bases")},
+		// Two bases dirs because generation is split by API group: the aigateway
+		// group ships in the self bundle, the inference group does not.
+		CRDDirectoryPaths: []string{
+			"testdata/crds",
+			filepath.Join(repoRoot, "config/self/crd/bases"),
+			filepath.Join(repoRoot, "config/crd/bases"),
+		},
 		ErrorIfCRDPathMissing: true,
+		// Installed before the manager starts, because the guardrail
+		// reconciler only registers its provider watch when the CRD already
+		// resolves.
+		CRDs: []*apiextensionsv1.CustomResourceDefinition{nemoGuardrailsCRD()},
 	}
 	apiServer := environment.ControlPlane.GetAPIServer().Configure()
 	apiServer.Set("authorization-mode", "RBAC")
@@ -62,6 +79,9 @@ func startEnvironment(t *testing.T, setupControllers func(ctrl.Manager)) client.
 		clientgoscheme.AddToScheme,
 		inferencev1alpha1.AddToScheme,
 		aigatewayv1alpha1.AddToScheme,
+		// So a scenario can remove and reinstall the provider CRD and watch
+		// the controller recover.
+		apiextensionsv1.AddToScheme,
 	)
 	require.NoError(t, schemeBuilder.AddToScheme(scheme))
 	admin, err := client.New(config, client.Options{Scheme: scheme})
@@ -77,10 +97,7 @@ func startEnvironment(t *testing.T, setupControllers func(ctrl.Manager)) client.
 			require.NoError(t, admin.Create(t.Context(), &resource))
 		}
 	}
-	controllerUser, err := environment.AddUser(envtest.User{
-		Name:   "system:serviceaccount:opendatahub:ai-gateway-controller",
-		Groups: []string{"system:serviceaccounts", "system:serviceaccounts:opendatahub", "system:authenticated"},
-	}, &rest.Config{QPS: -1})
+	controllerUser, err := environment.AddUser(controllerIdentity, &rest.Config{QPS: -1})
 	require.NoError(t, err)
 	mgr, err := ctrl.NewManager(controllerUser.Config(), ctrl.Options{
 		Scheme:                  scheme,

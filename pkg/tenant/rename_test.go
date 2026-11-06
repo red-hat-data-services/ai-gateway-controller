@@ -17,9 +17,11 @@ limitations under the License.
 package tenant
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/go-openapi/testify/v2/assert"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -107,8 +109,8 @@ func TestRenameNonDefaultTenantPayloadProcessingDeployment(t *testing.T) {
 	}
 
 	sa, _, _ := unstructured.NestedString(out[0].Object, "spec", "template", "spec", "serviceAccountName")
-	if sa != wantName {
-		t.Fatalf("serviceAccountName = %q, want %q", sa, wantName)
+	if want := "payload-processing-post-redteam"; sa != want {
+		t.Fatalf("serviceAccountName = %q, want the dedicated post-auth %q", sa, want)
 	}
 
 	volumes, _, _ := unstructured.NestedSlice(out[0].Object, "spec", "template", "spec", "volumes")
@@ -193,15 +195,31 @@ func TestRenameServiceAccount(t *testing.T) {
 	in := []unstructured.Unstructured{{Object: map[string]any{
 		"apiVersion": "v1",
 		"kind":       "ServiceAccount",
-		"metadata":   map[string]any{"name": PayloadProcessingName},
+		"metadata":   map[string]any{"name": PayloadProcessingName, "namespace": "istio-system"},
+		// Anything MaaS sets on the shared account must not reach the
+		// post-auth one.
+		"secrets": []any{map[string]any{"name": "shared-token"}},
 	}}}
 
 	out, err := Rename(in, "redteam", "istio-system")
 	if err != nil {
 		t.Fatalf("Rename: %v", err)
 	}
+	if len(out) != 2 {
+		t.Fatalf("Rename returned %d resources, want the shared and the post-auth ServiceAccount", len(out))
+	}
 	if got := out[0].GetName(); got != "payload-processing-redteam" {
 		t.Fatalf("name = %q, want %q", got, "payload-processing-redteam")
+	}
+	post := out[1]
+	want := map[string]any{
+		"apiVersion":                   "v1",
+		"kind":                         "ServiceAccount",
+		"metadata":                     map[string]any{"name": "payload-processing-post-redteam", "namespace": "istio-system"},
+		"automountServiceAccountToken": false,
+	}
+	if !reflect.DeepEqual(post.Object, want) {
+		t.Fatalf("post-auth ServiceAccount = %v, want %v", post.Object, want)
 	}
 }
 
@@ -501,7 +519,7 @@ func TestRenameEnvoyFilterMissingClusterPatchErrors(t *testing.T) {
 	}
 }
 
-func TestRenameErrorsWhenComputedNameExceeds63Characters(t *testing.T) {
+func TestRenameShortensTo63Characters(t *testing.T) {
 	// "payload-processing-plugins-" (28 chars) + a 40-char tenant ID = 68,
 	// past the Kubernetes 63-character object name limit.
 	longTenantID := strings.Repeat("a", 40)
@@ -511,9 +529,10 @@ func TestRenameErrorsWhenComputedNameExceeds63Characters(t *testing.T) {
 		"metadata":   map[string]any{"name": PayloadProcessingPluginsConfigMapName},
 	}}}
 
-	if _, err := Rename(in, longTenantID, "istio-system"); err == nil {
-		t.Fatal("expected an error for a computed name over 63 characters")
-	}
+	out, err := Rename(in, longTenantID, "istio-system")
+	assert.NoError(t, err, "Rename returned an unexpected error", "err", err)
+	assert.Len(t, out, 1, "Rename output isn't of the expected length")
+	assert.Len(t, out[0].GetName(), 63, "Rename didn't shorten to 63 characters")
 }
 
 func TestRenameDoesNotMutateInputSlice(t *testing.T) {

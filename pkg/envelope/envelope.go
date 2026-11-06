@@ -12,11 +12,14 @@ package envelope
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
+	"strings"
 
 	"github.com/gowebpki/jcs"
 
@@ -62,10 +65,15 @@ type SecretRef struct {
 	Key       string `json:"key"`
 }
 
-// Credential is the final-hop credential reference. Field set is exact:
-// the consumer rejects unknown fields inside credential objects.
+// Credential is the final-hop credential reference. The wire field set is
+// exact: the consumer rejects unknown fields inside credential objects, so
+// Header never serializes (json:"-"). Header is a controller-internal carrier
+// for the provider-boundary request header the credential_inject filter must
+// inject into (see defaultAuthHeaders); it threads from StrategyFor into the
+// ExtProc credential entry (pkg/tenant/extproc.go), never onto the overlay.
 type Credential struct {
 	Strategy  string    `json:"strategy"`
+	Header    string    `json:"-"`
 	SecretRef SecretRef `json:"secretRef"`
 }
 
@@ -87,8 +95,17 @@ type Candidate struct {
 	Fresh    bool   `json:"fresh"`
 	// SelectionGroup is scoped by (kind, name). A pointer is required so
 	// group zero is emitted instead of being omitted by encoding/json.
-	SelectionGroup *uint32     `json:"selection_group,omitempty"`
-	Credential     *Credential `json:"credential,omitempty"`
+	SelectionGroup *uint32 `json:"selection_group,omitempty"`
+	// TrafficWeight is the Praxis weightedRandom candidate weight (1–1000).
+	// CRD ExternalProviderRef.weight is 0–100; AGC pass-throughs positive
+	// values. Omitted unless selection_policy.mode is weightedRandom — Praxis
+	// rejects traffic_weight with any other mode, and requires it on every
+	// candidate when mode is weightedRandom.
+	TrafficWeight *uint32     `json:"traffic_weight,omitempty"`
+	Credential    *Credential `json:"credential,omitempty"`
+	APIFormat     string      `json:"api_format,omitempty"`
+	Path          string      `json:"path,omitempty"`
+	TargetModel   string      `json:"target_model,omitempty"`
 }
 
 // Provenance records who rendered this envelope and from what source state.
@@ -132,7 +149,6 @@ type Overlay struct {
 // Frozen error surface (port plan §6): each maps to a Ready=False condition
 // with a stable reason, and is what E2E failure-injection asserts against.
 var (
-	ErrWeightUnsupported     = errors.New("envelope: non-uniform (proportional) weights are not supported in 3.6; use uniform weights or a single provider (proportional canaries: known 3.6 limitation, see ADR 0001 D5)")
 	ErrDuplicateProvider     = errors.New("envelope: a client model cannot bind the same provider more than once")
 	ErrUnknownCluster        = errors.New("envelope: candidate references cluster absent from load_balancer config")
 	ErrScopeMismatch         = errors.New("envelope: scope fields must be non-empty")
@@ -152,15 +168,25 @@ type Options struct {
 	ProducerVersion string
 	// RenderedAt is injected (RFC3339) to keep Render deterministic under test.
 	RenderedAt string
+	// IncludeProviderProfiles enables the newer Praxis AI profile fields used
+	// for API translation. Keep this false for flag-off overlays so older
+	// intelligent_route consumers receive the same candidate shape as main.
+	IncludeProviderProfiles bool
+	// PreservedCandidates are already-published candidates kept verbatim
+	// ahead of the rendered routes. A tenant's own candidates are preserved
+	// this way when only contributions from other namespaces change.
+	PreservedCandidates []Candidate
 }
 
 // Render validates the resolved route set and emits the envelope with its
 // revision. Distinct providers with equal positive weights sharing a
 // client-visible model name are assigned selection group zero and use
-// Praxis' global random policy. Singleton model capabilities remain ungrouped
-// and deterministic.
-// Unequal weights and repeated providers are rejected because this controller
-// does not implement proportional routing or deduplication of bindings.
+// Praxis' global random policy. Unequal positive weights use weightedRandom
+// with per-candidate traffic_weight (CRD weight pass-through). Singleton
+// model capabilities remain ungrouped and deterministic unless the overlay
+// must use weightedRandom (Praxis requires traffic_weight and selection_group
+// on every candidate in that mode). Repeated providers for one client model
+// are rejected.
 //
 // Revision rule: digest equal to prev → prev returned unchanged (no bump);
 // digest changed → Generation = prev.Generation + 1.
@@ -178,21 +204,21 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 	if err != nil {
 		return Envelope{}, err
 	}
-
-	candidates := make([]Candidate, 0)
-	known := make(map[string]bool, len(opts.KnownClusters))
-	for _, c := range opts.KnownClusters {
-		known[c] = true
+	preservedNeedsWeighted := slices.ContainsFunc(opts.PreservedCandidates, func(c Candidate) bool { return c.TrafficWeight != nil })
+	preservedNeedsRandom := slices.ContainsFunc(opts.PreservedCandidates, func(c Candidate) bool { return c.SelectionGroup != nil })
+	if selection.weighted || preservedNeedsWeighted {
+		selection.policy = weightedRandomSelectionPolicy
+		selection.weighted = true
+	} else if selection.policy == nil && preservedNeedsRandom {
+		selection.policy = randomSelectionPolicy
 	}
 
+	candidates := append(make([]Candidate, 0, len(opts.PreservedCandidates)), opts.PreservedCandidates...)
 	for _, m := range routes.Models {
-		if err := checkUniformWeights(m); err != nil {
+		if err := ValidateModel(m, opts); err != nil {
 			return Envelope{}, err
 		}
 		for _, r := range m.Routes {
-			if len(known) > 0 && !known[r.Cluster] {
-				return Envelope{}, fmt.Errorf("%w: %s (model %s)", ErrUnknownCluster, r.Cluster, r.Model)
-			}
 			// Candidate names are the client-visible model identity.  This must
 			// match resolver.Route.ClientName and the HTTPRoute body/header
 			// matches; the ExternalModel object name is control-plane identity.
@@ -204,31 +230,54 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 			// The Cluster stays shared (one transport per provider).
 			cand := Candidate{
 				Cluster:  r.Cluster,
-				StableID: CandidateStableID(r.Model, r.Provider),
+				StableID: RouteStableID(r),
 				Kind:     "inference_model",
 				Name:     r.ClientName,
 				Site:     scope.LocalSite,
 				Fresh:    true,
 			}
-			if group, ok := selection.groups[selectionRouteKey{modelRef: m.ModelRef, model: r.Model, provider: r.Provider, cluster: r.Cluster}]; ok {
+			if opts.IncludeProviderProfiles {
+				cand.APIFormat = r.APIFormat
+				cand.Path = r.Path
+				cand.TargetModel = r.TargetModel
+			}
+			key := selectionRouteKey{modelRef: m.ModelRef, model: r.Model, provider: r.Provider, cluster: r.Cluster}
+			if group, ok := selection.groups[key]; ok {
 				group := group
 				cand.SelectionGroup = &group
 			}
-			strategy, err := StrategyFor(r)
-			if err != nil {
-				return Envelope{}, fmt.Errorf("model %s provider %s: %w", r.Model, r.Provider, err)
+			if weight, ok := selection.weights[key]; ok {
+				weight := weight
+				cand.TrafficWeight = &weight
 			}
-			if strategy != "" {
+			// ValidateModel has already qualified the strategy.
+			if strategy, header, _ := StrategyFor(r); strategy != "" {
 				cand.Credential = &Credential{
 					Strategy: strategy,
+					Header:   header,
 					SecretRef: SecretRef{
 						Name:      r.SecretName,
-						Namespace: r.Namespace,
+						Namespace: r.SecretRefNamespace(),
 						Key:       r.SecretKey,
 					},
 				}
 			}
 			candidates = append(candidates, cand)
+		}
+	}
+	if selection.weighted {
+		// Praxis weightedRandom requires selection_group and traffic_weight on
+		// every candidate, including preserved foreign entries and singletons.
+		normalizeWeightedCandidates(candidates)
+	}
+	if !opts.IncludeProviderProfiles {
+		// Preserved candidates may have been published while translation was
+		// enabled. Strip the versioned profile fields before hashing a flag-off
+		// overlay so disabling the feature returns to the main wire contract.
+		for i := range candidates {
+			candidates[i].APIFormat = ""
+			candidates[i].Path = ""
+			candidates[i].TargetModel = ""
 		}
 	}
 
@@ -282,66 +331,122 @@ type selectionRouteKey struct {
 }
 
 type selectionCapability struct {
-	count      int
-	firstRoute resolver.Route
+	count       int
+	firstWeight int
+	unequal     bool
 }
 
 type selectionMetadata struct {
-	policy json.RawMessage
-	groups map[selectionRouteKey]uint32
+	policy   json.RawMessage
+	weighted bool
+	groups   map[selectionRouteKey]uint32
+	weights  map[selectionRouteKey]uint32
 }
 
 // deriveSelectionMetadata is the single policy derivation used by both
 // normal publication and deletion-time republishing (both pass through
 // Render). Praxis scopes groups by (kind, name), so provider candidates for
 // distinct client-visible names never share a group.
+//
+// Equal multi-provider capabilities keep mode random (no traffic_weight).
+// Any unequal positive weights force weightedRandom for the whole overlay:
+// Praxis allows only one selection_policy.mode and requires traffic_weight
+// plus selection_group on every candidate in that mode.
 func deriveSelectionMetadata(routes *resolver.ResolvedRouteSet) (selectionMetadata, error) {
 	capabilities := map[string]*selectionCapability{}
 	providerBindings := map[string]bool{}
 	for _, model := range routes.Models {
-		if err := checkUniformWeights(model); err != nil {
-			return selectionMetadata{}, err
-		}
 		for _, route := range model.Routes {
 			key := "inference_model\x00" + route.ClientName
-			binding := key + "\x00" + route.Provider
+			binding := key + "\x00" + route.ProviderNamespace + "/" + route.Provider
 			if providerBindings[binding] {
 				return selectionMetadata{}, fmt.Errorf("%w: client model %s provider %s", ErrDuplicateProvider, route.ClientName, route.Provider)
 			}
 			providerBindings[binding] = true
 			capability := capabilities[key]
 			if capability == nil {
-				capability = &selectionCapability{firstRoute: route}
+				capability = &selectionCapability{firstWeight: route.Weight}
 				capabilities[key] = capability
-			} else if route.Weight != capability.firstRoute.Weight {
-				return selectionMetadata{}, fmt.Errorf("%w: client model %s has weights %d and %d across providers",
-					ErrWeightUnsupported, route.ClientName, capability.firstRoute.Weight, route.Weight)
+			} else if route.Weight != capability.firstWeight {
+				capability.unequal = true
 			}
 			capability.count++
 		}
 	}
-	metadata := selectionMetadata{groups: make(map[selectionRouteKey]uint32)}
-	for _, model := range routes.Models {
-		for _, route := range model.Routes {
-			capability := capabilities["inference_model\x00"+route.ClientName]
-			if capability.count > 1 {
-				metadata.groups[selectionRouteKey{modelRef: model.ModelRef, model: route.Model, provider: route.Provider, cluster: route.Cluster}] = 0
-			}
+	needsWeighted := false
+	needsRandom := false
+	for _, capability := range capabilities {
+		if capability.count <= 1 {
+			continue
+		}
+		if capability.unequal {
+			needsWeighted = true
+		} else {
+			needsRandom = true
 		}
 	}
-	for _, capability := range capabilities {
-		if capability.count > 1 {
-			metadata.policy = json.RawMessage(`{"mode":"random"}`)
-			break
+	metadata := selectionMetadata{
+		groups:  make(map[selectionRouteKey]uint32),
+		weights: make(map[selectionRouteKey]uint32),
+	}
+	if needsWeighted {
+		metadata.policy = weightedRandomSelectionPolicy
+		metadata.weighted = true
+		for _, model := range routes.Models {
+			for _, route := range model.Routes {
+				key := selectionRouteKey{modelRef: model.ModelRef, model: route.Model, provider: route.Provider, cluster: route.Cluster}
+				metadata.groups[key] = 0
+				metadata.weights[key] = trafficWeightFor(route.Weight)
+			}
+		}
+		return metadata, nil
+	}
+	if needsRandom {
+		metadata.policy = randomSelectionPolicy
+		for _, model := range routes.Models {
+			for _, route := range model.Routes {
+				if capabilities["inference_model\x00"+route.ClientName].count > 1 {
+					metadata.groups[selectionRouteKey{modelRef: model.ModelRef, model: route.Model, provider: route.Provider, cluster: route.Cluster}] = 0
+				}
+			}
 		}
 	}
 	return metadata, nil
 }
 
-// ValidateSelectionMetadata rejects unequal positive weights for routes that
-// resolve to the same client-visible model. Render uses the same derivation to
-// generate the wire metadata; the controller calls this before applying
-// transport resources so invalid weights do not change serving state.
+// trafficWeightFor maps a positive CRD/resolver weight onto Praxis
+// traffic_weight. CRD max is 100; Praxis accepts 1–1000. Non-positive values
+// should already be filtered by the resolver; clamp defensively.
+func trafficWeightFor(weight int) uint32 {
+	if weight < 1 {
+		return 1
+	}
+	if weight > 1000 {
+		return 1000
+	}
+	return uint32(weight)
+}
+
+// normalizeWeightedCandidates stamps the Praxis weightedRandom contract onto
+// every candidate: selection_group and traffic_weight are required on all of
+// them, including preserved foreign entries that previously used mode random.
+func normalizeWeightedCandidates(candidates []Candidate) {
+	for i := range candidates {
+		if candidates[i].SelectionGroup == nil {
+			group := uint32(0)
+			candidates[i].SelectionGroup = &group
+		}
+		if candidates[i].TrafficWeight == nil {
+			weight := uint32(1)
+			candidates[i].TrafficWeight = &weight
+		}
+	}
+}
+
+// ValidateSelectionMetadata rejects invalid selection bindings (today:
+// duplicate providers for one client-visible model). Render uses the same
+// derivation for wire metadata; the controller calls this before applying
+// transport resources so invalid configs do not change serving state.
 func ValidateSelectionMetadata(routes *resolver.ResolvedRouteSet) error {
 	if routes == nil {
 		return fmt.Errorf("%w: nil route set", ErrScopeMismatch)
@@ -350,13 +455,47 @@ func ValidateSelectionMetadata(routes *resolver.ResolvedRouteSet) error {
 	return err
 }
 
+// defaultAuthHeaders maps a qualified api-key provider to the provider-boundary
+// request header its credential_inject entry must target. It mirrors the praxis
+// credential_inject filter's defaultAuthHeaders map so the controller renders
+// the same header the data plane would otherwise default to, and overrides that
+// default where a provider diverges: anthropic uses x-api-key (the filter's own
+// apikey default, rendered explicitly so the entry is self-describing) while
+// Azure OpenAI uses api-key. Providers are absent here only when their strategy
+// fixes the header on the filter side (bearer_token always targets
+// Authorization: Bearer, so openai carries no override).
+var defaultAuthHeaders = map[string]string{
+	"anthropic":    "x-api-key",
+	"azure":        "api-key",
+	"azure-openai": "api-key",
+}
+
+// IsQualifiedAuthHeader reports whether header is a provider-boundary request
+// header the controller qualifies for apikey credential injection — one of the
+// values StrategyFor emits (see defaultAuthHeaders). The empty header is not
+// qualified here: it means "no injected header" (bearer_token fixes
+// Authorization filter-side), which callers treat as the absence of a header
+// rather than a value to validate. It lets a consumer reject an untrusted or
+// unrecognized header annotation before it drives credential_inject.
+func IsQualifiedAuthHeader(header string) bool {
+	for _, qualified := range defaultAuthHeaders {
+		if qualified == header {
+			return true
+		}
+	}
+	return false
+}
+
 // StrategyFor maps only the currently qualified provider API-key contracts to
-// Praxis wire strategies: openai + openai-chat maps to bearer_token
-// (Authorization: Bearer at the provider boundary) and anthropic + messages
-// maps to apikey (the credential_inject filter injects the Secret value into
-// its configured header, x-api-key by default). The wire stays reference-only
-// either way. Provider API keys are not interchangeable: other provider/
-// API-format combinations fail closed until their header semantics are
+// Praxis wire strategies, returning the strategy and — for apikey strategies —
+// the provider-boundary header the credential_inject filter must inject into
+// (see defaultAuthHeaders). OpenAI and Bedrock Mantle openai-chat use
+// bearer_token (Authorization: Bearer is fixed filter-side, so no header is
+// returned); anthropic + messages and azure/azure-openai + openai-chat use
+// apikey, injected into x-api-key and api-key respectively. Bedrock support is
+// limited to its Mantle OpenAI-compatible API; it does not cover Bedrock Runtime
+// SigV4 or Converse. The wire stays reference-only either way. Other
+// provider/API-format combinations fail closed until their header semantics are
 // explicitly supported.
 //
 // This is the single qualification authority: Render stamps overlay
@@ -365,22 +504,26 @@ func ValidateSelectionMetadata(routes *resolver.ResolvedRouteSet) error {
 // configuration through it as well. Both consumers must agree because the
 // data plane rejects a candidate whose strategy differs from the configured
 // credential entry (praxis-ai #1172); disagreement fails closed with a 503.
-func StrategyFor(route resolver.Route) (string, error) {
+func StrategyFor(route resolver.Route) (strategy, header string, err error) {
 	switch route.AuthType {
 	case "":
-		return "", nil
+		return "", "", nil
 	case "apikey":
-		if route.ProviderType == "openai" && route.APIFormat == "openai-chat" {
-			return "bearer_token", nil
+		switch {
+		case route.ProviderType == "openai" && route.APIFormat == "openai-chat":
+			return "bearer_token", "", nil
+		case route.ProviderType == "anthropic" && route.APIFormat == "messages":
+			return "apikey", defaultAuthHeaders["anthropic"], nil
+		case (route.ProviderType == "azure" || route.ProviderType == "azure-openai") && route.APIFormat == "openai-chat":
+			return "apikey", defaultAuthHeaders[route.ProviderType], nil
+		case route.ProviderType == "bedrock-openai" && route.APIFormat == "openai-chat":
+			return "bearer_token", "", nil
 		}
-		if route.ProviderType == "anthropic" && route.APIFormat == "messages" {
-			return "apikey", nil
-		}
-		return "", fmt.Errorf("%w: auth.type apikey for provider %q and API format %q", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)
+		return "", "", fmt.Errorf("%w: auth.type apikey for provider %q and API format %q", ErrUnsupportedCredential, route.ProviderType, route.APIFormat)
 	case "sigv4", "oauth2":
-		return "", fmt.Errorf("%w: auth.type %q", ErrUnsupportedCredential, route.AuthType)
+		return "", "", fmt.Errorf("%w: auth.type %q", ErrUnsupportedCredential, route.AuthType)
 	default:
-		return "", fmt.Errorf("envelope: unknown auth.type %q", route.AuthType)
+		return "", "", fmt.Errorf("envelope: unknown auth.type %q", route.AuthType)
 	}
 }
 
@@ -393,16 +536,69 @@ func CandidateStableID(model, provider string) string {
 	return model + "/provider-" + provider
 }
 
-// checkUniformWeights enforces the R1 guard for one model group.
-func checkUniformWeights(m resolver.ModelRoutes) error {
-	if len(m.Routes) == 0 {
-		return nil // model renders no candidates; skips are the record
+// randomSelectionPolicy is the Praxis picker policy for equal-weight groups.
+var randomSelectionPolicy = json.RawMessage(`{"mode":"random"}`)
+
+// weightedRandomSelectionPolicy is the Praxis picker for proportional weights.
+var weightedRandomSelectionPolicy = json.RawMessage(`{"mode":"weightedRandom"}`)
+
+// maxStableIDBytes is the Praxis stable_id length limit.
+const maxStableIDBytes = 256
+
+// ScopedStableID is the stable_id for a candidate whose model or provider is
+// outside the tenant namespace: <modelNamespace>/<model>/<providerNamespace>/<provider>,
+// or sha256:<hex> over the length-prefixed fields when that exceeds the
+// Praxis limit. Kubernetes names contain no "/", so the existing form (one
+// slash), this form (three) and the hash form (none) never collide.
+func ScopedStableID(modelNamespace, model, providerNamespace, provider string) string {
+	fields := []string{modelNamespace, model, providerNamespace, provider}
+	if id := strings.Join(fields, "/"); len(id) <= maxStableIDBytes {
+		return id
 	}
-	first := m.Routes[0].Weight
-	for _, r := range m.Routes[1:] {
-		if r.Weight != first {
-			return fmt.Errorf("%w: model %s has weights %d and %d across providers",
-				ErrWeightUnsupported, m.ModelRef, first, r.Weight)
+	h := sha256.New()
+	for _, field := range fields {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(field)))
+		h.Write(size[:])
+		h.Write([]byte(field))
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// RouteStableID returns the route's stable_id: its explicit scoped override,
+// otherwise the existing CandidateStableID form.
+func RouteStableID(route resolver.Route) string {
+	if route.StableID != "" {
+		return route.StableID
+	}
+	return CandidateStableID(route.Model, route.Provider)
+}
+
+// IsScopedStableID reports whether id is a ScopedStableID (three slashes or
+// the hash form) rather than the existing tenant-local form.
+func IsScopedStableID(id string) bool {
+	return strings.Count(id, "/") != 1
+}
+
+// ValidateModel applies Render's per-model checks: provider selection (no
+// repeated provider), known clusters and qualified credential strategies. The
+// controller also runs it on a contribution from another namespace in
+// isolation, so a model Render would reject is excluded before it can fail
+// the whole tenant overlay.
+func ValidateModel(m resolver.ModelRoutes, opts Options) error {
+	if _, err := deriveSelectionMetadata(&resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{m}}); err != nil {
+		return err
+	}
+	known := make(map[string]bool, len(opts.KnownClusters))
+	for _, c := range opts.KnownClusters {
+		known[c] = true
+	}
+	for _, r := range m.Routes {
+		if len(known) > 0 && !known[r.Cluster] {
+			return fmt.Errorf("%w: %s (model %s)", ErrUnknownCluster, r.Cluster, r.Model)
+		}
+		if _, _, err := StrategyFor(r); err != nil {
+			return fmt.Errorf("model %s provider %s: %w", r.Model, r.Provider, err)
 		}
 	}
 	return nil

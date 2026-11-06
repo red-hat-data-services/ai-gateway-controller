@@ -59,6 +59,10 @@ TEST_FLAGS ?= -race -coverprofile=coverage.out
 .PHONY: test
 test: test-unit test-envtest ##	run unit and control-plane tests
 
+.PHONY: test-kind-env-contracts
+test-kind-env-contracts: ## check Kind image references and controller identity filtering
+	bash test/kind-env/test_run_contracts.sh
+
 .PHONY: test-unit
 test-unit: tidy ##	run unit tests with coverage
 	go test $(TEST_FLAGS) ./...
@@ -82,8 +86,12 @@ tidy: ##	go mod tidy
 
 .PHONY: manifests
 manifests: $(CONTROLLER_GEN) ##	generate CRDs and deepcopy implementations
-	$(CONTROLLER_GEN) object paths=./api/... \
-		crd paths=./api/... \
+	$(CONTROLLER_GEN) object paths=./api/...
+	# Routed by API group: this controller's own group ships in the self bundle
+	# it installs; the shared inference group is installed by maas-controller.
+	$(CONTROLLER_GEN) crd paths=./api/aigateway/... \
+		output:crd:artifacts:config=config/self/crd/bases
+	$(CONTROLLER_GEN) crd paths=./api/inference/... \
 		output:crd:artifacts:config=config/crd/bases
 
 .PHONY: vet

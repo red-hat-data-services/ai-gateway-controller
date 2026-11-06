@@ -38,7 +38,7 @@ func TestRender_HappyPath(t *testing.T) {
 
 	env, err := Render(set, scope(), Revision{}, Options{
 		KnownClusters: []string{"provider-p1"}, SourceUID: "uid-1",
-		ProducerVersion: "0.1.0", RenderedAt: "2026-09-03T00:00:00Z",
+		ProducerVersion: "0.1.0", RenderedAt: "2026-09-03T00:00:00Z", IncludeProviderProfiles: true,
 	})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
@@ -53,6 +53,9 @@ func TestRender_HappyPath(t *testing.T) {
 	if c.Name != "m1" || c.Cluster != "provider-p1" || c.Kind != "inference_model" || c.Site != "site-a" || !c.Fresh {
 		t.Errorf("candidate mapping: %+v", c)
 	}
+	if c.APIFormat != "openai-chat" || c.Path != "/v1/chat/completions" || c.TargetModel != "t" {
+		t.Fatalf("trusted provider profile missing from candidate: %+v", c)
+	}
 	// Wire shape per praxis validate_revision_shape (overlay.rs):
 	// revision = {kind: "content_addressed", algorithm: "sha256", value}.
 	if env.Revision.Kind != "content_addressed" || env.Revision.Algorithm != "sha256" {
@@ -63,6 +66,85 @@ func TestRender_HappyPath(t *testing.T) {
 	}
 	if env.Provenance.SourceGeneration != 1 {
 		t.Errorf("first distribution source_generation: %d, want 1", env.Provenance.SourceGeneration)
+	}
+}
+
+func TestRenderPublishesDistinctProfilesForMixedProviderSelection(t *testing.T) {
+	openai := route("client-model", "openai", 1)
+	openai.Model, openai.ClientName = "external-model", "client-model"
+	openai.TargetModel, openai.Path, openai.APIFormat = "gpt-deployed", "/v1/chat/completions", "openai-chat"
+	anthropic := route("client-model", "anthropic", 1)
+	anthropic.Model, anthropic.ClientName = "external-model", "client-model"
+	anthropic.ProviderType, anthropic.TargetModel = "anthropic", "claude-deployed"
+	anthropic.APIFormat, anthropic.Path = "messages", "/v1/messages"
+	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/external-model", Routes: []resolver.Route{openai, anthropic}})
+	env, err := Render(set, scope(), Revision{}, Options{IncludeProviderProfiles: true})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(env.Overlay.Candidates) != 2 {
+		t.Fatalf("candidate count = %d, want 2", len(env.Overlay.Candidates))
+	}
+	profiles := map[string]Candidate{}
+	for _, candidate := range env.Overlay.Candidates {
+		profiles[candidate.StableID] = candidate
+	}
+	if got := profiles[CandidateStableID("external-model", "openai")]; got.APIFormat != "openai-chat" || got.Path != "/v1/chat/completions" || got.TargetModel != "gpt-deployed" {
+		t.Fatalf("OpenAI candidate profile = %+v", got)
+	}
+	if got := profiles[CandidateStableID("external-model", "anthropic")]; got.APIFormat != "messages" || got.Path != "/v1/messages" || got.TargetModel != "claude-deployed" {
+		t.Fatalf("Anthropic candidate profile = %+v", got)
+	}
+}
+
+func TestRenderProviderProfilesAreOptInAndClearedWhenTranslationTurnsOff(t *testing.T) {
+	r := route("client-model", "openai", 1)
+	r.Model = "external-model"
+	r.TargetModel = "gpt-deployed"
+	r.Path = "/v1/responses"
+	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/external-model", Routes: []resolver.Route{r}})
+
+	offBefore, err := Render(set, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render flag-off overlay: %v", err)
+	}
+	assertProviderProfile(t, offBefore.Overlay.Candidates[0], "", "", "")
+
+	on, err := Render(set, scope(), revisionForEnvelope(offBefore), Options{IncludeProviderProfiles: true})
+	if err != nil {
+		t.Fatalf("Render flag-on overlay: %v", err)
+	}
+	assertProviderProfile(t, on.Overlay.Candidates[0], "openai-chat", "/v1/responses", "gpt-deployed")
+
+	offAfter, err := Render(&resolver.ResolvedRouteSet{}, scope(), revisionForEnvelope(on), Options{
+		PreservedCandidates:     on.Overlay.Candidates,
+		IncludeProviderProfiles: false,
+	})
+	if err != nil {
+		t.Fatalf("Render flag-off overlay after toggle: %v", err)
+	}
+	assertProviderProfile(t, offAfter.Overlay.Candidates[0], "", "", "")
+	if offAfter.ContentDigest.Value != offBefore.ContentDigest.Value {
+		t.Fatalf("flag-off digest after toggle = %s, want original flag-off digest %s", offAfter.ContentDigest.Value, offBefore.ContentDigest.Value)
+	}
+}
+
+func revisionForEnvelope(env Envelope) Revision {
+	return Revision{Generation: env.Provenance.SourceGeneration, Digest: env.ContentDigest.Value}
+}
+
+func assertProviderProfile(t *testing.T, candidate Candidate, apiFormat, path, targetModel string) {
+	t.Helper()
+	if candidate.APIFormat != apiFormat || candidate.Path != path || candidate.TargetModel != targetModel {
+		t.Fatalf("provider profile = (%q, %q, %q), want (%q, %q, %q)",
+			candidate.APIFormat, candidate.Path, candidate.TargetModel, apiFormat, path, targetModel)
+	}
+	raw, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatalf("marshal candidate: %v", err)
+	}
+	if apiFormat == "" && (strings.Contains(string(raw), `"api_format"`) || strings.Contains(string(raw), `"target_model"`) || strings.Contains(string(raw), `"path"`)) {
+		t.Fatalf("flag-off candidate serializes provider profile fields: %s", raw)
 	}
 }
 
@@ -100,9 +182,9 @@ func TestRender_APIKeyRejectsUnqualifiedCombinations(t *testing.T) {
 	}{
 		{"anthropic with openai chat format", "anthropic", "openai-chat"},
 		{"openai with anthropic messages format", "openai", "messages"},
-		{"azure with openai chat format", "azure", "openai-chat"},
 		{"azure with anthropic messages format", "azure", "messages"},
-		{"aws-bedrock with openai chat format", "aws-bedrock", "openai-chat"},
+		{"Bedrock Runtime provider name with openai chat format", "aws-bedrock", "openai-chat"},
+		{"Bedrock Mantle with messages format", "bedrock-openai", "messages"},
 		{"vertex with anthropic messages format", "vertex", "messages"},
 		{"anthropic with unknown format", "anthropic", "completions"},
 		{"unknown provider with known format", "mistral", "openai-chat"},
@@ -121,6 +203,35 @@ func TestRender_APIKeyRejectsUnqualifiedCombinations(t *testing.T) {
 				t.Errorf("error must name both the provider and the API format, got %v", err)
 			}
 		})
+	}
+}
+
+func TestRender_BedrockMantleMapsAPIKeyToBearerReference(t *testing.T) {
+	r := route("m1", "bedrock", 1)
+	r.ProviderType = "bedrock-openai"
+	r.APIFormat = "openai-chat"
+	r.Endpoint = "bedrock-mantle.us-east-2.api.aws"
+	r.Path = "/v1/chat/completions"
+	r.TargetModel = "openai.gpt-oss-20b"
+	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{
+		IncludeProviderProfiles: true,
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	candidate := env.Overlay.Candidates[0]
+	if candidate.Credential == nil || candidate.Credential.Strategy != "bearer_token" {
+		t.Fatalf("Bedrock Mantle credential = %+v, want reference-only bearer_token", candidate.Credential)
+	}
+	if candidate.Path != "/v1/chat/completions" || candidate.TargetModel != "openai.gpt-oss-20b" {
+		t.Fatalf("Bedrock Mantle profile = %+v", candidate)
+	}
+	raw, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "fixture-only-secret") {
+		t.Fatal("credential value appeared in reference-only overlay")
 	}
 }
 
@@ -145,6 +256,57 @@ func TestRender_AnthropicMessagesMapsToApikeyReference(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "fixture-only-secret") {
 		t.Error("credential value must never reach the wire")
+	}
+}
+
+func TestRender_AzureOpenAIChatMapsToApikeyWithHeaderOverride(t *testing.T) {
+	// Azure OpenAI uses the api-key header, diverging from the credential_inject
+	// filter's x-api-key default. The wire stays reference-only with the apikey
+	// strategy; the header override rides in-memory (json:"-") into the ExtProc
+	// credential entry, never onto the overlay.
+	for _, providerType := range []string{"azure", "azure-openai"} {
+		t.Run(providerType, func(t *testing.T) {
+			r := route("m1", "p1", 1)
+			r.ProviderType = providerType
+			r.APIFormat = "openai-chat"
+			env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{})
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			cred := env.Overlay.Candidates[0].Credential
+			if cred == nil || cred.Strategy != "apikey" {
+				t.Fatalf("expected apikey strategy, got %+v", cred)
+			}
+			if cred.Header != "api-key" {
+				t.Errorf("header = %q, want api-key", cred.Header)
+			}
+			raw, err := json.Marshal(cred)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := `{"strategy":"apikey","secretRef":{"name":"p1-key","namespace":"ns1","key":"api-key"}}`
+			if string(raw) != want {
+				t.Errorf("credential wire JSON must stay reference-only without header:\n got %s\nwant %s", raw, want)
+			}
+		})
+	}
+}
+
+func TestIsQualifiedAuthHeader(t *testing.T) {
+	// Exactly the non-empty headers StrategyFor emits are qualified; the empty
+	// header (bearer_token, none injected) and any other value are not, so a
+	// consumer can reject an untrusted or unrecognized header annotation.
+	for header, want := range map[string]bool{
+		"api-key":         true,
+		"x-api-key":       true,
+		"":                false,
+		"authorization":   false,
+		"Authorization":   false,
+		"x-forwarded-for": false,
+	} {
+		if got := IsQualifiedAuthHeader(header); got != want {
+			t.Errorf("IsQualifiedAuthHeader(%q) = %t, want %t", header, got, want)
+		}
 	}
 }
 
@@ -181,17 +343,19 @@ func TestRender_APIKeyMapsToReferenceOnlyBearerCredential(t *testing.T) {
 	}
 }
 
-func TestRender_WeightGuard(t *testing.T) {
+func TestRender_WeightSelection(t *testing.T) {
 	cases := []struct {
-		name    string
-		weights []int
-		wantErr bool
+		name       string
+		weights    []int
+		wantPolicy string
+		wantWeight bool
 	}{
-		{"uniform nil-normalized", []int{1, 1}, false},
-		{"uniform equal nonzero", []int{2, 2}, false},
-		{"single provider any weight", []int{7}, false},
-		{"non-uniform 70/30", []int{70, 30}, true},
-		{"non-uniform 2/1", []int{2, 1}, true},
+		{"uniform nil-normalized", []int{1, 1}, `{"mode":"random"}`, false},
+		{"uniform equal nonzero", []int{2, 2}, `{"mode":"random"}`, false},
+		{"single provider any weight", []int{7}, "", false},
+		{"non-uniform 70/30", []int{70, 30}, `{"mode":"weightedRandom"}`, true},
+		{"non-uniform 2/1", []int{2, 1}, `{"mode":"weightedRandom"}`, true},
+		{"non-uniform 80/20", []int{80, 20}, `{"mode":"weightedRandom"}`, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -199,31 +363,136 @@ func TestRender_WeightGuard(t *testing.T) {
 			for i, w := range tc.weights {
 				routes = append(routes, route("m1", string(rune('a'+i)), w))
 			}
-			_, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: routes}), scope(), Revision{}, Options{})
-			if tc.wantErr {
-				if !errors.Is(err, ErrWeightUnsupported) {
-					t.Fatalf("weights %v: want ErrWeightUnsupported, got %v", tc.weights, err)
-				}
-				if !strings.Contains(err.Error(), "ns1/m1") {
-					t.Errorf("error must name the model: %v", err)
-				}
-			} else if err != nil {
+			env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: routes}), scope(), Revision{}, Options{})
+			if err != nil {
 				t.Fatalf("weights %v: unexpected error %v", tc.weights, err)
+			}
+			if string(env.Overlay.SelectionPolicy) != tc.wantPolicy {
+				t.Fatalf("weights %v: selection_policy = %s, want %s", tc.weights, env.Overlay.SelectionPolicy, tc.wantPolicy)
+			}
+			for i, candidate := range env.Overlay.Candidates {
+				if tc.wantWeight {
+					if candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+						t.Fatalf("candidate %d selection_group = %v, want 0", i, candidate.SelectionGroup)
+					}
+					if candidate.TrafficWeight == nil || int(*candidate.TrafficWeight) != tc.weights[i] {
+						t.Fatalf("candidate %d traffic_weight = %v, want %d", i, candidate.TrafficWeight, tc.weights[i])
+					}
+				} else if candidate.TrafficWeight != nil {
+					t.Fatalf("candidate %d traffic_weight = %v, want omitted", i, candidate.TrafficWeight)
+				}
 			}
 		})
 	}
 }
 
-func TestRender_WeightGuardIsPerModel(t *testing.T) {
-	// Model A uniform, model B non-uniform → whole render refused (one
-	// envelope, one source — a bad model must not ship a partial envelope).
+func TestRender_UnequalWeightForcesWeightedRandomOnSiblingModels(t *testing.T) {
+	// Model A uniform, model B unequal → whole overlay uses weightedRandom
+	// because Praxis allows only one selection_policy.mode.
 	set := routeSet(
 		resolver.ModelRoutes{ModelRef: "ns1/a", Routes: []resolver.Route{route("a", "p1", 1), route("a", "p2", 1)}},
 		resolver.ModelRoutes{ModelRef: "ns1/b", Routes: []resolver.Route{route("b", "p1", 7), route("b", "p2", 3)}},
 	)
-	_, err := Render(set, scope(), Revision{}, Options{})
-	if !errors.Is(err, ErrWeightUnsupported) {
-		t.Fatalf("want ErrWeightUnsupported from model b, got %v", err)
+	env, err := Render(set, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if string(env.Overlay.SelectionPolicy) != `{"mode":"weightedRandom"}` {
+		t.Fatalf("selection_policy = %s, want weightedRandom", env.Overlay.SelectionPolicy)
+	}
+	for _, candidate := range env.Overlay.Candidates {
+		if candidate.SelectionGroup == nil || candidate.TrafficWeight == nil {
+			t.Fatalf("weightedRandom candidate missing group/weight: %+v", candidate)
+		}
+	}
+}
+
+func TestRender_WeightedRandomNormalizesMixedCapabilitiesAndPreservesContributions(t *testing.T) {
+	group := uint32(0)
+	weightNine, weightThree := uint32(9), uint32(3)
+	preserved := []Candidate{
+		{Cluster: "preserved-equal-a", StableID: "other/equal-a", Kind: "inference_model", Name: "preserved-equal", Site: "site-a", Fresh: true, SelectionGroup: &group},
+		{Cluster: "preserved-equal-b", StableID: "other/equal-b", Kind: "inference_model", Name: "preserved-equal", Site: "site-a", Fresh: true, SelectionGroup: &group},
+		{Cluster: "preserved-weighted-a", StableID: "other/weighted-a", Kind: "inference_model", Name: "preserved-weighted", Site: "site-a", Fresh: true, SelectionGroup: &group, TrafficWeight: &weightNine},
+		{Cluster: "preserved-weighted-b", StableID: "other/weighted-b", Kind: "inference_model", Name: "preserved-weighted", Site: "site-a", Fresh: true, SelectionGroup: &group, TrafficWeight: &weightThree},
+	}
+	routes := routeSet(
+		resolver.ModelRoutes{ModelRef: "ns1/weighted", Routes: []resolver.Route{route("weighted", "a", 50), route("weighted", "b", 25), route("weighted", "c", 25)}},
+		resolver.ModelRoutes{ModelRef: "ns1/equal", Routes: []resolver.Route{route("equal", "d", 7), route("equal", "e", 7)}},
+		resolver.ModelRoutes{ModelRef: "ns1/single", Routes: []resolver.Route{route("single", "f", 4)}},
+	)
+	env, err := Render(routes, scope(), Revision{}, Options{PreservedCandidates: preserved})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if string(env.Overlay.SelectionPolicy) != `{"mode":"weightedRandom"}` {
+		t.Fatalf("selection_policy = %s, want weightedRandom", env.Overlay.SelectionPolicy)
+	}
+	weightsByStableID := map[string]uint32{
+		"weighted/provider-a": 50, "weighted/provider-b": 25, "weighted/provider-c": 25,
+		"equal/provider-d": 7, "equal/provider-e": 7, "single/provider-f": 4,
+		"other/equal-a": 1, "other/equal-b": 1,
+		"other/weighted-a": 9, "other/weighted-b": 3,
+	}
+	if len(env.Overlay.Candidates) != len(weightsByStableID) {
+		t.Fatalf("candidate count = %d, want %d", len(env.Overlay.Candidates), len(weightsByStableID))
+	}
+	for _, candidate := range env.Overlay.Candidates {
+		want, ok := weightsByStableID[candidate.StableID]
+		if !ok {
+			t.Fatalf("unexpected candidate: %+v", candidate)
+		}
+		if candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+			t.Errorf("candidate %s selection_group = %v, want 0", candidate.StableID, candidate.SelectionGroup)
+		}
+		if candidate.TrafficWeight == nil || *candidate.TrafficWeight != want {
+			got := "<nil>"
+			if candidate.TrafficWeight != nil {
+				got = strconv.FormatUint(uint64(*candidate.TrafficWeight), 10)
+			}
+			t.Errorf("candidate %s traffic_weight = %s, want %d", candidate.StableID, got, want)
+		}
+	}
+}
+
+func TestRender_SelectionPolicyTransitionsOutOfWeightedRandom(t *testing.T) {
+	weighted := routeSet(resolver.ModelRoutes{ModelRef: "ns1/model", Routes: []resolver.Route{
+		route("model", "a", 80), route("model", "b", 20),
+	}})
+	first, err := Render(weighted, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first.Overlay.SelectionPolicy) != `{"mode":"weightedRandom"}` {
+		t.Fatalf("initial policy = %s, want weightedRandom", first.Overlay.SelectionPolicy)
+	}
+	equal := routeSet(resolver.ModelRoutes{ModelRef: "ns1/model", Routes: []resolver.Route{
+		route("model", "a", 4), route("model", "b", 4),
+	}})
+	second, err := Render(equal, scope(), Revision{Generation: first.Provenance.SourceGeneration, Digest: first.Revision.Value}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second.Overlay.SelectionPolicy) != `{"mode":"random"}` || second.Provenance.SourceGeneration != first.Provenance.SourceGeneration+1 {
+		t.Fatalf("weighted->equal policy/generation = %s/%d, want random/%d", second.Overlay.SelectionPolicy,
+			second.Provenance.SourceGeneration, first.Provenance.SourceGeneration+1)
+	}
+	for _, candidate := range second.Overlay.Candidates {
+		if candidate.SelectionGroup == nil || candidate.TrafficWeight != nil {
+			t.Fatalf("equal candidate retained weighted metadata after policy transition: %+v", candidate)
+		}
+	}
+	single := routeSet(resolver.ModelRoutes{ModelRef: "ns1/model", Routes: []resolver.Route{route("model", "a", 4)}})
+	third, err := Render(single, scope(), Revision{Generation: second.Provenance.SourceGeneration, Digest: second.Revision.Value}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(third.Overlay.SelectionPolicy) != 0 || third.Provenance.SourceGeneration != second.Provenance.SourceGeneration+1 {
+		t.Fatalf("equal->singleton policy/generation = %s/%d, want no policy/%d", third.Overlay.SelectionPolicy,
+			third.Provenance.SourceGeneration, second.Provenance.SourceGeneration+1)
+	}
+	if third.Overlay.Candidates[0].SelectionGroup != nil || third.Overlay.Candidates[0].TrafficWeight != nil {
+		t.Fatalf("singleton retained selection metadata: %+v", third.Overlay.Candidates[0])
 	}
 }
 
@@ -334,13 +603,53 @@ func TestRender_RandomGroupsAreScopedPerClientModel(t *testing.T) {
 	}
 }
 
-func TestRender_RejectsUnequalWeightsAcrossSameClientModel(t *testing.T) {
+func TestRender_UnequalWeightsAcrossSameClientModelUseWeightedRandom(t *testing.T) {
 	set := routeSet(
 		resolver.ModelRoutes{ModelRef: "ns1/a", Routes: []resolver.Route{route("shared", "p1", 2)}},
 		resolver.ModelRoutes{ModelRef: "ns1/b", Routes: []resolver.Route{route("shared", "p2", 1)}},
 	)
-	if _, err := Render(set, scope(), Revision{}, Options{}); !errors.Is(err, ErrWeightUnsupported) {
-		t.Fatalf("Render error = %v, want ErrWeightUnsupported", err)
+	env, err := Render(set, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if string(env.Overlay.SelectionPolicy) != `{"mode":"weightedRandom"}` {
+		t.Fatalf("selection_policy = %s, want weightedRandom", env.Overlay.SelectionPolicy)
+	}
+	want := map[string]uint32{"provider-p1": 2, "provider-p2": 1}
+	for _, candidate := range env.Overlay.Candidates {
+		if candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+			t.Fatalf("candidate %s selection_group = %v, want 0", candidate.Cluster, candidate.SelectionGroup)
+		}
+		if candidate.TrafficWeight == nil || *candidate.TrafficWeight != want[candidate.Cluster] {
+			t.Fatalf("candidate %s traffic_weight = %v, want %d", candidate.Cluster, candidate.TrafficWeight, want[candidate.Cluster])
+		}
+	}
+}
+
+func TestRender_WeightChangeBumpsDigest(t *testing.T) {
+	equal := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 1), route("m1", "p2", 1)}})
+	first, err := Render(equal, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unequal := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 80), route("m1", "p2", 20)}})
+	changed, err := Render(unequal, scope(), Revision{Generation: first.Provenance.SourceGeneration, Digest: first.Revision.Value}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Revision.Value == first.Revision.Value {
+		t.Fatal("weight change must bump content digest")
+	}
+	if changed.Provenance.SourceGeneration != first.Provenance.SourceGeneration+1 {
+		t.Fatalf("generation = %d, want %d", changed.Provenance.SourceGeneration, first.Provenance.SourceGeneration+1)
+	}
+	noop, err := Render(unequal, scope(), Revision{Generation: changed.Provenance.SourceGeneration, Digest: changed.Revision.Value}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noop.Provenance.SourceGeneration != changed.Provenance.SourceGeneration || noop.Revision.Value != changed.Revision.Value {
+		t.Fatalf("identical weighted overlay must keep generation/digest: got %d/%s want %d/%s",
+			noop.Provenance.SourceGeneration, noop.Revision.Value, changed.Provenance.SourceGeneration, changed.Revision.Value)
 	}
 }
 

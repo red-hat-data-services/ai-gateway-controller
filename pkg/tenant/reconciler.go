@@ -19,34 +19,37 @@ package tenant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
-
-// notReadyRequeueInterval is used when a MaasTenantConfig has opted into
-// praxis but is not yet ready for it (see GatewayRef / gatewayExists), or when a
-// transition-in is blocked on the IPP migration marker. This is a "come
-// back shortly" wait, distinct from ResyncInterval's steady-state resync.
-const notReadyRequeueInterval = 10 * time.Second
 
 // Reconciler primarily watches MaasTenantConfig CRs (owned by
 // maas-controller) — mirroring maas-controller's own TenantReconciler — and,
@@ -110,22 +113,162 @@ type Reconciler struct {
 	// Log receives one entry per reconcile, plus any render/apply/cleanup
 	// error.
 	Log logr.Logger
+	// Recorder publishes a Warning Event on an AIGuardrail this tenant fails
+	// closed although the guardrail reconciler accepted it. Nil disables them.
+	Recorder events.EventRecorder
+
+	// nemoOutsideInfra holds, per tenant namespace, what reportNemoOutsideInfra
+	// last reported, so it reports only changes.
+	nemoOutsideInfra sync.Map
+}
+
+// tenantEventPredicates returns the watch predicates that filter the tenant
+// reconciler's watches so that only events that can change the rendered
+// praxis stack enqueue a reconcile.
+//
+// Without predicates, every update to a watched object — including status-only
+// writes and Secret metadata bumps — re-applied the whole tenant stack. In
+// busy namespaces (maas-controller status writebacks, test-driven model churn,
+// this controller's own ExternalModel status writes) that produced one full
+// praxis re-apply per unrelated event at event cadence.
+//
+// GenerationChangedPredicate admits creates, deletes, generic events, and
+// updates whose spec changed (metadata.generation bumped); it drops status-only
+// and metadata-only updates, which cannot change the rendered output.
+//
+// The AITenant watch additionally needs status updates that the enqueue
+// mapper or the apply path reads: status.tenantNamespace (the mapper reads
+// it, so the event that first populates it must be admitted or a new
+// AITenant would never map to its MaasTenantConfig), and status.gatewayRef /
+// DeployReady transitions (the apply path targets the Gateway they name, and
+// steady state returns without a requeue). Other status-only writes are
+// dropped. The MaasTenantConfig watch additionally admits changes to the
+// AnnotationPayloadProcessingType annotation, which selects the praxis vs
+// legacy-IPP backend without bumping metadata.generation.
+func tenantEventPredicates() map[string]predicate.Predicate {
+	aitenantUpdate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				aitenantConfigNamespace(e.ObjectOld) != aitenantConfigNamespace(e.ObjectNew) {
+				return true
+			}
+			// The reconcile reads status.gatewayRef and DeployReady to pick
+			// the target Gateway, and the steady-state path returns without
+			// scheduling a requeue: admit their transitions so a gateway
+			// re-claim or Ready↔Failed flip reconciles promptly instead of
+			// waiting out the resync interval.
+			old, oldOK := asUnstructured(e.ObjectOld)
+			current, currentOK := asUnstructured(e.ObjectNew)
+			if !oldOK || !currentOK {
+				return false
+			}
+			oldName, oldNamespace, oldReady := GatewayRef(old)
+			newName, newNamespace, newReady := GatewayRef(current)
+			return oldName != newName || oldNamespace != newNamespace || oldReady != newReady ||
+				DeployReady(old) != DeployReady(current)
+		},
+	}
+	// The payload-processing backend is selected by annotation, which does
+	// not bump metadata.generation. An IPP→praxis flip on an existing
+	// MaasTenantConfig must reconcile promptly: the IPP path returns without
+	// scheduling a requeue, so the resync interval would be the only backstop.
+	maastenantconfigUpdate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				PayloadProcessingType(mustUnstructured(e.ObjectOld)) != PayloadProcessingType(mustUnstructured(e.ObjectNew))
+		},
+	}
+	return map[string]predicate.Predicate{
+		"maastenantconfig": maastenantconfigUpdate,
+		"aitenant":         aitenantUpdate,
+		"externalmodel":    predicate.GenerationChangedPredicate{},
+		"externalprovider": predicate.GenerationChangedPredicate{},
+	}
+}
+
+// asUnstructured converts a watch object to *unstructured.Unstructured.
+func asUnstructured(obj client.Object) (*unstructured.Unstructured, bool) {
+	u, ok := obj.(*unstructured.Unstructured)
+	return u, ok
+}
+
+// mustUnstructured converts a watch object to *unstructured.Unstructured,
+// returning an empty object when the type does not match (annotations of an
+// empty object read as unset, making the comparison a no-op).
+func mustUnstructured(obj client.Object) *unstructured.Unstructured {
+	u, _ := asUnstructured(obj)
+	if u == nil {
+		return &unstructured.Unstructured{}
+	}
+	return u
+}
+
+// aitenantConfigNamespace reads the MaasTenantConfig namespace an AITenant's
+// status points at; empty when unset or the object is not an AITenant.
+func aitenantConfigNamespace(obj client.Object) string {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return ""
+	}
+	namespace, _ := ConfigNamespace(u)
+	return namespace
+}
+
+// notControllerOwnedSecret reports whether a Secret was not rendered by this
+// controller, i.e. is a credential source rather than controller output.
+func notControllerOwnedSecret(obj client.Object) bool {
+	return obj.GetLabels()[managedByLabel] != render.FieldOwner
+}
+
+// tenantSecretPredicate filters the tenant Secret watch. The watch exists to
+// react to credential sources changing in the tenant namespace; without the
+// filter it also fired on this controller's own output — projected credential
+// copies (agc-cred-*) and the payload-processing ServiceAccount's dockercfg —
+// self-triggering a full praxis re-apply per write. OpenShift-injected
+// dockercfg churn (builder/deployer/default tokens) is not excludable at watch
+// time, but it only occurs at namespace lifecycle boundaries, before the
+// MaasTenantConfig it would enqueue exists.
+//
+// Deletes are always admitted, including of controller-owned copies: a copy
+// is removed by the attachment reconciler acting on the model in the model's
+// namespace, which no tenant-side watch maps back to this tenant, so the
+// Secret delete is the only event that can trigger the tenant reconcile
+// dropping the candidate (and its Secret mount) from the rendered stack.
+// Dropping it would leave the ExtProc mounting a deleted Secret — blocking
+// new pods — until the resync interval.
+func tenantSecretPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return notControllerOwnedSecret(e.Object) },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return notControllerOwnedSecret(e.ObjectNew) },
+		GenericFunc: func(e event.GenericEvent) bool { return notControllerOwnedSecret(e.Object) },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	}
 }
 
 // SetupWithManager registers the MaasTenantConfig watch (primary trigger)
-// and a secondary AITenant watch mapped back to the owning MaasTenantConfig,
+// and secondary watches mapped back to the owning MaasTenantConfig,
 // mirroring maas-controller's own TenantReconciler.SetupWithManager shape.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	preds := tenantEventPredicates()
 	return ctrl.NewControllerManagedBy(mgr).
-		For(NewMaasTenantConfig()).
+		For(NewMaasTenantConfig(), builder.WithPredicates(preds["maastenantconfig"])).
 		Watches(
 			NewAITenant(),
 			handler.EnqueueRequestsFromMapFunc(r.enqueueMaasTenantConfigForAITenant),
+			builder.WithPredicates(preds["aitenant"]),
 		).
-		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
-		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
-		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(preds["externalmodel"])).
+		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(preds["externalprovider"])).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(tenantSecretPredicate())).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
+		Watches(&aigatewayv1alpha1.AIGuardrail{},
+			handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(nemoCalloutChanged())).
+		Watches(newMaaSSubscription(), handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
+		Watches(newMaaSModelRef(), handler.EnqueueRequestsFromMapFunc(r.enqueueMaasTenantConfigForModelRef)).
 		Complete(r)
 }
 
@@ -146,11 +289,26 @@ func (r *Reconciler) maasTenantConfigForNamespace(_ context.Context, obj client.
 	}}}
 }
 
-// enqueueMaasTenantConfigForAITenant maps an AITenant event to the
-// MaasTenantConfig it owns, via status.tenantNamespace (see
-// ConfigNamespace) — avoiding any need to duplicate maas-controller's
-// TenantNamespaceForAITenant naming convention, which depends on a
-// configurable default tenant namespace this controller does not know.
+// enqueueMaasTenantConfigForModelRef picks the tenant to update when a model ref changes.
+// A model ref in the tenant namespace updates that tenant. One stored with the model
+// updates each tenant whose subscription points at it, not a tenant config in the model namespace.
+func (r *Reconciler) enqueueMaasTenantConfigForModelRef(ctx context.Context, obj client.Object) []reconcile.Request {
+	namespaces, err := ModelRefTenants(ctx, r.Client, obj)
+	if err != nil {
+		r.Log.Error(err, "resolve tenants for MaaSModelRef watch; subscribing tenants were not enqueued")
+	}
+	requests := make([]reconcile.Request, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      MaasTenantConfigInstanceName,
+		}})
+	}
+	return requests
+}
+
+// enqueueMaasTenantConfigForAITenant updates the tenant named by status.tenantNamespace.
+// The AI Tenant object itself can live in a different namespace.
 func (r *Reconciler) enqueueMaasTenantConfigForAITenant(_ context.Context, obj client.Object) []reconcile.Request {
 	u, ok := obj.(*unstructured.Unstructured)
 	if !ok {
@@ -257,14 +415,16 @@ func (r *Reconciler) gatewayExists(ctx context.Context, namespace, name string) 
 // it must requeue.
 //
 // It returns false (transient ⇒ requeue, not an error) when, read live, the
-// AITenant: is gone; has a different metadata.uid than wantUID; no longer binds
+// AITenant: is gone; has a different metadata.uid than wantUID; has a
+// different metadata.generation than wantGeneration; no longer binds
 // this MaasTenantConfig (status.tenantNamespace); no longer publishes the same
 // status.gatewayRef this reconcile rendered against; or has a non-zero
 // deletionTimestamp (delete already in flight). An empty wantUID disables the
-// check, so a live object always carries a UID and only tests can opt out.
+// check, so a live object always carries a UID and only tests can opt out;
+// a zero wantGeneration opts out of the generation check the same way.
 // This guards the apply path only: delete/cleanup must run regardless of
 // identity (see resolveOwnedAITenant).
-func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstructured.Unstructured, wantUID types.UID, wantGatewayName, wantGatewayNamespace string) (bool, error) {
+func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstructured.Unstructured, wantUID types.UID, wantGeneration int64, wantGatewayName, wantGatewayNamespace string) (bool, error) {
 	if wantUID == "" {
 		return true, nil
 	}
@@ -294,6 +454,15 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	if aitenant.GetUID() != wantUID {
 		return false, nil
 	}
+	// The same spec. DeployReady below rejects a status that is behind the
+	// spec, but it passes once maas re-stamps the condition at the newer
+	// generation -- and by then the resolved copy this reconcile rendered
+	// from is the stale one. spec.guardrails is read on that copy, so a
+	// generation that moved means the check tree about to be written is not
+	// the one the live spec asks for.
+	if wantGeneration != 0 && aitenant.GetGeneration() != wantGeneration {
+		return false, nil
+	}
 	// Ownership bind still holds live (anti-spoof): re-checked because the
 	// resolve above read the possibly-stale cache.
 	if ns, ok := ConfigNamespace(aitenant); !ok || ns != mtc.GetNamespace() {
@@ -314,32 +483,34 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	return true, nil
 }
 
-// reconcilePraxis is the steady-state path for a tenant that currently
-// opts into praxis: ensure the cleanup finalizer is present (before doing
-// anything else, so even a partially-applied tenant is guaranteed a
-// cleanup pass later), wait for readiness, then render/apply.
-func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
+// preparePraxisOwnerForApply ensures cleanup protection and resolves a ready
+// AITenant/Gateway before the Praxis resources are rendered or applied.
+func (r *Reconciler) preparePraxisOwnerForApply(
+	ctx context.Context,
+	log logr.Logger,
+	mtc *unstructured.Unstructured,
+) (*unstructured.Unstructured, string, string, ctrl.Result, error) {
 	if err := r.ensureFinalizer(ctx, mtc); err != nil {
-		return ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
+		return nil, "", "", ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
 	}
 
 	aitenant, ready, err := r.resolveOwningAITenant(ctx, mtc)
 	if err != nil {
-		return ctrl.Result{}, err
+		return nil, "", "", ctrl.Result{}, err
 	}
 	if !ready {
 		log.Info("MaasTenantConfig opted into praxis but owning AITenant is not DeployReady yet (missing/Failed/stale Ready stamp); will retry")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return nil, "", "", ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	gatewayName, gatewayNamespace, gwReady := GatewayRef(aitenant)
 	if !gwReady {
 		log.Info("owning AITenant status.gatewayRef is not populated; will retry")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return nil, "", "", ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 	if err := r.gatewayExists(ctx, gatewayNamespace, gatewayName); err != nil {
 		log.Info("owning AITenant gatewayRef Gateway object is not ready; will retry", "error", err)
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return nil, "", "", ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	// Handshake: claim cleanup-complete → steady. Absent means wait (existing
@@ -347,11 +518,39 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	// cleanup-complete). Status itself is the durable claim — no bundleExists gate.
 	ready, err = EnsurePraxisMayDeploy(ctx, r.Client, mtc)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("ensure praxis may deploy: %w", err)
+		return nil, "", "", ctrl.Result{}, fmt.Errorf("ensure praxis may deploy: %w", err)
 	}
 	if !ready {
 		log.Info("waiting for the legacy IPP cleanup to finish before applying praxis-extproc")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return nil, "", "", ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
+	return aitenant, gatewayName, gatewayNamespace, ctrl.Result{}, nil
+}
+
+// reconcilePraxis is the steady-state path for a tenant that currently
+// opts into praxis: ensure the cleanup finalizer is present (before doing
+// anything else, so even a partially-applied tenant is guaranteed a
+// cleanup pass later), wait for readiness, then render/apply.
+func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
+	aitenant, gatewayName, gatewayNamespace, result, err := r.preparePraxisOwnerForApply(ctx, log, mtc)
+	if err != nil || result.RequeueAfter > 0 {
+		return result, err
+	}
+
+	// The maas-api HTTPRoute lives in the tenant's infrastructure namespace,
+	// and the EnvoyFilter's route-name matches must be qualified with it
+	// (Istio names Gateway API route rules
+	// "<namespace>.<HTTPRoute-name>.<rule-index>"). maas-controller normally
+	// publishes it on the MaasTenantConfig status before it waits on this
+	// controller's EnvoyFilter. If it is not set (an upgrade path where the
+	// status is not republished promptly, for example), the praxis dataplane
+	// must still be rendered and applied: the bypass patches silently no-op
+	// with unqualified names, and the requeue below re-applies the filter
+	// with qualified names once the status appears.
+	infraNamespace, _, _ := unstructured.NestedString(mtc.Object, "status", "infraNamespace")
+	missingInfraNamespace := infraNamespace == ""
+	if missingInfraNamespace {
+		log.Info("MaasTenantConfig status.infraNamespace is not set; applying the praxis dataplane with unqualified maas-api bypass names; will re-apply once it is published")
 	}
 
 	rendered, err := render.Build(r.ManifestPath)
@@ -360,10 +559,11 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	}
 
 	resources := render.PostRender(rendered, render.Params{
-		Namespace:        gatewayNamespace,
-		GatewayName:      gatewayName,
-		Image:            r.Image,
-		MaaSAPIRouteName: ResourceName(r.MaaSAPIRouteNameBase, tenantID),
+		Namespace:             gatewayNamespace,
+		GatewayName:           gatewayName,
+		Image:                 r.Image,
+		MaaSAPIRouteName:      ResourceName(r.MaaSAPIRouteNameBase, tenantID),
+		MaaSAPIRouteNamespace: infraNamespace,
 	})
 
 	resources, err = Rename(resources, tenantID, gatewayNamespace)
@@ -374,39 +574,35 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		log.Error(err, "cannot render praxis-extproc resources for this tenant name; will not retry until the tenant changes")
 		return ctrl.Result{}, nil
 	}
+	apiTranslation, err := APITranslationEnabled(mtc)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("read authoritative MaaS apiTranslation setting: %w", err)
+	}
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, apiTranslation); err != nil {
+		return ctrl.Result{}, fmt.Errorf("configure shared ExtProc: %w", err)
+	}
 	tenantNamespace := mtc.GetNamespace()
-	hasModels, err := r.hasActiveExternalModels(ctx, tenantNamespace, gatewayName, gatewayNamespace)
+	runtimeCandidates, serving, overlayReady, reason, err := r.resolvePraxisRuntimeCandidates(
+		ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	var runtimeCandidates []envelope.Candidate
-	if hasModels {
-		_, requiredProviders, providerErr := r.providersForTenant(ctx, tenantNamespace, gatewayName, gatewayNamespace)
-		if providerErr != nil {
-			return ctrl.Result{}, providerErr
+	if !overlayReady {
+		log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
+	if !serving {
+		if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
+			return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
 		}
-		ready, reason, overlayErr := r.routingOverlayReady(ctx, tenantNamespace, requiredProviders)
-		if overlayErr != nil {
-			return ctrl.Result{}, fmt.Errorf("check routing overlay: %w", overlayErr)
-		}
-		if !ready {
-			log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
-			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
-		}
-		runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-	} else if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
-		return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
 	}
 
 	resources, err = SplitPostAuthResources(resources, tenantID, gatewayNamespace, tenantNamespace)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
 	}
-	if hasModels {
-		if err := configureExternalModelExtProc(resources, tenantNamespace, runtimeCandidates); err != nil {
+	if serving {
+		if err := configureExternalModelExtProc(resources, tenantID, tenantNamespace, runtimeCandidates, apiTranslation); err != nil {
 			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)
 		}
 	} else {
@@ -422,6 +618,10 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		resources = filtered
 		log.Info("omitting controller-managed NetworkPolicy by explicit configuration", "namespace", gatewayNamespace)
 	}
+	scaling := resolveIPPScaling(mtc, log)
+	if err := configureIPPScaling(log, &resources, tenantID, gatewayNamespace, scaling); err != nil {
+		return ctrl.Result{}, fmt.Errorf("configure IPP scaling: %w", err)
+	}
 	for i := range resources {
 		labels := resources[i].GetLabels()
 		if labels == nil {
@@ -430,16 +630,37 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		labels[managedByLabel] = render.FieldOwner
 		resources[i].SetLabels(labels)
 	}
+	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace, apiTranslation)
+	if errors.Is(err, errStaleBinding) {
+		log.Info("guardrail status is behind its spec; keeping the checks already published", "error", err)
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
+	if err != nil && !softCalloutErr(err) {
+		return ctrl.Result{}, err
+	}
+	if err != nil {
+		log.Error(err, "guardrail catalog is incomplete; affected checks fail closed and the rest are published")
+	}
+	r.reportNemoOutsideInfra(ctx, log, tenantNamespace, infraNamespace, pinNemoCalloutsToInfra(callouts, infraNamespace))
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	bindNemoPodSelectors(ctx, reader, callouts)
+	resources, err = configureNemoCallouts(resources, tenantID, gatewayNamespace, tenantNamespace, callouts)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("compile NeMo callouts: %w", err)
+	}
 	if err := r.waitForForeignOwnership(ctx, resources); err != nil {
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	// RHOAIENG-98846: do not ForceOwnership-overwrite a leftover IPP plugins
 	// ConfigMap unless the operator force-annotated the MaasTenantConfig.
 	if err := r.ensurePluginsConfigMapMigrationAllowed(ctx, mtc, gatewayNamespace, tenantID); err != nil {
 		log.Info("waiting for plugins ConfigMap migration gate before applying praxis-extproc", "error", err)
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	// Re-validate the owning AITenant live, immediately before writing cluster
@@ -450,16 +671,22 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	// resolved copy, so if the live object no longer matches on identity,
 	// ownership, readiness, generation, or gateway, it must not be applied
 	// (RHAI-2514 apply-path fence). Transient ⇒ requeue.
-	if valid, err := r.aiTenantStillValidForApply(ctx, mtc, aitenant.GetUID(), gatewayName, gatewayNamespace); err != nil {
+	if valid, err := r.aiTenantStillValidForApply(ctx, mtc, aitenant.GetUID(), aitenant.GetGeneration(), gatewayName, gatewayNamespace); err != nil {
 		return ctrl.Result{}, err
 	} else if !valid {
 		log.Info("owning AITenant changed (uid, ownership, readiness, generation, or gatewayRef) before praxis-extproc apply; will re-resolve")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		log.Error(err, "praxis-extproc apply failed for tenant; will retry")
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
+	}
+	if err := r.cleanupOrphanedIPPHPAs(ctx, tenantID, gatewayNamespace, scaling); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.pruneNemoCallerRBAC(ctx, tenantNamespace, resources); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Drop any leftover tenant-scoped standalone Praxis hop from earlier
@@ -474,7 +701,61 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 
 	log.Info("praxis-extproc install applied",
 		"tenantID", tenantID, "namespace", gatewayNamespace, "gatewayName", gatewayName)
+	if missingInfraNamespace {
+		// The bypass route names were rendered unqualified; re-apply once the
+		// MaasTenantConfig publishes its infrastructure namespace.
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+}
+
+func (r *Reconciler) resolvePraxisRuntimeCandidates(
+	ctx context.Context,
+	tenantNamespace, gatewayName, gatewayNamespace string,
+	apiTranslation bool,
+) ([]envelope.Candidate, bool, bool, string, error) {
+	hasModels, err := r.hasActiveExternalModels(ctx, tenantNamespace, gatewayName, gatewayNamespace)
+	if err != nil {
+		return nil, false, false, "", err
+	}
+	attached, unreadableOverlay, err := r.attachedOverlayCandidates(ctx, tenantNamespace)
+	if err != nil {
+		return nil, false, false, "", err
+	}
+	homeCandidates, policyExcludedOnly, homeErr := r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
+	if homeErr != nil && !errors.Is(homeErr, resolver.ErrNoRoutes) {
+		return nil, false, false, "", homeErr
+	}
+	// An unreadable overlay may still carry attachments: keep the processor
+	// and let routingOverlayReady report it, as for the tenant's own models.
+	serving := hasModels || len(homeCandidates) > 0 || len(attached) > 0 || unreadableOverlay
+	if !serving {
+		return nil, false, true, "", nil
+	}
+
+	if policyExcludedOnly && len(attached) == 0 && !unreadableOverlay {
+		// The model controller has withdrawn every home route on purpose. Its
+		// overlay may already be gone, so do not wait for it before applying
+		// shared tenant configuration and cleanup.
+		return nil, false, true, "", nil
+	}
+
+	_, requiredProviders, err := r.providersForTenant(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
+	if err != nil {
+		return nil, false, false, "", err
+	}
+	ready, reason, err := r.routingOverlayReady(ctx, tenantNamespace, requiredProviders)
+	if err != nil {
+		return nil, false, false, "", fmt.Errorf("check routing overlay: %w", err)
+	}
+	if !ready {
+		return nil, true, false, reason, nil
+	}
+	candidates, err := combineRuntimeCandidates(homeCandidates, attached, homeErr, policyExcludedOnly)
+	if err != nil {
+		return nil, false, false, "", err
+	}
+	return candidates, true, true, "", nil
 }
 
 // deleteStandalonePraxis removes controller-owned standalone Praxis resources
@@ -546,7 +827,19 @@ func (r *Reconciler) cleanupExternalModelResources(ctx context.Context, tenantID
 		{gvkEnvoyFilter, PayloadProcessingExternalModelFilterNameForTenant(tenantID), gatewayNamespace},
 		{gvkEnvoyFilter, PayloadProcessingExternalModelEnvoyFilterName(tenantID), gatewayNamespace},
 	}
+	// The route filter also carries patches for attachments from other
+	// namespaces, which can be written before this tenant observes them in
+	// the published overlay. The ExternalModel reconciler owns that filter
+	// while any attachment route targets this tenant.
+	attachments := &unstructured.UnstructuredList{}
+	attachments.SetGroupVersionKind(gvkHTTPRoute.GroupVersion().WithKind("HTTPRouteList"))
+	if err := r.Client.List(ctx, attachments, client.MatchingLabels{LabelManagedBy: ManagedByAIGatewayController, LabelAttachmentTenant: tenantNamespace}); err != nil {
+		return fmt.Errorf("list attachment HTTPRoutes for %s: %w", tenantNamespace, err)
+	}
 	for _, target := range targets {
+		if len(attachments.Items) > 0 && target.gvk == gvkEnvoyFilter && target.name == PayloadProcessingExternalModelEnvoyFilterName(tenantID) {
+			continue
+		}
 		if err := r.deleteResourceIfOwned(ctx, target.gvk, target.name, target.namespace); err != nil {
 			return err
 		}
@@ -554,10 +847,14 @@ func (r *Reconciler) cleanupExternalModelResources(ctx context.Context, tenantID
 	return nil
 }
 
-func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayName, gatewayNamespace string) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
+func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
 	var providers v1alpha1.ExternalProviderList
 	if err := r.Client.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
 		return nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
+	}
+	providerTypes := make(map[string]string, len(providers.Items))
+	for i := range providers.Items {
+		providerTypes[providers.Items[i].Name] = providers.Items[i].Spec.Provider
 	}
 	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
 	if err != nil {
@@ -566,13 +863,18 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	referenced := map[string]bool{}
 	required := map[string]bool{}
 	for i := range models {
+		if !models[i].DeletionTimestamp.IsZero() {
+			continue
+		}
 		for _, ref := range models[i].Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
-			if name == "" {
+			// A provider in another namespace is never a same-named local one.
+			if name == "" || ref.Ref.Namespace != "" && ref.Ref.Namespace != namespace {
 				continue
 			}
 			referenced[name] = true
-			if ref.Weight == nil || *ref.Weight > 0 {
+			translationDisabled := !apiTranslationEnabled && ref.APIFormat == "messages" && providerTypes[name] == "anthropic"
+			if (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled {
 				required[name] = true
 			}
 		}
@@ -580,7 +882,7 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	result := make([]v1alpha1.ExternalProvider, 0, len(providers.Items))
 	availableRequired := make(map[string]bool, len(required))
 	for i := range providers.Items {
-		if referenced[providers.Items[i].Name] {
+		if providers.Items[i].DeletionTimestamp.IsZero() && referenced[providers.Items[i].Name] {
 			result = append(result, providers.Items[i])
 			if required[providers.Items[i].Name] {
 				availableRequired[providers.Items[i].Name] = true
@@ -592,46 +894,164 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	return result, availableRequired, nil
 }
 
-func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string) ([]envelope.Candidate, error) {
+func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]envelope.Candidate, bool, error) {
 	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var providers v1alpha1.ExternalProviderList
 	if err := r.Client.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("list ExternalProviders for ExtProc runtime configuration: %w", err)
+		return nil, false, fmt.Errorf("list ExternalProviders for ExtProc runtime configuration: %w", err)
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
 	for i := range models {
-		modelPtrs = append(modelPtrs, &models[i])
+		if !models[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		// Providers in other namespaces are loaded from the published overlay
+		// (attachedOverlayCandidates), so a model referencing only those has
+		// no local runtime candidates.
+		if slices.ContainsFunc(models[i].Spec.ExternalProviderRefs, func(ref v1alpha1.ExternalProviderRef) bool {
+			return ref.Ref.Namespace == "" || ref.Ref.Namespace == namespace
+		}) {
+			modelPtrs = append(modelPtrs, &models[i])
+		}
 	}
+
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
-		providerPtrs = append(providerPtrs, &providers.Items[i])
-	}
-	runtimeSet, err := resolver.ResolveAll(modelPtrs, providerPtrs)
-	if err != nil {
-		return nil, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
-	}
-	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
-	for _, route := range runtimeSet.Routes() {
-		strategy, err := envelope.StrategyFor(route)
-		if err != nil {
-			return nil, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
+		if providers.Items[i].DeletionTimestamp.IsZero() {
+			providerPtrs = append(providerPtrs, &providers.Items[i])
 		}
-		candidate := envelope.Candidate{
-			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
-			Kind: "inference_model", Name: route.ClientName, Fresh: true,
+	}
+	runtimeSet, err := resolver.ResolveAllWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled)
+	policyExcludedOnly := allRuntimeRoutesExcludedByPolicy(runtimeSet)
+	if err != nil && !errors.Is(err, resolver.ErrNoRoutes) {
+		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
+	}
+	candidates, candidateErr := ExternalModelRuntimeCandidates(runtimeSet, apiTranslationEnabled)
+	if candidateErr != nil {
+		return nil, false, candidateErr
+	}
+	candidates, candidateErr = RetainHomeRuntimeCandidates(ctx, r.Client, namespace, candidates, apiTranslationEnabled)
+	if candidateErr != nil {
+		return nil, false, candidateErr
+	}
+	if errors.Is(err, resolver.ErrNoRoutes) && len(candidates) == 0 && len(modelPtrs) > 0 {
+		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
+	}
+	return candidates, policyExcludedOnly, nil
+}
+
+// allRuntimeRoutesExcludedByPolicy distinguishes an intentional translation
+// exclusion from a missing or unready provider. The latter must retain the
+// last applied runtime configuration until the provider recovers.
+func allRuntimeRoutesExcludedByPolicy(set *resolver.ResolvedRouteSet) bool {
+	if set == nil || len(set.Models) == 0 {
+		return false
+	}
+	sawExclusion := false
+	for _, model := range set.Models {
+		if len(model.Routes) > 0 || len(model.Skips) == 0 {
+			return false
 		}
-		if strategy != "" {
-			candidate.Credential = &envelope.Credential{
-				Strategy:  strategy,
-				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
+		for _, skip := range model.Skips {
+			if skip.Reason != resolver.SkipTranslationDisabled {
+				return false
+			}
+			sawExclusion = true
+		}
+	}
+	return sawExclusion
+}
+
+// combineRuntimeCandidates allows an intentional policy exclusion to leave
+// only attached candidates. Other ErrNoRoutes causes preserve the last
+// applied runtime configuration by returning the error.
+func combineRuntimeCandidates(home, attached []envelope.Candidate, homeErr error, policyExcludedOnly bool) ([]envelope.Candidate, error) {
+	if errors.Is(homeErr, resolver.ErrNoRoutes) && policyExcludedOnly {
+		home = nil
+		homeErr = nil
+	}
+	if homeErr != nil {
+		return nil, homeErr
+	}
+	return append(home, attached...), nil
+}
+
+// attachedOverlayCandidates returns the published overlay candidates that
+// ExternalModels or ExternalProviders from other namespaces contribute to this
+// tenant. They carry scoped stable IDs and reference credential Secrets in the
+// tenant namespace, mostly copies.
+// A candidate whose copy no longer exists is skipped: its attachment was
+// removed and the entry is inert until the next overlay publish drops it,
+// so mounting the missing Secret would only block the ExtProc rollout.
+// Absence is confirmed against the API server, because the metadata cache can
+// lag the copy written alongside the overlay that triggered this reconcile.
+// The bool reports a controller-owned overlay that cannot be parsed.
+func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, bool, error) {
+	var configMap corev1.ConfigMap
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: praxisOverlayName}, &configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("get routing overlay %s/%s: %w", namespace, praxisOverlayName, err)
+	}
+	if configMap.GetLabels()[managedByLabel] != render.FieldOwner {
+		return nil, false, nil
+	}
+	var env envelope.Envelope
+	if json.Unmarshal([]byte(configMap.Data[praxisOverlayDataKey]), &env) != nil {
+		// routingOverlayReady reports the invalid overlay as not ready.
+		return nil, true, nil //nolint:nilerr // readiness, not an error
+	}
+	var attached []envelope.Candidate
+	for _, candidate := range env.Overlay.Candidates {
+		if !envelope.IsScopedStableID(candidate.StableID) {
+			continue
+		}
+		if candidate.Credential != nil {
+			copySecret := &metav1.PartialObjectMetadata{}
+			copySecret.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
+			key := client.ObjectKey{Namespace: candidate.Credential.SecretRef.Namespace, Name: candidate.Credential.SecretRef.Name}
+			if err := r.Client.Get(ctx, key, copySecret); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return nil, false, fmt.Errorf("get credential copy %s: %w", key, err)
+				}
+				// The cache can lag the write that published this overlay
+				// entry: the overlay ConfigMap event that triggered this
+				// reconcile can arrive before the Secret informer observed
+				// the copy written alongside it. Read the API server before
+				// concluding the copy is gone — answering the lag as absence
+				// silently drops the candidate from the rendered ExtProc
+				// mount until the next event. Mirrors the live-read fallback
+				// in the attachment reconciler's credentialCopyOwned.
+				if r.APIReader == nil {
+					continue
+				}
+				if err := r.APIReader.Get(ctx, key, copySecret); err != nil {
+					if apierrors.IsNotFound(err) {
+						continue
+					}
+					return nil, false, fmt.Errorf("live get credential copy %s: %w", key, err)
+				}
+			}
+			// Credential.Header is json:"-" and is lost on the overlay round-trip;
+			// restore it from the copy Secret stamped at attach time — but only from
+			// a Secret marked as a credential copy, and only when the stamped value is
+			// a header the controller qualifies. A header annotation on an untrusted
+			// or unexpected Secret in the tenant namespace must never drive
+			// credential_inject; an unrecognized value leaves the header unset
+			// (bearer_token semantics), failing closed rather than injecting it.
+			if copySecret.GetLabels()[LabelCredentialCopy] == "true" {
+				if header := copySecret.GetAnnotations()[AnnotationCredentialHeader]; envelope.IsQualifiedAuthHeader(header) {
+					candidate.Credential.Header = header
+				}
 			}
 		}
-		candidates = append(candidates, candidate)
+		attached = append(attached, candidate)
 	}
-	return candidates, nil
+	return attached, false, nil
 }
 
 func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders map[string]bool) (bool, string, error) {
@@ -686,7 +1106,7 @@ func (r *Reconciler) waitForForeignOwnership(ctx context.Context, resources []un
 		}
 		current := &unstructured.Unstructured{}
 		current.SetGroupVersionKind(desired.GroupVersionKind())
-		if err := r.Client.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
@@ -725,12 +1145,12 @@ func (r *Reconciler) reconcileNotPraxis(ctx context.Context, log logr.Logger, mt
 	}
 	if aitenant == nil {
 		log.Info("waiting for owning AITenant before praxis-extproc cleanup after switch-away")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 	_, gatewayNamespace, gwReady := GatewayRef(aitenant)
 	if !gwReady {
 		log.Info("waiting for status.gatewayRef before praxis-extproc cleanup after switch-away")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	if err := r.cleanup(ctx, tenantID, gatewayNamespace, mtc.GetNamespace()); err != nil {
@@ -773,13 +1193,13 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, log logr.Logger, mtc *
 	}
 	if aitenant == nil {
 		log.Info("MaasTenantConfig deleting but owning AITenant is not resolvable yet; will retry cleanup")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	_, gatewayNamespace, gwReady := GatewayRef(aitenant)
 	if !gwReady {
 		log.Info("MaasTenantConfig deleting but status.gatewayRef is not populated; will retry cleanup")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	if err := r.cleanup(ctx, tenantID, gatewayNamespace, mtc.GetNamespace()); err != nil {
@@ -851,6 +1271,7 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, te
 		{gvkConfigMap, PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID), tenantNamespace},
 		{gvkServiceAccount, PayloadProcessingServiceAccountName(tenantID), gatewayNamespace},
 		{gvkServiceAccount, PayloadProcessingServiceAccountName(tenantID), tenantNamespace},
+		{gvkServiceAccount, PayloadProcessingPostServiceAccountName(tenantID), gatewayNamespace},
 		{gvkServiceAccount, PayloadProcessingPostServiceAccountName(tenantID), tenantNamespace},
 		{gvkServiceAccount, PayloadProcessingExternalModelServiceAccountName(tenantID), tenantNamespace},
 		{gvkNetworkPolicy, PayloadProcessingNetworkPolicyName(tenantID), gatewayNamespace},
@@ -865,11 +1286,47 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, te
 		{gvkDestinationRule, PayloadProcessingExternalModelServiceName(tenantID), tenantNamespace},
 		{gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID), ""},
 		{gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingPostNameForTenant(tenantID), ""},
+		{gvkHPA, PayloadProcessingHPAName(tenantID), gatewayNamespace},
+		{gvkHPA, PayloadPreProcessingHPAName(tenantID), gatewayNamespace},
 	}
 
 	for _, t := range targets {
 		if err := r.deleteResourceIfOwned(ctx, t.gvk, t.name, t.namespace); err != nil {
 			return err
+		}
+	}
+	if err := r.pruneNemoCallerRBAC(ctx, tenantNamespace, nil); err != nil {
+		return err
+	}
+	r.nemoOutsideInfra.Delete(tenantNamespace)
+	return r.cleanupAttachmentState(ctx, tenantNamespace)
+}
+
+// cleanupAttachmentState removes what ExternalModels from other namespaces
+// contributed to this tenant: credential copies in the tenant namespace and
+// their Gateway-namespace DestinationRules. Their HTTPRoutes live in the model
+// namespaces and stay owned by the ExternalModel reconciler.
+func (r *Reconciler) cleanupAttachmentState(ctx context.Context, tenantNamespace string) error {
+	copies := &metav1.PartialObjectMetadataList{}
+	copies.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("SecretList"))
+	if err := r.Client.List(ctx, copies, client.InNamespace(tenantNamespace),
+		client.MatchingLabels{LabelManagedBy: ManagedByAIGatewayController, LabelCredentialCopy: "true"}); err != nil {
+		return fmt.Errorf("list credential copies in %s: %w", tenantNamespace, err)
+	}
+	for i := range copies.Items {
+		if err := client.IgnoreNotFound(r.deleteWithUIDPrecondition(ctx, &copies.Items[i])); err != nil {
+			return fmt.Errorf("delete credential copy %s/%s: %w", tenantNamespace, copies.Items[i].GetName(), err)
+		}
+	}
+	rules := &unstructured.UnstructuredList{}
+	rules.SetGroupVersionKind(gvkDestinationRule.GroupVersion().WithKind("DestinationRuleList"))
+	if err := r.Client.List(ctx, rules,
+		client.MatchingLabels{LabelManagedBy: ManagedByAIGatewayController, LabelAttachmentTenant: tenantNamespace}); err != nil {
+		return fmt.Errorf("list attachment DestinationRules for %s: %w", tenantNamespace, err)
+	}
+	for i := range rules.Items {
+		if err := client.IgnoreNotFound(r.deleteWithUIDPrecondition(ctx, &rules.Items[i])); err != nil {
+			return fmt.Errorf("delete attachment DestinationRule %s/%s: %w", rules.Items[i].GetNamespace(), rules.Items[i].GetName(), err)
 		}
 	}
 	return nil
@@ -880,7 +1337,7 @@ func (r *Reconciler) deleteResourceIfOwned(ctx context.Context, gvk schema.Group
 	obj.SetGroupVersionKind(gvk)
 	obj.SetName(name)
 	obj.SetNamespace(namespace)
-	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
@@ -889,8 +1346,18 @@ func (r *Reconciler) deleteResourceIfOwned(ctx context.Context, gvk schema.Group
 	if !shouldDeletePraxisResource(obj) {
 		return nil
 	}
-	if err := client.IgnoreNotFound(r.Client.Delete(ctx, obj)); err != nil {
+	if err := client.IgnoreNotFound(r.deleteWithUIDPrecondition(ctx, obj)); err != nil {
 		return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, namespace, name, err)
 	}
 	return nil
+}
+
+func (r *Reconciler) deleteWithUIDPrecondition(ctx context.Context, obj client.Object) error {
+	uid := obj.GetUID()
+	if uid == "" {
+		return r.Client.Delete(ctx, obj)
+	}
+	return r.Client.Delete(ctx, obj, &client.DeleteOptions{
+		Preconditions: metav1.NewUIDPreconditions(string(uid)),
+	})
 }

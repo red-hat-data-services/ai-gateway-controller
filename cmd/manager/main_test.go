@@ -26,7 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
-const wantFallbackImage = "quay.io/opendatahub/odh-praxis-extproc:odh-stable"
+const wantFallbackImage = "quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874"
 
 func TestResolveExtprocImageUsesEnvVar(t *testing.T) {
 	digest := "quay.io/opendatahub/odh-praxis-extproc@sha256:abc123"
@@ -117,5 +117,37 @@ func TestApplyLogDevelopmentUnsetLeavesDefault(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("stderr write on unset: %q", buf.String())
+	}
+}
+
+func TestBuildMetricsServerOptionsSecure(t *testing.T) {
+	opts := buildMetricsServerOptions(":8443", true)
+	if opts.BindAddress != ":8443" {
+		t.Fatalf("BindAddress = %q, want :8443", opts.BindAddress)
+	}
+	if !opts.SecureServing {
+		t.Fatal("SecureServing = false, want true")
+	}
+	if opts.CertDir != metricsCertDir {
+		t.Fatalf("CertDir = %q, want %q", opts.CertDir, metricsCertDir)
+	}
+	if opts.FilterProvider == nil {
+		t.Fatal("FilterProvider is nil, want non-nil")
+	}
+}
+
+func TestBuildMetricsServerOptionsInsecure(t *testing.T) {
+	opts := buildMetricsServerOptions(":8080", false)
+	if opts.BindAddress != ":8080" {
+		t.Fatalf("BindAddress = %q, want :8080", opts.BindAddress)
+	}
+	if opts.SecureServing {
+		t.Fatal("SecureServing = true, want false")
+	}
+	if opts.CertDir != "" {
+		t.Fatalf("CertDir = %q, want empty", opts.CertDir)
+	}
+	if opts.FilterProvider != nil {
+		t.Fatal("FilterProvider is set, want nil")
 	}
 }

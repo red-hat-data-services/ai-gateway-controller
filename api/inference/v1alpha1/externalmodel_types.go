@@ -56,7 +56,8 @@ type ExternalModelSpec struct {
 	ExternalProviderRefs []ExternalProviderRef `json:"externalProviderRefs"`
 
 	// GatewayRefs explicitly selects the Praxis gateways that serve this model.
-	// Omission retains tenant-local resolution; it does not select a global gateway.
+	// When omitted, the tenant whose MaasTenantConfig is in the model namespace
+	// serves the model; in a namespace of no tenant, the default tenant's Gateway does.
 	// Names are distinct across namespaces. An explicit empty list is invalid.
 	// +optional
 	// +kubebuilder:validation:MinItems=1
@@ -102,8 +103,8 @@ type ExternalProviderRef struct {
 
 	// Config holds model-specific configuration as key-value pairs.
 	// Overrides the ExternalProvider config for this model-provider binding,
-	// except tls.caCertificates, which configures shared provider transport and
-	// must be set on the ExternalProvider.
+	// except tls.caCertificates and tls.credentialName, which configure shared
+	// provider transport and must be set on the ExternalProvider.
 	// +optional
 	Config map[string]string `json:"config,omitempty"`
 
@@ -113,10 +114,12 @@ type ExternalProviderRef struct {
 	// +optional
 	Auth *AuthConfig `json:"auth,omitempty"`
 
-	// Weight controls eligibility for this provider binding. Zero disables the
-	// binding; an omitted weight defaults to one. Multiple eligible providers
-	// for the same client model must have equal positive weights and are selected
-	// uniformly. Unequal positive weights are not supported.
+	// Weight controls relative traffic among eligible providers for this
+	// client model. Zero disables the binding; an omitted weight defaults to
+	// one. Equal positive weights are selected uniformly (Praxis mode random).
+	// Unequal positive weights are selected proportionally (Praxis mode
+	// weightedRandom); the CRD value (1–100) is passed through as overlay
+	// traffic_weight (Praxis accepts 1–1000).
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100
@@ -195,8 +198,4 @@ type ExternalModelList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ExternalModel `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&ExternalModel{}, &ExternalModelList{})
 }

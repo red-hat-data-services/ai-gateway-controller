@@ -91,7 +91,7 @@ spec:
                           description: |-
                             Type identifies the auth type for this provider.
                             e.g. "apikey" (header based), "sigv4", etc.
-                            "simple" is retained for installed-schema compatibility.
+                            "simple" is retained for installed-schema compatibility and is served as "apikey".
                           enum:
                           - apikey
                           - simple
@@ -108,8 +108,8 @@ spec:
                       description: |-
                         Config holds model-specific configuration as key-value pairs.
                         Overrides the ExternalProvider config for this model-provider binding,
-                        except tls.caCertificates, which configures shared provider transport and
-                        must be set on the ExternalProvider.
+                        except tls.caCertificates and tls.credentialName, which configure shared
+                        provider transport and must be set on the ExternalProvider.
                       type: object
                     path:
                       description: |-
@@ -152,10 +152,12 @@ spec:
                     weight:
                       default: 1
                       description: |-
-                        Weight controls eligibility for this provider binding. Zero disables the
-                        binding; an omitted weight defaults to one. Multiple eligible providers
-                        for the same client model must have equal positive weights and are selected
-                        uniformly. Unequal positive weights are not supported.
+                        Weight controls relative traffic among eligible providers for this
+                        client model. Zero disables the binding; an omitted weight defaults to
+                        one. Equal positive weights are selected uniformly (Praxis mode random).
+                        Unequal positive weights are selected proportionally (Praxis mode
+                        weightedRandom); the CRD value (1–100) is passed through as overlay
+                        traffic_weight (Praxis accepts 1–1000).
                       maximum: 100
                       minimum: 0
                       type: integer
@@ -171,7 +173,8 @@ spec:
               gatewayRefs:
                 description: |-
                   GatewayRefs explicitly selects the Praxis gateways that serve this model.
-                  Omission retains tenant-local resolution; it does not select a global gateway.
+                  When omitted, the tenant whose MaasTenantConfig is in the model namespace
+                  serves the model; in a namespace of no tenant, the default tenant's Gateway does.
                   Names are distinct across namespaces. An explicit empty list is invalid.
                 items:
                   description: NamespacedObjectReference identifies a Gateway or HTTPRoute

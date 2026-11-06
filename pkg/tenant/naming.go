@@ -16,6 +16,8 @@ limitations under the License.
 
 package tenant
 
+import "knative.dev/pkg/kmeta"
+
 // ID returns the resource-naming tenant identifier for an AITenant name.
 // The default/legacy AITenant keeps the empty identifier so its resources
 // stay unsuffixed (mirrors maas-controller's tenantreconcile.TenantIdentifierFor
@@ -33,7 +35,7 @@ func ResourceName(base, tenantID string) string {
 	if tenantID == "" {
 		return base
 	}
-	return base + "-" + tenantID
+	return kmeta.ChildName(base+"-", tenantID)
 }
 
 func PayloadProcessingDeploymentName(tenantID string) string {
@@ -56,10 +58,13 @@ func PayloadProcessingServiceAccountName(tenantID string) string {
 	return ResourceName(PayloadProcessingName, tenantID)
 }
 
-// PayloadProcessingPostServiceAccountName is intentionally distinct from
-// MaaS's payload-processing ServiceAccount. MaaS's shared IPP reader binding
-// may grant that account Secret access; the post-auth ExtProc only needs
-// projected volumes and must not inherit the shared MaaS permissions.
+// PayloadProcessingPostServiceAccountName is the gateway-namespace post-auth
+// ExtProc's ServiceAccount. It is intentionally distinct from MaaS's
+// payload-processing ServiceAccount, which the pre-auth ExtProc keeps: MaaS's
+// shared IPP reader binding may grant that account Secret access, while the
+// post-auth ExtProc only needs projected volumes. It holds no binding but the
+// NeMo caller grants, so the token it sends to an authenticated NeMo server
+// carries nothing else.
 func PayloadProcessingPostServiceAccountName(tenantID string) string {
 	return ResourceName(PayloadProcessingName+"-post", tenantID)
 }
@@ -89,6 +94,14 @@ func PayloadProcessingNetworkPolicyName(tenantID string) string {
 
 func PayloadProcessingEnvoyFilterName(tenantID string) string {
 	return ResourceName(PayloadProcessingName, tenantID)
+}
+
+func PayloadProcessingHPAName(tenantID string) string {
+	return ResourceName(PayloadProcessingName, tenantID)
+}
+
+func PayloadPreProcessingHPAName(tenantID string) string {
+	return ResourceName(PayloadPreProcessingName, tenantID)
 }
 
 // PayloadProcessingExternalModelEnvoyFilterName is owned exclusively by the
