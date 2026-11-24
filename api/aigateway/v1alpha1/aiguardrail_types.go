@@ -75,11 +75,13 @@ type AIGuardrailSpec struct {
 }
 
 // AIGuardrailProvider configures the TrustyAI provider used by a guardrail.
+// Exactly one provider must be set.
+// +kubebuilder:validation:ExactlyOneOf=nemo
 type AIGuardrailProvider struct {
 	// Nemo references a NemoGuardrails resource. If Namespace is omitted,
 	// the reference resolves in the AIGuardrail namespace.
-	// +kubebuilder:validation:Required
-	Nemo AIGuardrailNemoProvider `json:"nemo"`
+	// +optional
+	Nemo *AIGuardrailNemoProvider `json:"nemo,omitempty"`
 
 	// Format=duration is omitted because it admits strings metav1.Duration cannot
 	// decode. Kept apart from the field doc so it stays out of the CRD description.

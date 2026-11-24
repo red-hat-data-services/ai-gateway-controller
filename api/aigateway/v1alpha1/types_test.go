@@ -38,7 +38,7 @@ func TestAIGuardrailDeepCopy(t *testing.T) {
 	original := &AIGuardrail{
 		Spec: AIGuardrailSpec{
 			Provider: AIGuardrailProvider{
-				Nemo: AIGuardrailNemoProvider{
+				Nemo: &AIGuardrailNemoProvider{
 					Ref: AIGuardrailNamespacedReference{Name: "tenant-nemo", Namespace: "guardrails"},
 				},
 			},
@@ -52,4 +52,6 @@ func TestAIGuardrailDeepCopy(t *testing.T) {
 	assert.Equal(t, original.Spec, copied.Spec)
 	copied.Spec.Checks[0].Phases[0] = GuardrailPhaseOutput
 	assert.Equal(t, GuardrailPhaseInput, original.Spec.Checks[0].Phases[0])
+	copied.Spec.Provider.Nemo.Ref.Name = "other-nemo"
+	assert.Equal(t, "tenant-nemo", original.Spec.Provider.Nemo.Ref.Name)
 }

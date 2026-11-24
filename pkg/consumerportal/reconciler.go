@@ -31,11 +31,14 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	discv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"knative.dev/pkg/network"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -68,6 +71,11 @@ const (
 	// name only breaks ties deterministically when several Routes front the
 	// same Gateway.
 	GatewayRouteName = "maas-gateway-route"
+
+	gatewayNameLabel = "gateway.networking.k8s.io/gateway-name"
+	routeKindService = "Service"
+	routeAdmitted    = "Admitted"
+	conditionTrue    = "True"
 )
 
 var (
@@ -362,7 +370,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		log.Info("default AITenant status.gatewayRef is not populated yet; will retry")
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
-	hostname, err := r.gatewayHostname(ctx, gatewayNamespace, gatewayName)
+	hostname, listener, err := r.gatewayHostname(ctx, gatewayNamespace, gatewayName)
 	if err != nil {
 		log.Info("cannot determine the Gateway hostname for the OIDC callback; will retry", "error", err)
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
@@ -427,23 +435,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, fmt.Errorf("render: %w", err)
 	}
 	resources := Render(rendered, Params{
-		Namespace:          infraNamespace,
-		DashboardNamespace: dashboardNamespace,
-		Instance:           mtc.GetNamespace(),
-		Image:              r.Image,
-		OIDCIssuerURL:      issuerURL,
-		OIDCClientID:       OIDCClientID(aitenant),
-		RedisConnectionURL: redisURL,
-		RedisHash:          redisHash,
-		Hostname:           hostname,
-		GatewayName:        gatewayName,
-		GatewayNamespace:   gatewayNamespace,
-		AuthorinoNamespace: r.authorinoNamespace(),
-		ProviderCAKeys:     caKeys,
-		CABundleHash:       caBundleHash,
-		CredentialsHash:    credentialsHash,
-		RefreshInterval:    RefreshInterval(aitenant),
-		CookieExpire:       CookieExpire(aitenant),
+		Namespace:           infraNamespace,
+		DashboardNamespace:  dashboardNamespace,
+		Instance:            mtc.GetNamespace(),
+		Image:               r.Image,
+		OIDCIssuerURL:       issuerURL,
+		OIDCClientID:        OIDCClientID(aitenant),
+		RedisConnectionURL:  redisURL,
+		RedisHash:           redisHash,
+		Hostname:            hostname,
+		GatewayName:         gatewayName,
+		GatewayNamespace:    gatewayNamespace,
+		GatewayListenerName: listener.Name,
+		AuthorinoNamespace:  r.authorinoNamespace(),
+		ProviderCAKeys:      caKeys,
+		CABundleHash:        caBundleHash,
+		CredentialsHash:     credentialsHash,
+		RefreshInterval:     RefreshInterval(aitenant),
+		CookieExpire:        CookieExpire(aitenant),
 	})
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
@@ -719,64 +728,60 @@ func (r *Reconciler) resolveOwnedAITenant(ctx context.Context, mtc *unstructured
 //     concrete hostname is published on the Route instead).
 //
 // An HTTPS listener is required regardless of source: the portal HTTPRoutes
-// attach to the Gateway's https section and the OIDC callback is served over
+// attach to the selected HTTPS listener and the OIDC callback is served over
 // TLS, so a Gateway without one can never serve the portal and the
 // reconciliation fails closed instead of deploying one that cannot work.
-func (r *Reconciler) gatewayHostname(ctx context.Context, namespace, name string) (string, error) {
+func (r *Reconciler) gatewayHostname(ctx context.Context, namespace, name string) (string, Listener, error) {
 	gw := &unstructured.Unstructured{}
 	gw.SetGroupVersionKind(gvkGateway)
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, gw); err != nil {
-		return "", fmt.Errorf("get Gateway %s/%s: %w", namespace, name, err)
+		return "", Listener{}, fmt.Errorf("get Gateway %s/%s: %w", namespace, name, err)
 	}
-	if !hasHTTPSListener(gw) {
-		return "", fmt.Errorf("gateway %s/%s has no HTTPS listener; the portal routes and OIDC callback require one", namespace, name)
+	listener, hasListener := SelectListener(gw)
+	if !hasListener {
+		return "", Listener{}, fmt.Errorf(
+			"gateway %s/%s has no HTTPS listener; the portal routes and OIDC callback require one",
+			namespace, name)
 	}
+	listenerHostname := listener.Hostname
 	hostname := ListenerHostname(gw)
 	if hostname == "" {
-		hostname = gatewayStatusHostname(gw)
+		hostname = gatewayStatusHostname(gw, listenerHostname)
 	}
 	if hostname == "" {
-		routeHost, err := r.gatewayRouteHostname(ctx, namespace, name)
+		routeHost, err := r.gatewayRouteHostname(ctx, namespace, name, listener.Port, listenerHostname)
 		if err != nil {
-			return "", fmt.Errorf("gateway %s/%s has no HTTPS listener with a concrete hostname: %w", namespace, name, err)
-		}
-		if routeHost == "" {
-			return "", fmt.Errorf("gateway %s/%s has no HTTPS listener with a concrete hostname, no external status address, and no Route in %s fronts it with a usable host",
-				namespace, name, namespace)
+			return "", Listener{}, fmt.Errorf(
+				"gateway %s/%s has no HTTPS listener with a concrete hostname: %w", namespace, name, err)
 		}
 		hostname = routeHost
 	}
-	return hostname, nil
-}
-
-// hasHTTPSListener reports whether the Gateway has any HTTPS listener.
-func hasHTTPSListener(gateway *unstructured.Unstructured) bool {
-	listeners, _, _ := unstructured.NestedSlice(gateway.Object, "spec", "listeners")
-	for _, entry := range listeners {
-		listener, ok := entry.(map[string]any)
-		if !ok {
-			continue
-		}
-		protocol, _, _ := unstructured.NestedString(listener, "protocol")
-		if protocol == "HTTPS" {
-			return true
-		}
+	if hostname == "" {
+		return "", Listener{}, fmt.Errorf(
+			"gateway %s/%s has no HTTPS listener with a concrete hostname, no external status address, and no Route in %s fronts it with a usable host",
+			namespace, name, namespace)
 	}
-	return false
+	return hostname, listener, nil
 }
 
-// internalAddressSuffixes are cluster-internal DNS suffixes. A Gateway whose
-// data-plane Service is ClusterIP publishes its internal service name in
-// status.addresses; that name is not usable as the OIDC callback host.
-// ".svc" catches the short form (x.namespace.svc); ".cluster.local" also
-// subsumes the long form (x.namespace.svc.cluster.local).
-var internalAddressSuffixes = []string{".svc", ".cluster.local"}
+func hostnameMatchesListener(listenerHostname, hostname string) bool {
+	listenerHostname = normalizeHostname(listenerHostname)
+	hostname = normalizeHostname(hostname)
+	if listenerHostname == "" {
+		return true
+	}
+	if suffix, wildcard := strings.CutPrefix(listenerHostname, "*."); wildcard {
+		return strings.HasSuffix(hostname, "."+suffix) && len(hostname) > len(suffix)+1
+	}
+	return hostname == listenerHostname
+}
 
 // gatewayStatusHostname returns the first external Hostname-type Gateway
 // status address, or "" when there is none. IP-type addresses are skipped:
 // OIDC redirect URIs are broker-registered hostnames in practice, and the
 // presented certificate would not match an IP.
-func gatewayStatusHostname(gateway *unstructured.Unstructured) string {
+func gatewayStatusHostname(gateway *unstructured.Unstructured, listenerHostname string) string {
+	clusterDomain := normalizeHostname(network.GetClusterDomainName())
 	addresses, _, _ := unstructured.NestedSlice(gateway.Object, "status", "addresses")
 	for _, entry := range addresses {
 		address, ok := entry.(map[string]any)
@@ -784,62 +789,67 @@ func gatewayStatusHostname(gateway *unstructured.Unstructured) string {
 			continue
 		}
 		addressType, _, _ := unstructured.NestedString(address, "type")
-		value, _, _ := unstructured.NestedString(address, "value")
+		rawValue, _, _ := unstructured.NestedString(address, "value")
+		value := normalizeHostname(rawValue)
 		if addressType != "Hostname" || value == "" || strings.HasPrefix(value, "*") {
 			continue
 		}
-		internal := false
-		for _, suffix := range internalAddressSuffixes {
-			if strings.HasSuffix(value, suffix) {
-				internal = true
-				break
-			}
-		}
-		if !internal {
+		if !internalClusterHostname(value, clusterDomain) &&
+			hostnameMatchesListener(listenerHostname, value) {
 			return value
 		}
 	}
 	return ""
 }
 
+func normalizeHostname(hostname string) string {
+	return strings.ToLower(strings.TrimSuffix(hostname, "."))
+}
+
+func internalClusterHostname(hostname, clusterDomain string) bool {
+	return strings.HasSuffix(hostname, ".svc") ||
+		(clusterDomain != "" && strings.HasSuffix(hostname, ".svc."+clusterDomain))
+}
+
 // gatewayRouteHostname returns the host of the OpenShift Route that fronts
 // the Gateway in the ClusterIP + Route gateway pattern. Routes are
-// discovered rather than addressed by name: a Route counts only when it can
-// actually serve the portal — TLS configured (an insecure Route cannot serve
-// the https:// OIDC callback), no path restriction or "/" (a Route scoped to
-// a subpath would not forward /maas-portal or /oauth2), a concrete non-
-// wildcard host, and a backend Service carrying the Gateway data-plane
-// identity label (gateway.networking.k8s.io/gateway-name). When several
-// Routes front the same Gateway, the well-known setup-script name wins and
-// otherwise the lexicographically first Route name does, so the choice is
-// deterministic.
-func (r *Reconciler) gatewayRouteHostname(ctx context.Context, namespace, gatewayName string) (string, error) {
+// discovered rather than addressed by name: a Route counts only when the
+// router has admitted it, it can actually serve the portal — TLS configured
+// (an insecure Route cannot serve the https:// OIDC callback), no path
+// restriction or "/" (a Route scoped to a subpath would not forward
+// /maas-portal or /oauth2), a concrete non-wildcard ingress host, and TLS that
+// reaches the backend over TLS (reencrypt or passthrough). Every traffic-
+// bearing backend must resolve to the endpoint port for the Gateway's portal
+// HTTPS listener. When several Routes front the same Gateway, the
+// well-known setup-script name wins and otherwise the lexicographically first
+// Route name does, so the choice is deterministic.
+func (r *Reconciler) gatewayRouteHostname(ctx context.Context, namespace, gatewayName string, listenerPort int64, listenerHostname string) (string, error) {
 	routes := &unstructured.UnstructuredList{}
 	routes.SetGroupVersionKind(gvkOpenShiftRouteList)
 	if err := r.APIReader.List(ctx, routes, client.InNamespace(namespace)); err != nil {
+		if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			return "", nil
+		}
 		return "", fmt.Errorf("list Routes in %s: %w", namespace, err)
+	}
+	gatewayServices, err := r.gatewayServices(ctx, namespace, gatewayName)
+	if err != nil {
+		return "", err
 	}
 	fallbackHost, fallbackName := "", ""
 	for _, route := range routes.Items {
-		host, _, _ := unstructured.NestedString(route.Object, "spec", "host")
+		host := admittedRouteHostname(route, listenerHostname)
 		if host == "" || strings.HasPrefix(host, "*") {
 			continue
 		}
-		if tls, found, _ := unstructured.NestedFieldNoCopy(route.Object, "spec", "tls"); !found || tls == nil {
+		termination, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "termination")
+		if termination != "reencrypt" && termination != "passthrough" {
 			continue
 		}
 		if path, _, _ := unstructured.NestedString(route.Object, "spec", "path"); path != "" && path != "/" {
 			continue
 		}
-		backend, _, _ := unstructured.NestedString(route.Object, "spec", "to", "name")
-		if backend == "" {
-			continue
-		}
-		fronts, err := r.routeFrontsGateway(ctx, namespace, backend, gatewayName)
-		if err != nil {
-			return "", err
-		}
-		if !fronts {
+		if !routeTargetsGatewayHTTPS(route, gatewayServices, listenerPort) {
 			continue
 		}
 		if route.GetName() == GatewayRouteName {
@@ -852,17 +862,181 @@ func (r *Reconciler) gatewayRouteHostname(ctx context.Context, namespace, gatewa
 	return fallbackHost, nil
 }
 
-// routeFrontsGateway reports whether the named Service is the Gateway's
-// data-plane Service, identified by the gateway-name label.
-func (r *Reconciler) routeFrontsGateway(ctx context.Context, namespace, serviceName, gatewayName string) (bool, error) {
-	service := &corev1.Service{}
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: serviceName}, service); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("get Service %s/%s: %w", namespace, serviceName, err)
+// gatewayServices returns the Services in a namespace whose selectors identify
+// the Gateway's data-plane pods.
+type gatewayService struct {
+	service      corev1.Service
+	endpointPort map[string]map[int32]struct{}
+}
+
+func (r *Reconciler) gatewayServices(ctx context.Context, namespace, gatewayName string) (map[string]gatewayService, error) {
+	services := &corev1.ServiceList{}
+	if err := r.APIReader.List(ctx, services, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list Services in %s: %w", namespace, err)
 	}
-	return service.Labels["gateway.networking.k8s.io/gateway-name"] == gatewayName, nil
+	slices := &discv1.EndpointSliceList{}
+	if err := r.APIReader.List(ctx, slices, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list EndpointSlices in %s: %w", namespace, err)
+	}
+	endpointPorts := make(map[string]map[string]map[int32]struct{})
+	for _, slice := range slices.Items {
+		serviceName := slice.Labels["kubernetes.io/service-name"]
+		if serviceName == "" {
+			continue
+		}
+		if endpointPorts[serviceName] == nil {
+			endpointPorts[serviceName] = make(map[string]map[int32]struct{})
+		}
+		for _, port := range slice.Ports {
+			if port.Port == nil {
+				continue
+			}
+			portName := ""
+			if port.Name != nil {
+				portName = *port.Name
+			}
+			if endpointPorts[serviceName][portName] == nil {
+				endpointPorts[serviceName][portName] = make(map[int32]struct{})
+			}
+			endpointPorts[serviceName][portName][*port.Port] = struct{}{}
+		}
+	}
+	gatewayServices := make(map[string]gatewayService)
+	for _, service := range services.Items {
+		if service.Spec.Selector[gatewayNameLabel] == gatewayName {
+			gatewayServices[service.Name] = gatewayService{
+				service:      *service.DeepCopy(),
+				endpointPort: endpointPorts[service.Name],
+			}
+		}
+	}
+	return gatewayServices, nil
+}
+
+// routeTargetsGatewayHTTPS reports whether every traffic-bearing Route backend
+// is a Gateway Service and reaches a port exposed by an HTTPS listener.
+func routeTargetsGatewayHTTPS(route unstructured.Unstructured, gatewayServices map[string]gatewayService, listenerPort int64) bool {
+	backends := make([]map[string]any, 0, 4)
+	if primary, ok, _ := unstructured.NestedMap(route.Object, "spec", "to"); ok && primary != nil {
+		backends = append(backends, primary)
+	}
+	alternates, _, _ := unstructured.NestedSlice(route.Object, "spec", "alternateBackends")
+	for _, alternate := range alternates {
+		backend, ok := alternate.(map[string]any)
+		if !ok {
+			return false
+		}
+		backends = append(backends, backend)
+	}
+
+	trafficBackends := 0
+	for _, backend := range backends {
+		kind, _, _ := unstructured.NestedString(backend, "kind")
+		if kind != "" && kind != routeKindService {
+			return false
+		}
+		name, _, _ := unstructured.NestedString(backend, "name")
+		if name == "" {
+			return false
+		}
+		weight, weightFound, _ := unstructured.NestedInt64(backend, "weight")
+		if weightFound && weight <= 0 {
+			continue
+		}
+		service, targetsGateway := gatewayServices[name]
+		if !targetsGateway || !serviceServesHTTPSListener(service, listenerPort, route) {
+			return false
+		}
+		trafficBackends++
+	}
+	return trafficBackends > 0
+}
+
+func serviceServesHTTPSListener(gatewayService gatewayService, listenerPort int64, route unstructured.Unstructured) bool {
+	targetPort, targetFound, _ := unstructured.NestedFieldNoCopy(route.Object, "spec", "port", "targetPort")
+	matches := 0
+	for _, servicePort := range gatewayService.service.Spec.Ports {
+		if int64(servicePort.Port) != listenerPort {
+			continue
+		}
+		endpointPorts := endpointPortsForServicePort(servicePort, gatewayService.endpointPort)
+		if !targetFound {
+			if len(gatewayService.service.Spec.Ports) == 1 && len(endpointPorts) == 1 {
+				matches++
+			}
+			continue
+		}
+		if routePortMatchesEndpointPort(targetPort, servicePort.Name, endpointPorts) {
+			matches++
+		}
+	}
+	return matches > 0
+}
+
+func endpointPortsForServicePort(
+	servicePort corev1.ServicePort,
+	endpointPortsByName map[string]map[int32]struct{},
+) map[int32]struct{} {
+	if servicePort.TargetPort.Type == intstr.Int {
+		expected := servicePort.TargetPort.IntVal
+		if _, matches := endpointPortsByName[servicePort.Name][expected]; !matches {
+			return nil
+		}
+		return map[int32]struct{}{expected: {}}
+	}
+	return endpointPortsByName[servicePort.Name]
+}
+
+func routePortMatchesEndpointPort(targetPort any, servicePortName string, endpointPorts map[int32]struct{}) bool {
+	switch target := targetPort.(type) {
+	case string:
+		return target == servicePortName && len(endpointPorts) > 0
+	case int64:
+		if target < 0 || target > 65535 {
+			return false
+		}
+		_, matches := endpointPorts[int32(target)]
+		return matches
+	default:
+		return false
+	}
+}
+
+// admittedRouteHostname returns the first concrete host published by an
+// OpenShift Route ingress that reports Admitted=True.
+func admittedRouteHostname(route unstructured.Unstructured, listenerHostname string) string {
+	ingresses, found, err := unstructured.NestedSlice(route.Object, "status", "ingress")
+	if err != nil || !found {
+		return ""
+	}
+	for _, ingress := range ingresses {
+		ingressMap, ok := ingress.(map[string]any)
+		if !ok {
+			continue
+		}
+		host, ok := ingressMap["host"].(string)
+		if !ok || host == "" {
+			continue
+		}
+		conditions, found, _ := unstructured.NestedSlice(ingressMap, "conditions")
+		if !found {
+			continue
+		}
+		for _, condition := range conditions {
+			conditionMap, ok := condition.(map[string]any)
+			if !ok {
+				continue
+			}
+			conditionType, _ := conditionMap["type"].(string)
+			conditionStatus, _ := conditionMap["status"].(string)
+			if conditionType == routeAdmitted && conditionStatus == conditionTrue {
+				if hostnameMatchesListener(listenerHostname, host) {
+					return host
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // providerCAKeys returns the odh-trusted-ca-bundle keys that contain

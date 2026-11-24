@@ -60,7 +60,7 @@ func aiGuardrail(name, namespace string) *aigatewayv1alpha1.AIGuardrail {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: aigatewayv1alpha1.AIGuardrailSpec{
 			Provider: aigatewayv1alpha1.AIGuardrailProvider{
-				Nemo: aigatewayv1alpha1.AIGuardrailNemoProvider{
+				Nemo: &aigatewayv1alpha1.AIGuardrailNemoProvider{
 					Ref: aigatewayv1alpha1.AIGuardrailNamespacedReference{Name: "guardrails"},
 				},
 				Timeout: metav1.Duration{Duration: 30 * time.Second},
@@ -278,6 +278,27 @@ func awaitModelRemoved(t *testing.T, c client.Client, model *inferencev1alpha1.E
 		key.Name = "payload-processing-external-model-" + model.Namespace
 		require.True(collect, apierrors.IsNotFound(c.Get(t.Context(), key, &appsv1.Deployment{})), "ExtProc workload remains")
 	}, eventuallyTimeout, pollInterval, "deleting the last model must remove its routing and workload")
+}
+
+// awaitModelTenantNotReady waits until model reports TenantNotReady while its
+// routing overlay and routeName, its last published route, remain.
+func awaitModelTenantNotReady(t *testing.T, c client.Client, model *inferencev1alpha1.ExternalModel, routeName string) {
+	t.Helper()
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		var actual inferencev1alpha1.ExternalModel
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKeyFromObject(model), &actual))
+		ready := apimeta.FindStatusCondition(actual.Status.Conditions, "Ready")
+		require.NotNil(collect, ready)
+		require.Equal(collect, metav1.ConditionFalse, ready.Status)
+		require.Equal(collect, "TenantNotReady", ready.Reason, ready.Message)
+		key := client.ObjectKey{Namespace: model.Namespace, Name: publisher.DefaultName}
+		require.NoError(collect, c.Get(t.Context(), key, &corev1.ConfigMap{}), "routing overlay removed")
+		route := &unstructured.Unstructured{}
+		route.SetAPIVersion("gateway.networking.k8s.io/v1")
+		route.SetKind("HTTPRoute")
+		key.Name = routeName
+		require.NoError(collect, c.Get(t.Context(), key, route), "model route removed")
+	}, eventuallyTimeout, pollInterval, "the model must report its tenant not ready and keep its routing")
 }
 
 // markAvailable sets the Deployment's Available condition.
