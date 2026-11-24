@@ -139,6 +139,8 @@ func TestExternalModelConfigMatchesMainWhenTranslationIsOff(t *testing.T) {
   grpc_address: "0.0.0.0:9004"
   health_address: "0.0.0.0:50052"
   metrics_address: "0.0.0.0:9090"
+  metrics_auth:
+    enabled: false
   max_body_bytes: 10485760
   tls:
     mode: provided
@@ -334,6 +336,33 @@ func TestSharedExtProcConfigDefaultOff(t *testing.T) {
 	}
 }
 
+// TestGeneratedExtProcConfigsDisableMetricsAuth pins the pairing with the pod
+// change in rename.go: the post-auth Deployment runs without a mounted
+// ServiceAccount token, so Praxis must not try to TokenReview /metrics. With
+// the upstream default (enabled: true) it exits before opening the gRPC
+// listener, which takes all tenant inference down.
+func TestGeneratedExtProcConfigsDisableMetricsAuth(t *testing.T) {
+	want := "  metrics_auth:\n    enabled: false\n"
+	for _, apiTranslation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shared/apiTranslation=%t", apiTranslation), func(t *testing.T) {
+			config := sharedExtProcConfig(apiTranslation, DefaultExtProcMaxBodyBytes)
+			if !strings.Contains(config, want) {
+				t.Fatalf("shared chain must disable metrics auth:\n%s", config)
+			}
+			if strings.Contains(config, "metrics_auth:\n    enabled: true") {
+				t.Fatalf("shared chain re-enabled metrics auth:\n%s", config)
+			}
+		})
+	}
+
+	t.Run("post-auth", func(t *testing.T) {
+		config := extprocPostAuthConfig(nil, nil, false, DefaultExtProcMaxBodyBytes)
+		if !strings.Contains(config, want) {
+			t.Fatalf("post-auth chain must disable metrics auth:\n%s", config)
+		}
+	})
+}
+
 // TestSharedExtProcConfigHasHeadersGuard verifies that API translation does
 // not alter the leading shared-chain security boundary.
 func TestSharedExtProcConfigHasHeadersGuard(t *testing.T) {
@@ -473,7 +502,7 @@ func TestConfigureSharedExtProcDoesNotRewriteExternalModelResources(t *testing.T
 			"data":     map[string]any{"extproc.yaml": "external-model-chain"},
 		}},
 	}
-	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, true, DefaultExtProcMaxBodyBytes); err != nil {
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, true, DefaultExtProcMaxBodyBytes, DefaultExtProcResponseBodyMode); err != nil {
 		t.Fatal(err)
 	}
 	data, _, err := unstructured.NestedStringMap(resources[0].Object, "data")
@@ -517,10 +546,10 @@ func TestConfigureSharedExtProcKeepsDefaultResponseModeWhenTranslationIsOff(t *t
 		}},
 		sharedEnvoyFilterFixture(tenantID, gatewayNamespace),
 	}
-	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, false, DefaultExtProcMaxBodyBytes); err != nil {
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, false, DefaultExtProcMaxBodyBytes, DefaultExtProcResponseBodyMode); err != nil {
 		t.Fatal(err)
 	}
-	assertSharedResponseMode(t, resources[2], "BUFFERED", false)
+	assertSharedResponseMode(t, resources[2], "STREAMED", false)
 }
 
 func TestTranslationSettingsToggleWithoutStaleRenderedState(t *testing.T) {
@@ -558,13 +587,13 @@ func TestTranslationSettingsToggleWithoutStaleRenderedState(t *testing.T) {
 	}
 	candidates := []envelope.Candidate{{Cluster: "provider-openai"}}
 	for _, enabled := range []bool{false, true, false} {
-		if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, enabled, DefaultExtProcMaxBodyBytes); err != nil {
+		if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, enabled, DefaultExtProcMaxBodyBytes, DefaultExtProcResponseBodyMode); err != nil {
 			t.Fatalf("configure shared ExtProc with translation=%t: %v", enabled, err)
 		}
 		if err := configureExternalModelExtProc(resources, tenantID, "tenant-a", candidates, enabled, DefaultExtProcMaxBodyBytes); err != nil {
 			t.Fatalf("configure ExternalModel ExtProc with translation=%t: %v", enabled, err)
 		}
-		assertSharedResponseMode(t, resources[2], map[bool]string{true: "STREAMED", false: "BUFFERED"}[enabled], enabled)
+		assertSharedResponseMode(t, resources[2], "STREAMED", enabled)
 		sharedData, _, err := unstructured.NestedStringMap(resources[0].Object, "data")
 		if err != nil {
 			t.Fatal(err)

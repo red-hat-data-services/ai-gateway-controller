@@ -6,12 +6,10 @@ metadata:
     app.kubernetes.io/name: maas-consumer-portal
     app.kubernetes.io/part-of: maas-consumer-portal
 spec:
-  hostnames:
-    - CONSUMER_PORTAL_HOSTNAME
   parentRefs:
     - name: CONSUMER_PORTAL_GATEWAY_NAME
       namespace: CONSUMER_PORTAL_GATEWAY_NAMESPACE
-      sectionName: https
+      sectionName: CONSUMER_PORTAL_GATEWAY_LISTENER_NAME
   rules:
     - matches:
         - path:
@@ -75,12 +73,10 @@ metadata:
     app.kubernetes.io/name: maas-consumer-portal-oauth2
     app.kubernetes.io/part-of: maas-consumer-portal
 spec:
-  hostnames:
-    - CONSUMER_PORTAL_HOSTNAME
   parentRefs:
     - name: CONSUMER_PORTAL_GATEWAY_NAME
       namespace: CONSUMER_PORTAL_GATEWAY_NAMESPACE
-      sectionName: https
+      sectionName: CONSUMER_PORTAL_GATEWAY_LISTENER_NAME
   rules:
     - matches:
         - path:

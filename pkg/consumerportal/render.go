@@ -83,11 +83,12 @@ type Params struct {
 	RedisConnectionURL string
 	// RedisHash is stamped on the pod template so Redis connection changes
 	// restart the proxy.
-	RedisHash          string
-	Hostname           string
-	GatewayName        string
-	GatewayNamespace   string
-	AuthorinoNamespace string
+	RedisHash           string
+	Hostname            string
+	GatewayName         string
+	GatewayNamespace    string
+	GatewayListenerName string
+	AuthorinoNamespace  string
 	// ProviderCAKeys are the non-empty odh-trusted-ca-bundle keys passed to the
 	// proxy as --provider-ca-file.
 	ProviderCAKeys []string
@@ -114,9 +115,9 @@ func Render(resources []unstructured.Unstructured, p Params) []unstructured.Unst
 		"CONSUMER_PORTAL_CLIENT_ID", p.OIDCClientID,
 		"CONSUMER_PORTAL_REDIRECT_URL", "https://"+p.Hostname+"/oauth2/callback",
 		"CONSUMER_PORTAL_COOKIE_DOMAIN", p.Hostname,
-		"CONSUMER_PORTAL_HOSTNAME", p.Hostname,
 		"CONSUMER_PORTAL_GATEWAY_NAMESPACE", p.GatewayNamespace,
 		"CONSUMER_PORTAL_GATEWAY_NAME", p.GatewayName,
+		"CONSUMER_PORTAL_GATEWAY_LISTENER_NAME", p.GatewayListenerName,
 		"CONSUMER_PORTAL_AUTHORINO_NAMESPACE", p.AuthorinoNamespace,
 		"CONSUMER_PORTAL_COOKIE_REFRESH", p.RefreshInterval.String(),
 		"CONSUMER_PORTAL_COOKIE_EXPIRE", p.CookieExpire.String(),
@@ -290,20 +291,49 @@ func OIDCIssuerURL(aitenant *unstructured.Unstructured) string {
 	return issuer
 }
 
-// ListenerHostname returns the hostname of the Gateway's first HTTPS listener
-// with a concrete (non-wildcard) hostname, or "" when there is none.
-func ListenerHostname(gateway *unstructured.Unstructured) string {
+// Listener identifies the Gateway listener selected for the portal routes.
+type Listener struct {
+	Name     string
+	Hostname string
+	Port     int64
+}
+
+// SelectListener returns the first Gateway HTTPS listener with a concrete
+// hostname. When none has one, it returns the first HTTPS listener so status
+// addresses and OpenShift Routes can supply the external hostname.
+func SelectListener(gateway *unstructured.Unstructured) (Listener, bool) {
 	listeners, _, _ := unstructured.NestedSlice(gateway.Object, "spec", "listeners")
+	var fallback Listener
+	foundFallback := false
 	for _, entry := range listeners {
 		listener, ok := entry.(map[string]any)
 		if !ok {
 			continue
 		}
+		name, _, _ := unstructured.NestedString(listener, "name")
 		protocol, _, _ := unstructured.NestedString(listener, "protocol")
 		hostname, _, _ := unstructured.NestedString(listener, "hostname")
-		if protocol == "HTTPS" && hostname != "" && !strings.HasPrefix(hostname, "*") {
-			return hostname
+		port, portFound, portErr := unstructured.NestedInt64(listener, "port")
+		if protocol != "HTTPS" || name == "" || portErr != nil || !portFound {
+			continue
+		}
+		selected := Listener{Name: name, Hostname: hostname, Port: port}
+		if !foundFallback {
+			fallback, foundFallback = selected, true
+		}
+		if hostname != "" && !strings.HasPrefix(hostname, "*") {
+			return selected, true
 		}
 	}
-	return ""
+	return fallback, foundFallback
+}
+
+// ListenerHostname returns the concrete (non-wildcard) hostname of the
+// selected Gateway HTTPS listener, or "" when it has none.
+func ListenerHostname(gateway *unstructured.Unstructured) string {
+	listener, ok := SelectListener(gateway)
+	if !ok || listener.Hostname == "" || strings.HasPrefix(listener.Hostname, "*") {
+		return ""
+	}
+	return listener.Hostname
 }

@@ -72,3 +72,19 @@ func testGuardrailTimeoutAdmission(t *testing.T, c client.Client) {
 		})
 	}
 }
+
+// testGuardrailProviderAdmission checks that a guardrail must set exactly one provider.
+func testGuardrailProviderAdmission(t *testing.T, c client.Client) {
+	t.Helper()
+	const namespace = "guardrail-provider-admission"
+	createNamespace(t, c, namespace)
+	guardrail := &unstructured.Unstructured{}
+	require.NoError(t, c.Scheme().Convert(aiGuardrail("no-provider", namespace), guardrail, nil))
+	unstructured.RemoveNestedField(guardrail.Object, "spec", "provider", "nemo")
+
+	err := c.Create(t.Context(), guardrail)
+
+	require.True(t, apierrors.IsInvalid(err), "a guardrail without a provider must be rejected, got %v", err)
+	assert.ErrorContains(t, err, "spec.provider")
+	assert.ErrorContains(t, err, "exactly one of the fields in [nemo] must be set")
+}

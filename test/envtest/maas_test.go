@@ -3,6 +3,7 @@
 package envtest_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
@@ -141,4 +143,39 @@ func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 		latest.Object["status"] = map[string]any{"infraNamespace": infraNamespace}
 		require.NoError(collect, m.client.Status().Update(t.Context(), latest))
 	}, 10*time.Second, time.Second, "publish status.infraNamespace on the MaasTenantConfig")
+}
+
+// terminatingTenant deletes the tenant's AITenant and reports it as
+// maas-controller does while its finalizer holds the object for cleanup:
+// Terminating, with Ready re-stamped for the generation the deletion bumped.
+// The fixture's finalizer is released when the test ends.
+func (m maasFixture) terminatingTenant(t *testing.T, namespace string) {
+	t.Helper()
+	const hold = "test.opendatahub.io/hold"
+	key := client.ObjectKey{Namespace: maasNamespace, Name: namespace}
+	ait := tenant.NewAITenant()
+	require.NoError(t, m.client.Get(t.Context(), key, ait))
+	controllerutil.AddFinalizer(ait, hold)
+	require.NoError(t, m.client.Update(t.Context(), ait))
+	t.Cleanup(func() {
+		// t.Context is already canceled when cleanup runs.
+		ctx := context.Background()
+		ait := tenant.NewAITenant()
+		require.NoError(t, client.IgnoreNotFound(m.client.Get(ctx, key, ait)))
+		if controllerutil.RemoveFinalizer(ait, hold) {
+			require.NoError(t, m.client.Update(ctx, ait))
+		}
+	})
+	require.NoError(t, m.client.Delete(t.Context(), ait))
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		latest := tenant.NewAITenant()
+		require.NoError(collect, m.client.Get(t.Context(), key, latest))
+		require.NoError(collect, unstructured.SetNestedField(latest.Object, "Terminating", "status", "phase"))
+		require.NoError(collect, unstructured.SetNestedSlice(latest.Object, []any{map[string]any{
+			"type": tenant.AITenantConditionReady, "status": "False",
+			"reason": "DeletionInProgress", "message": "AITenant deletion cleanup is in progress",
+			"observedGeneration": latest.GetGeneration(), "lastTransitionTime": time.Now().UTC().Format(time.RFC3339),
+		}}, "status", "conditions"))
+		require.NoError(collect, m.client.Status().Update(t.Context(), latest))
+	}, 10*time.Second, time.Second, "report the AITenant Terminating")
 }

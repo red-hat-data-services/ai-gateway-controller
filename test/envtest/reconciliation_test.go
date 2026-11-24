@@ -16,6 +16,10 @@ func TestControlPlane(t *testing.T) {
 		testGuardrailTimeoutAdmission(t, c)
 	})
 
+	t.Run("guardrails require exactly one provider", func(t *testing.T) {
+		testGuardrailProviderAdmission(t, c)
+	})
+
 	t.Run("shipped permissions cover credential copies and reference grants", func(t *testing.T) {
 		testShippedPermissions(t, c)
 	})
@@ -61,6 +65,27 @@ func TestControlPlane(t *testing.T) {
 		awaitModelPublished(t, c, model, provider)
 		attachment := awaitGuardrailEnforced(t, c, namespace)
 		awaitGuardrailDetached(t, c, namespace, attachment)
+	})
+
+	t.Run("a terminating tenant stops reporting its models ready but keeps them routed", func(t *testing.T) {
+		// Given a model published through an existing Praxis tenant.
+		const namespace = "tenant-termination"
+		maas := maasFixture{client: c}
+		maas.existingPraxisTenant(t, namespace)
+		awaitPraxisInstalled(t, c, namespace)
+		provider := createProvider(t, c, namespace)
+		model := externalModel("model", namespace,
+			withModelName("chat"),
+			withProviderModel(provider.Name, "provider-model"),
+		)
+		require.NoError(t, c.Create(t.Context(), model))
+		routeName := awaitModelPublished(t, c, model, provider)
+
+		// When MaaS starts deleting the tenant's AITenant.
+		maas.terminatingTenant(t, namespace)
+
+		// Then the model reports its tenant not ready and keeps its routing.
+		awaitModelTenantNotReady(t, c, model, routeName)
 	})
 }
 
