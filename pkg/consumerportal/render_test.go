@@ -37,15 +37,16 @@ func renderTestResources(t *testing.T) []unstructured.Unstructured {
 		t.Fatalf("render.Build: %v", err)
 	}
 	return Render(built, Params{
-		Namespace:          testInfraNamespace,
-		DashboardNamespace: DefaultDashboardNamespace,
-		Image:              "quay.io/example/kube-auth-proxy:test",
-		OIDCIssuerURL:      testIssuer,
-		Hostname:           testHostname,
-		OIDCClientID:       "test-client",
-		GatewayName:        testGatewayName,
-		GatewayNamespace:   testGatewayNamespace,
-		AuthorinoNamespace: DefaultAuthorinoNamespace,
+		Namespace:           testInfraNamespace,
+		DashboardNamespace:  DefaultDashboardNamespace,
+		Image:               "quay.io/example/kube-auth-proxy:test",
+		OIDCIssuerURL:       testIssuer,
+		Hostname:            testHostname,
+		OIDCClientID:        "test-client",
+		GatewayName:         testGatewayName,
+		GatewayNamespace:    testGatewayNamespace,
+		GatewayListenerName: "web-secure",
+		AuthorinoNamespace:  DefaultAuthorinoNamespace,
 	})
 }
 
@@ -132,16 +133,16 @@ func TestRenderSubstitutesTenantValues(t *testing.T) {
 func TestRenderBuildsConsumerPortalRoutes(t *testing.T) {
 	resources := renderTestResources(t)
 	portal := findResource(t, resources, "HTTPRoute", PortalRouteName)
-	hostnames, _, _ := unstructured.NestedStringSlice(portal.Object, "spec", "hostnames")
-	if len(hostnames) != 1 || hostnames[0] != testHostname {
-		t.Errorf("portal HTTPRoute hostnames = %v, want [%s]", hostnames, testHostname)
+	portalHostnames, found, err := unstructured.NestedStringSlice(portal.Object, "spec", "hostnames")
+	if found || err != nil || len(portalHostnames) != 0 {
+		t.Errorf("portal HTTPRoute hostnames = %v (found=%t, err=%v), want none", portalHostnames, found, err)
 	}
 	parents, _, _ := unstructured.NestedSlice(portal.Object, "spec", "parentRefs")
 	if len(parents) != 1 {
 		t.Fatalf("portal parentRefs = %v, want one", parents)
 	}
 	parent, ok := parents[0].(map[string]any)
-	if !ok || parent["name"] != testGatewayName || parent["namespace"] != testGatewayNamespace || parent["sectionName"] != "https" {
+	if !ok || parent["name"] != testGatewayName || parent["namespace"] != testGatewayNamespace || parent["sectionName"] != "web-secure" {
 		t.Errorf("portal parentRef = %#v", parent)
 	}
 
@@ -172,6 +173,10 @@ func TestRenderBuildsConsumerPortalRoutes(t *testing.T) {
 	}
 
 	oauth := findResource(t, resources, "HTTPRoute", OAuthRouteName)
+	oauthHostnames, found, err := unstructured.NestedStringSlice(oauth.Object, "spec", "hostnames")
+	if found || err != nil || len(oauthHostnames) != 0 {
+		t.Errorf("oauth HTTPRoute hostnames = %v (found=%t, err=%v), want none", oauthHostnames, found, err)
+	}
 	oauthRule := firstNestedMap(t, oauth.Object, "spec", "rules")
 	oauthPath, _, _ := unstructured.NestedString(firstNestedMap(t, oauthRule, "matches"), "path", "value")
 	oauthBackendRef := firstNestedMap(t, oauthRule, "backendRefs")

@@ -629,14 +629,27 @@ resolved in order: the Gateway's first HTTPS listener with a concrete
 from user browsers and would break the broker-registered redirect URI); and
 the OpenShift Route that fronts the Gateway in the ClusterIP + Route gateway
 pattern, where the listener carries no hostname. An HTTPS listener is
-required regardless of source — the portal routes attach to the Gateway's
-https section and the callback is served over TLS, so a Gateway without one
-fails closed. Routes are discovered by listing the Gateway namespace and
-matching the backend Service's `gateway.networking.k8s.io/gateway-name`
-label rather than by name, and only Routes that can serve the portal count:
-TLS configured, no subpath restriction, and a concrete host. The
-conventional `maas-gateway-route` name only breaks ties when several Routes
-front the same Gateway.
+required regardless of source — the controller discovers an HTTPS listener,
+renders its name into the portal HTTPRoutes, and the callback is served over
+TLS, so a Gateway without one fails closed. Internal status hostnames are
+recognized for the configured
+cluster domain, including custom domains, so they do not defeat Route
+discovery. Routes are discovered by listing the Gateway namespace and matching
+the backend Service's `gateway.networking.k8s.io/gateway-name` selector rather
+than by name, and only Routes that can serve the portal count: `reencrypt` or
+`passthrough` TLS, no subpath restriction, a concrete `Admitted=True` ingress
+host, and every positive-weight backend selecting the EndpointSlice-resolved
+Service endpoint port for the portal listener. The conventional
+`maas-gateway-route` name only
+breaks ties when several Routes front the same Gateway.
+The portal HTTPRoutes intentionally omit `spec.hostnames`. In the ClusterIP +
+Route pattern, `openshiftRoute` mode forbids listener hostnames and Istio must
+serve the Gateway's hostname-less listener as one path-based catch-all virtual
+host. Constraining only the portal routes to the discovered Route host would
+split Envoy's route table into an exact-host virtual host for the portal and a
+catch-all virtual host for API and model routes. The discovered host is still
+used for the OIDC redirect URL and cookie domain, but HTTPRoute matching stays
+path-only.
 
 The same reconciliation creates the `maas-consumer-portal` and
 `maas-consumer-portal-oauth2` HTTPRoutes on the default Gateway, a
