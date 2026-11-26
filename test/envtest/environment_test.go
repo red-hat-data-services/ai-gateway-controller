@@ -100,7 +100,10 @@ func startEnvironment(t *testing.T, setupControllers func(ctrl.Manager)) client.
 	controllerUser, err := environment.AddUser(controllerIdentity, &rest.Config{QPS: -1})
 	require.NoError(t, err)
 	mgr, err := ctrl.NewManager(controllerUser.Config(), ctrl.Options{
-		Scheme:                  scheme,
+		Scheme: scheme,
+		// As in cmd/manager: unstructured reads go through the informer cache,
+		// so the suite sees the same cache lag the controllers do.
+		Client:                  client.Options{Cache: &client.CacheOptions{Unstructured: true}},
 		Logger:                  testr.New(t),
 		Metrics:                 metricsserver.Options{BindAddress: "0"},
 		GracefulShutdownTimeout: ptr.To(5 * time.Second),

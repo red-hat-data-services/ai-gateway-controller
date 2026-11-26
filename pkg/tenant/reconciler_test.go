@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -613,7 +614,7 @@ func TestReconcileAddsFinalizerAndRequeuesWhenGatewayRefMissing(t *testing.T) {
 func TestReconcileAppliesWhenPendingWithGatewayRef(t *testing.T) {
 	requireManifests(t)
 	scheme := mtcSchemeForTests()
-	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusSteady)
 	aitenant := newAITenantOwner("redteam", "ai-tenants", "Pending", "my-gateway", "tenant-ns", "tenant-ns")
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", "tenant-ns")).WithInterceptorFuncs(rec.funcs()).Build()
@@ -646,7 +647,7 @@ func TestReconcileAppliesWhenPendingWithGatewayRef(t *testing.T) {
 func TestReconcileAppliesSharedResourcesWithOnlyDisabledMessagesModel(t *testing.T) {
 	requireManifests(t)
 	const namespace = "tenant-ns"
-	mtc := withMarker(newMTC(namespace, "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc := withMarker(newMTC(namespace, "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusSteady)
 	if err := unstructured.SetNestedMap(mtc.Object, map[string]any{"enabled": false}, "spec", "apiTranslation"); err != nil {
 		t.Fatal(err)
 	}
@@ -897,7 +898,7 @@ func TestAITenantGenerationFenceForApply(t *testing.T) {
 func TestReconcileRefusesWhenAITenantReplacedBeforeApply(t *testing.T) {
 	requireManifests(t)
 	scheme := mtcSchemeForTests()
-	mtc := withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc := withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusSteady)
 	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
 	aitenant.SetUID(types.UID("uid-1"))
 
@@ -940,7 +941,7 @@ func TestReconcileRefusesWhenAITenantReplacedBeforeApply(t *testing.T) {
 func TestReconcileUsesLiveReadNotStaleCache(t *testing.T) {
 	requireManifests(t)
 	scheme := mtcSchemeForTests()
-	mtc := withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc := withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusSteady)
 	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
 	aitenant.SetUID(types.UID("uid-1"))
 	gw := newGateway("my-gateway", DefaultAITenantName)
@@ -1011,8 +1012,10 @@ func TestReconcileWaitsForBlockedMigrationMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != constants.NotReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	// maas-controller ends the wait by writing cleanup-complete, which the
+	// MaasTenantConfig watch delivers; polling would only repeat this pass.
+	if res.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter = %v, want none while waiting for the handoff signal", res.RequeueAfter)
 	}
 	names, _, _ := rec.snapshot()
 	if len(names) != 0 {
@@ -1020,10 +1023,235 @@ func TestReconcileWaitsForBlockedMigrationMarker(t *testing.T) {
 	}
 }
 
+// TestReconcileBlockedPluginsMigrationWaitsForEvent covers the RHOAIENG-98846
+// gate: a leftover IPP plugins ConfigMap blocks the apply until the operator
+// sets AnnotationForcePayloadProcessingMigration, which the MaasTenantConfig
+// watch delivers, or changes or removes the ConfigMap, which the plugins
+// ConfigMap watch delivers. Neither needs a poll.
+func TestReconcileBlockedPluginsMigrationWaitsForEvent(t *testing.T) {
+	eventRecorder := events.NewFakeRecorder(10)
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMTCFinalizer(withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusSteady))
+	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
+	leftover := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        PayloadProcessingPluginsConfigMapForTenant(""),
+			Namespace:   DefaultAITenantName,
+			Annotations: map[string]string{AnnotationManaged: "false"},
+		},
+		Data: map[string]string{ippProcessingConfigKey: "kind: PayloadProcessorConfig\n"},
+	}
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, leftover, newGateway("my-gateway", DefaultAITenantName)).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute, Recorder: eventRecorder}
+	res, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter = %v, want none while the migration gate refuses", res.RequeueAfter)
+	}
+	names, _, _ := rec.snapshot()
+	if len(names) != 0 {
+		t.Fatalf("expected no praxis apply while the migration gate refuses, got %v", names)
+	}
+	// Nothing polls a refused gate, so the refusal is reported on the
+	// MaasTenantConfig for operators to find.
+	if len(eventRecorder.Events) != 1 {
+		t.Fatalf("events = %d, want one Warning naming the force annotation", len(eventRecorder.Events))
+	}
+	if event := <-eventRecorder.Events; !strings.Contains(event, reasonPluginsMigrationRefused) || !strings.Contains(event, AnnotationForcePayloadProcessingMigration) {
+		t.Fatalf("event = %q", event)
+	}
+}
+
+// TestReconcileBlockedPluginsMigrationPollsUntilCacheHoldsIt covers a gate
+// refusal on a ConfigMap the informer has not seen yet: a delete of an object
+// the informer never held produces no event, even after a relist, so the gate
+// polls until the cache holds the version that refused.
+func TestReconcileBlockedPluginsMigrationPollsUntilCacheHoldsIt(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMTCFinalizer(withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusSteady))
+	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
+	leftover := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        PayloadProcessingPluginsConfigMapForTenant(""),
+			Namespace:   DefaultAITenantName,
+			Annotations: map[string]string{AnnotationManaged: "false"},
+		},
+		Data: map[string]string{ippProcessingConfigKey: "kind: PayloadProcessorConfig\n"},
+	}
+	rec := &recorder{}
+	cacheClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc.DeepCopy(), aitenant.DeepCopy(), newGateway("my-gateway", DefaultAITenantName)).WithInterceptorFuncs(rec.funcs()).Build()
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, leftover, newGateway("my-gateway", DefaultAITenantName)).Build()
+
+	r := &Reconciler{Client: cacheClient, APIReader: liveClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	res, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v while the cache lacks the refusing ConfigMap", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	}
+	if names, _, _ := rec.snapshot(); len(names) != 0 {
+		t.Fatalf("expected no praxis apply while the migration gate refuses, got %v", names)
+	}
+}
+
+// TestReconcileBlockedPluginsMigrationPollsOnStaleCacheVersion covers the
+// cache holding an older version of the refusing ConfigMap: a delete of the
+// version the informer has not seen yet can still pass unseen, so the gate polls.
+func TestReconcileBlockedPluginsMigrationPollsOnStaleCacheVersion(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMTCFinalizer(withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusSteady))
+	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
+	leftover := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        PayloadProcessingPluginsConfigMapForTenant(""),
+			Namespace:   DefaultAITenantName,
+			Annotations: map[string]string{AnnotationManaged: "false"},
+		},
+		Data: map[string]string{ippProcessingConfigKey: "kind: PayloadProcessorConfig\n"},
+	}
+	rec := &recorder{}
+	cacheClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc.DeepCopy(), aitenant.DeepCopy(), leftover.DeepCopy(), newGateway("my-gateway", DefaultAITenantName)).WithInterceptorFuncs(rec.funcs()).Build()
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, leftover, newGateway("my-gateway", DefaultAITenantName)).Build()
+	// The live ConfigMap moves on; the cache still holds the previous version.
+	current := &corev1.ConfigMap{}
+	if err := liveClient.Get(t.Context(), client.ObjectKeyFromObject(leftover), current); err != nil {
+		t.Fatal(err)
+	}
+	current.Data["note"] = "edited"
+	if err := liveClient.Update(t.Context(), current); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Reconciler{Client: cacheClient, APIReader: liveClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	res, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v while the cache holds an older version", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	}
+}
+
+// TestReconcileBlockedPluginsMigrationReturnsCacheErrors returns a failed
+// cached read of the refusing ConfigMap for retry instead of waiting on it.
+func TestReconcileBlockedPluginsMigrationReturnsCacheErrors(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMTCFinalizer(withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusSteady))
+	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
+	leftover := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        PayloadProcessingPluginsConfigMapForTenant(""),
+			Namespace:   DefaultAITenantName,
+			Annotations: map[string]string{AnnotationManaged: "false"},
+		},
+		Data: map[string]string{ippProcessingConfigKey: "kind: PayloadProcessorConfig\n"},
+	}
+	cacheErr := errors.New("informer not synced")
+	funcs := (&recorder{}).funcs()
+	funcs.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.ConfigMap); ok && key.Name == PayloadProcessingPluginsConfigMapForTenant("") {
+			return cacheErr
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}
+	cacheClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc.DeepCopy(), aitenant.DeepCopy(), newGateway("my-gateway", DefaultAITenantName)).WithInterceptorFuncs(funcs).Build()
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, leftover, newGateway("my-gateway", DefaultAITenantName)).Build()
+
+	r := &Reconciler{Client: cacheClient, APIReader: liveClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	if _, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName)); !errors.Is(err, cacheErr) {
+		t.Fatalf("err = %v, want the cached read error", err)
+	}
+}
+
+// TestReconcilePluginsMigrationGateReturnsReadErrors keeps a failed live read
+// of the plugins ConfigMap apart from a refusal: it is returned for retry, not
+// treated as a wait for an event that may never come.
+func TestReconcilePluginsMigrationGateReturnsReadErrors(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMTCFinalizer(withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusSteady))
+	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
+	rec := &recorder{}
+	funcs := rec.funcs()
+	readErr := errors.New("etcdserver: request timed out")
+	// Only the gate reads the plugins ConfigMap as a typed object; the
+	// ownership checks before it read it as unstructured.
+	funcs.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.ConfigMap); ok && key.Name == PayloadProcessingPluginsConfigMapForTenant("") {
+			return readErr
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", DefaultAITenantName)).WithInterceptorFuncs(funcs).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	_, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName))
+	if !errors.Is(err, readErr) {
+		t.Fatalf("err = %v, want the plugins ConfigMap read error", err)
+	}
+	names, _, _ := rec.snapshot()
+	if len(names) != 0 {
+		t.Fatalf("expected no praxis apply after a failed gate read, got %v", names)
+	}
+}
+
+// TestReconcileStaleClaimRereadIsWokenBySteadyEvent covers a reconcile that
+// re-reads its own earlier steady claim: the first MaasTenantConfig Get comes
+// from a cache that still shows cleanup-complete, and by the claim's re-read
+// the cache shows steady. The pass waits without applying, so the update that
+// moved the cache from cleanup-complete to steady must reach the queue.
+func TestReconcileStaleClaimRereadIsWokenBySteadyEvent(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	mtc := withMTCFinalizer(withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusSteady))
+	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns")
+	rec := &recorder{}
+	funcs := rec.funcs()
+	mtcGets := 0
+	funcs.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if err := c.Get(ctx, key, obj, opts...); err != nil {
+			return err
+		}
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == MaasTenantConfigGVK.Kind {
+			mtcGets++
+			if mtcGets == 1 {
+				withMarker(u, PayloadProcessingStatusCleanupComplete)
+			}
+		}
+		return nil
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", "tenant-ns")).WithInterceptorFuncs(funcs).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+	res, err := r.Reconcile(t.Context(), mtcRequest("tenant-ns"))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	names, _, _ := rec.snapshot()
+	if mtcGets < 2 || len(names) != 0 || res.RequeueAfter != 0 {
+		t.Fatalf("mtcGets=%d applied=%v RequeueAfter=%v, want a stale first read, no apply and no requeue", mtcGets, names, res.RequeueAfter)
+	}
+
+	cached := withMTCFinalizer(withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete))
+	current := withMarker(cached.DeepCopy(), PayloadProcessingStatusSteady)
+	if !tenantEventPredicates()["maastenantconfig"].Update(updateFor(cached, current)) {
+		t.Fatal("the cleanup-complete to steady update was dropped; the waiting tenant would never reconcile again")
+	}
+}
+
 // TestReconcileProceedsWhenMigrationMarkerClear asserts the brand-new-tenant
 // bootstrap case: maas-controller seeds every new MaasTenantConfig with
 // PayloadProcessingStatusCleanupComplete at creation time, so the
-// initial transition-in is never blocked. Claiming then writes steady.
+// initial transition-in is never blocked. Claiming writes steady and ends the
+// pass; the next pass, which the steady update starts, applies.
 func TestReconcileProceedsWhenMigrationMarkerClear(t *testing.T) {
 	requireManifests(t)
 	scheme := mtcSchemeForTests()
@@ -1033,23 +1261,109 @@ func TestReconcileProceedsWhenMigrationMarkerClear(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", DefaultAITenantName)).WithInterceptorFuncs(rec.funcs()).Build()
 
 	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
-	res, err := r.Reconcile(context.Background(), mtcRequest(DefaultAITenantName))
+	res, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != time.Minute {
-		t.Fatalf("RequeueAfter = %v, want ResyncInterval", res.RequeueAfter)
-	}
 	names, _, _ := rec.snapshot()
-	assertContains(t, names, "payload-processing")
-
+	if res.RequeueAfter != 0 || len(names) != 0 {
+		t.Fatalf("claim pass: RequeueAfter=%v applied=%v, want neither", res.RequeueAfter, names)
+	}
 	var got unstructured.Unstructured
 	got.SetGroupVersionKind(MaasTenantConfigGVK)
-	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: DefaultAITenantName, Name: MaasTenantConfigInstanceName}, &got); err != nil {
+	if err := fakeClient.Get(t.Context(), client.ObjectKey{Namespace: DefaultAITenantName, Name: MaasTenantConfigInstanceName}, &got); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	if PayloadProcessingStatus(&got) != PayloadProcessingStatusSteady {
 		t.Fatalf("status = %q, want %q after claim", PayloadProcessingStatus(&got), PayloadProcessingStatusSteady)
+	}
+
+	res, err = r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName))
+	if err != nil {
+		t.Fatalf("Reconcile after claim: %v", err)
+	}
+	if res.RequeueAfter != time.Minute {
+		t.Fatalf("RequeueAfter = %v, want ResyncInterval", res.RequeueAfter)
+	}
+	names, _, _ = rec.snapshot()
+	assertContains(t, names, "payload-processing")
+}
+
+// TestReconcileClaimDoesNotApplyRevokedForce covers an operator revoking
+// AnnotationForcePayloadProcessingMigration while the handoff is claimed: the
+// first claim write conflicts with the revocation and the retry wins. Nothing
+// read before the claim may drive an apply, so the leftover IPP plugins
+// ConfigMap the force would have overwritten stays untouched.
+func TestReconcileClaimDoesNotApplyRevokedForce(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMTCFinalizer(withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusCleanupComplete))
+	annotations := mtc.GetAnnotations()
+	annotations[AnnotationForcePayloadProcessingMigration] = "true"
+	mtc.SetAnnotations(annotations)
+	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", DefaultAITenantName, DefaultAITenantName)
+	leftover := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        PayloadProcessingPluginsConfigMapForTenant(""),
+			Namespace:   DefaultAITenantName,
+			Annotations: map[string]string{AnnotationManaged: "false"},
+		},
+		Data: map[string]string{ippProcessingConfigKey: "kind: PayloadProcessorConfig\n"},
+	}
+	rec := &recorder{}
+	funcs := rec.funcs()
+	revoked := false
+	funcs.Update = func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if obj.GetObjectKind().GroupVersionKind().Kind == MaasTenantConfigGVK.Kind && !revoked {
+			revoked = true
+			stored := NewMaasTenantConfig()
+			if err := c.Get(ctx, client.ObjectKeyFromObject(obj), stored); err != nil {
+				return err
+			}
+			storedAnnotations := stored.GetAnnotations()
+			delete(storedAnnotations, AnnotationForcePayloadProcessingMigration)
+			stored.SetAnnotations(storedAnnotations)
+			if err := c.Update(ctx, stored); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: MaasTenantConfigGVK.Group, Resource: "maastenantconfigs"},
+				obj.GetName(), errors.New("the object has been modified"))
+		}
+		return c.Update(ctx, obj, opts...)
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, leftover, newGateway("my-gateway", DefaultAITenantName)).WithInterceptorFuncs(funcs).Build()
+
+	eventRecorder := events.NewFakeRecorder(10)
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute, Recorder: eventRecorder}
+
+	// The claim pass: the retried claim wins, and the pass ends without applying.
+	if _, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName)); err != nil {
+		t.Fatalf("claim pass: Reconcile: %v", err)
+	}
+	if names, _, _ := rec.snapshot(); len(names) != 0 {
+		t.Fatalf("claim pass applied %v", names)
+	}
+	stored := NewMaasTenantConfig()
+	if err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(mtc), stored); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if PayloadProcessingStatus(stored) != PayloadProcessingStatusSteady || forcePayloadProcessingMigration(stored) {
+		t.Fatalf("status = %q, force = %v; want steady with the force annotation revoked",
+			PayloadProcessingStatus(stored), forcePayloadProcessingMigration(stored))
+	}
+
+	// The next pass reads the revocation, and the gate refuses the leftover.
+	if _, err := r.Reconcile(t.Context(), mtcRequest(DefaultAITenantName)); err != nil {
+		t.Fatalf("apply pass: Reconcile: %v", err)
+	}
+	if names, _, _ := rec.snapshot(); len(names) != 0 {
+		t.Fatalf("apply pass applied %v with the force annotation revoked", names)
+	}
+	if len(eventRecorder.Events) != 1 {
+		t.Fatalf("events = %d, want the gate's refusal", len(eventRecorder.Events))
+	}
+	if event := <-eventRecorder.Events; !strings.Contains(event, reasonPluginsMigrationRefused) {
+		t.Fatalf("event = %q, want %s", event, reasonPluginsMigrationRefused)
 	}
 }
 
@@ -1085,7 +1399,7 @@ func TestReconcileSkipsMigrationMarkerCheckWhenBundleAlreadyExists(t *testing.T)
 func TestReconcileAppliesAndRequeuesResyncIntervalForNonDefaultTenant(t *testing.T) {
 	requireManifests(t)
 	scheme := mtcSchemeForTests()
-	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusSteady)
 	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns")
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", "tenant-ns")).WithInterceptorFuncs(rec.funcs()).Build()
@@ -1124,7 +1438,7 @@ func TestReconcileAppliesAndRequeuesResyncIntervalForNonDefaultTenant(t *testing
 func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 	requireManifests(t)
 	scheme := mtcSchemeForTests()
-	mtc := withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc := withMarker(newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants"), PayloadProcessingStatusSteady)
 	aitenant := newAITenantOwner(DefaultAITenantName, "ai-tenants", AITenantPhaseActive, "my-gateway", "openshift-ingress", DefaultAITenantName)
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
@@ -1153,7 +1467,7 @@ func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 func TestReconcileAppliesHPAsWhenAutoscalingConfigured(t *testing.T) {
 	requireManifests(t)
 	scheme := mtcSchemeForTests()
-	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusSteady)
 	mtc.Object["spec"] = map[string]any{
 		"payloadProcessing": map[string]any{
 			"replicas":    int64(2),
@@ -1189,7 +1503,7 @@ func TestReconcileAppliesHPAsWhenAutoscalingConfigured(t *testing.T) {
 func TestReconcileDeletesOrphanedHPAsWhenAutoscalingRemoved(t *testing.T) {
 	requireManifests(t)
 	scheme := mtcSchemeForTests()
-	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusSteady)
 	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "openshift-ingress", "tenant-ns")
 	orphan := &unstructured.Unstructured{}
 	orphan.SetGroupVersionKind(gvkHPA)

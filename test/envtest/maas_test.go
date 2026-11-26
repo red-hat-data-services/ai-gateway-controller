@@ -77,6 +77,14 @@ const infraNamespace = "odh-ai-gateway-infra"
 // Backend opt-in and migration are outside the model-publication scenario.
 func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 	t.Helper()
+	m.praxisTenant(t, namespace, tenant.PayloadProcessingStatusCleanupComplete)
+}
+
+// praxisTenant publishes a Praxis tenant with the given payload-processing
+// status. maas-controller seeds cleanup-complete on new tenants; an empty
+// status is a tenant whose legacy IPP cleanup has not been signalled yet.
+func (m maasFixture) praxisTenant(t *testing.T, namespace, payloadProcessingStatus string) {
+	t.Helper()
 	createNamespace(t, m.client, namespace)
 	// gatewayExists looks up the Gateway API object named by status.gatewayRef;
 	// the CRD is vendored in testdata/crds and the namespace is created in suite setup.
@@ -120,12 +128,15 @@ func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 	mtc.SetName(tenant.MaasTenantConfigInstanceName)
 	mtc.SetNamespace(namespace)
 	mtc.SetLabels(map[string]string{tenant.LabelManagedByAITenant: "true", tenant.LabelTenantName: namespace})
-	mtc.SetAnnotations(map[string]string{
-		tenant.AnnotationPayloadProcessingType:   tenant.PayloadProcessingBackendPraxis,
-		tenant.AnnotationPayloadProcessingStatus: tenant.PayloadProcessingStatusCleanupComplete,
-		tenant.AnnotationAITenantName:            namespace,
-		tenant.AnnotationAITenantNamespace:       maasNamespace,
-	})
+	annotations := map[string]string{
+		tenant.AnnotationPayloadProcessingType: tenant.PayloadProcessingBackendPraxis,
+		tenant.AnnotationAITenantName:          namespace,
+		tenant.AnnotationAITenantNamespace:     maasNamespace,
+	}
+	if payloadProcessingStatus != "" {
+		annotations[tenant.AnnotationPayloadProcessingStatus] = payloadProcessingStatus
+	}
+	mtc.SetAnnotations(annotations)
 	mtc.Object["spec"] = map[string]any{}
 	require.NoError(t, m.client.Create(t.Context(), mtc))
 	// The praxis reconcile waits for the infrastructure namespace before

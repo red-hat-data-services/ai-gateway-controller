@@ -20,8 +20,8 @@ import (
 	"context"
 	"fmt"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -48,16 +48,21 @@ func LegacyServes(mtc *unstructured.Unstructured) bool {
 // EnsurePraxisMayDeploy decides whether praxis may render/apply for mtc.
 //
 //	steady           → ready (resume / steady-state)
-//	cleanup-complete → CAS-claim to steady, then ready
+//	cleanup-complete → CAS-claim to steady, then not ready
 //	absent / other   → wait (legacy still owns, or cleanup not signaled yet)
 //
-// A false ready with a nil error means the caller should requeue shortly.
+// A false ready with a nil error means the caller waits for the next
+// MaasTenantConfig event: maas-controller writing cleanup-complete, a backend
+// switch, or the claim's own steady update. The pass that claims does not
+// apply: everything it read before the claim (the force annotation, deletion,
+// the tenant's settings) may already be stale, and the steady update starts a
+// pass that reads them again.
 func EnsurePraxisMayDeploy(ctx context.Context, c client.Client, mtc *unstructured.Unstructured) (ready bool, err error) {
 	switch PayloadProcessingStatus(mtc) {
 	case PayloadProcessingStatusSteady:
 		return true, nil
 	case PayloadProcessingStatusCleanupComplete:
-		return claimPraxisSteady(ctx, c, mtc)
+		return false, claimPraxisSteady(ctx, c, mtc)
 	default:
 		return false, nil
 	}
@@ -67,28 +72,29 @@ func EnsurePraxisMayDeploy(ctx context.Context, c client.Client, mtc *unstructur
 // AnnotationPayloadProcessingStatus=steady via an optimistic-concurrency
 // Update. Re-validates UsesPraxis on the fresh read so a legacy switch that
 // landed before this Get (same resourceVersion as the claim write) cannot
-// produce a praxis claim. A false return means another party claimed first,
-// the backend is no longer praxis, or the status is no longer clear — caller
-// must wait.
-func claimPraxisSteady(ctx context.Context, c client.Client, mtc *unstructured.Unstructured) (claimed bool, err error) {
-	latest := &unstructured.Unstructured{}
-	latest.SetGroupVersionKind(mtc.GroupVersionKind())
-	if err := c.Get(ctx, client.ObjectKeyFromObject(mtc), latest); err != nil {
-		return false, fmt.Errorf("get MaasTenantConfig for payload-processing status claim: %w", err)
-	}
-	if !UsesPraxis(latest) || PayloadProcessingStatus(latest) != PayloadProcessingStatusCleanupComplete {
-		return false, nil
-	}
-	setPayloadProcessingStatus(latest, PayloadProcessingStatusSteady)
-	if err := c.Update(ctx, latest); err != nil {
-		if apierrors.IsConflict(err) {
-			return false, nil
+// produce a praxis claim. It writes nothing when another party claimed first,
+// the backend is no longer praxis, or the status is no longer clear; the
+// caller waits for the event either way. A conflict on the claim write is
+// retried against a fresh read, since the cache can lag the write it lost to.
+// Once the retries run out the conflict is returned: that write may be one
+// the MaasTenantConfig watch drops, such as a status update, so the caller
+// must retry rather than wait for an event.
+func claimPraxisSteady(ctx context.Context, c client.Client, mtc *unstructured.Unstructured) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &unstructured.Unstructured{}
+		latest.SetGroupVersionKind(mtc.GroupVersionKind())
+		if err := c.Get(ctx, client.ObjectKeyFromObject(mtc), latest); err != nil {
+			return fmt.Errorf("get MaasTenantConfig for payload-processing status claim: %w", err)
 		}
-		return false, fmt.Errorf("claim payload-processing status to steady: %w", err)
-	}
-	// Keep the caller's copy in sync for subsequent patches in this reconcile.
-	setPayloadProcessingStatus(mtc, PayloadProcessingStatusSteady)
-	return true, nil
+		if !UsesPraxis(latest) || PayloadProcessingStatus(latest) != PayloadProcessingStatusCleanupComplete {
+			return nil
+		}
+		setPayloadProcessingStatus(latest, PayloadProcessingStatusSteady)
+		if err := c.Update(ctx, latest); err != nil {
+			return fmt.Errorf("claim payload-processing status to steady: %w", err)
+		}
+		return nil
+	})
 }
 
 // MarkPayloadProcessingCleanupComplete is this controller's switch-off "done"

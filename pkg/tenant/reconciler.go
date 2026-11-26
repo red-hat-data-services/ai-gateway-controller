@@ -143,10 +143,9 @@ type Reconciler struct {
 // AITenant would never map to its MaasTenantConfig), and status.gatewayRef /
 // DeployReady transitions (the apply path targets the Gateway they name, and
 // steady state returns without a requeue). Other status-only writes are
-// dropped. The MaasTenantConfig watch additionally admits changes to the
-// AnnotationPayloadProcessingType and AnnotationExtProcResponseBodyMode
-// annotations, which select the praxis vs legacy-IPP backend and the
-// shared ExtProc response body mode without bumping metadata.generation.
+// dropped. The MaasTenantConfig watch additionally admits annotation
+// changes and changes to the labels IdentifierFor reads, neither of which
+// bumps metadata.generation.
 func tenantEventPredicates() map[string]predicate.Predicate {
 	aitenantUpdate := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
@@ -170,23 +169,30 @@ func tenantEventPredicates() map[string]predicate.Predicate {
 				DeployReady(old) != DeployReady(current)
 		},
 	}
-	// The payload-processing backend and ExtProc response body mode are
-	// selected by annotation, which does not bump metadata.generation. An
-	// IPP→praxis flip or an experimental response-mode override on an
-	// existing MaasTenantConfig must reconcile promptly: the IPP path and
-	// steady-state praxis path can return without scheduling a requeue, so
-	// the resync interval would otherwise be the only backstop.
-	maastenantconfigUpdate := predicate.Funcs{
+	// Annotations carry the payload-processing backend, maas-controller's IPP
+	// handoff signal and the operator overrides (experimental-*,
+	// AnnotationForcePayloadProcessingMigration), and none of them bump
+	// metadata.generation. Every annotation change is admitted, as in
+	// maas-controller's MaasTenantConfig watch: the handoff and migration
+	// gate waits return without a requeue and rely on it, and a tenant that
+	// never used praxis returns without any. The controllers' own handoff
+	// writes cost one extra pass each; they are transitions, not a loop.
+	//
+	// IdentifierFor names every per-tenant resource from two labels, so a
+	// change to it is admitted too; other label changes are dropped.
+	tenantIdentityChanged := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() {
-				return true
+			if e.ObjectOld == nil || e.ObjectNew == nil {
+				return false
 			}
-			oldObj := mustUnstructured(e.ObjectOld)
-			newObj := mustUnstructured(e.ObjectNew)
-			return PayloadProcessingType(oldObj) != PayloadProcessingType(newObj) ||
-				extProcResponseBodyModeAnnotation(oldObj) != extProcResponseBodyModeAnnotation(newObj)
+			return IdentifierFor(e.ObjectOld) != IdentifierFor(e.ObjectNew)
 		},
 	}
+	maastenantconfigUpdate := predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.AnnotationChangedPredicate{},
+		tenantIdentityChanged,
+	)
 	return map[string]predicate.Predicate{
 		"maastenantconfig": maastenantconfigUpdate,
 		"aitenant":         aitenantUpdate,
@@ -201,17 +207,6 @@ func asUnstructured(obj client.Object) (*unstructured.Unstructured, bool) {
 	return u, ok
 }
 
-// mustUnstructured converts a watch object to *unstructured.Unstructured,
-// returning an empty object when the type does not match (annotations of an
-// empty object read as unset, making the comparison a no-op).
-func mustUnstructured(obj client.Object) *unstructured.Unstructured {
-	u, _ := asUnstructured(obj)
-	if u == nil {
-		return &unstructured.Unstructured{}
-	}
-	return u
-}
-
 // aitenantConfigNamespace reads the MaasTenantConfig namespace an AITenant's
 // status points at; empty when unset or the object is not an AITenant.
 func aitenantConfigNamespace(obj client.Object) string {
@@ -223,9 +218,9 @@ func aitenantConfigNamespace(obj client.Object) string {
 	return namespace
 }
 
-// notControllerOwnedSecret reports whether a Secret was not rendered by this
-// controller, i.e. is a credential source rather than controller output.
-func notControllerOwnedSecret(obj client.Object) bool {
+// notControllerOwned reports whether an object was not rendered by this
+// controller, e.g. a credential source rather than controller output.
+func notControllerOwned(obj client.Object) bool {
 	return obj.GetLabels()[managedByLabel] != render.FieldOwner
 }
 
@@ -247,9 +242,28 @@ func notControllerOwnedSecret(obj client.Object) bool {
 // new pods — until the resync interval.
 func tenantSecretPredicate() predicate.Funcs {
 	return predicate.Funcs{
-		CreateFunc:  func(e event.CreateEvent) bool { return notControllerOwnedSecret(e.Object) },
-		UpdateFunc:  func(e event.UpdateEvent) bool { return notControllerOwnedSecret(e.ObjectNew) },
-		GenericFunc: func(e event.GenericEvent) bool { return notControllerOwnedSecret(e.Object) },
+		CreateFunc:  func(e event.CreateEvent) bool { return notControllerOwned(e.Object) },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return notControllerOwned(e.ObjectNew) },
+		GenericFunc: func(e event.GenericEvent) bool { return notControllerOwned(e.Object) },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	}
+}
+
+// pluginsConfigMapPredicate filters the plugins ConfigMap watch to writes this
+// controller did not make: an IPP-shaped leftover that blocks the
+// RHOAIENG-98846 migration gate belongs to maas-controller or an operator,
+// while this controller's own applies need no second pass. An update away
+// from IPP-shaped data is admitted whoever owns the ConfigMap, since only that
+// change or a delete can end the gate's wait, and this controller never
+// writes IPP-shaped data. Deletes are always admitted: removing a leftover
+// ends the gate's wait, and a removed rendered ConfigMap must be applied again.
+func pluginsConfigMapPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { return notControllerOwned(e.Object) },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return notControllerOwned(e.ObjectNew) || ippShapedConfigMap(e.ObjectOld)
+		},
+		GenericFunc: func(e event.GenericEvent) bool { return notControllerOwned(e.Object) },
 		DeleteFunc:  func(event.DeleteEvent) bool { return true },
 	}
 }
@@ -259,6 +273,11 @@ func tenantSecretPredicate() predicate.Funcs {
 // mirroring maas-controller's own TenantReconciler.SetupWithManager shape.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	preds := tenantEventPredicates()
+	// IndexField only records the extractor against a cache that has not
+	// started yet, so context.Background is sufficient (as in pkg/guardrail).
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), NewMaasTenantConfig(), pluginsConfigMapIndex, indexMaasTenantConfigByPluginsConfigMap); err != nil {
+		return fmt.Errorf("index MaasTenantConfigs by plugins ConfigMap name: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(NewMaasTenantConfig(), builder.WithPredicates(preds["maastenantconfig"])).
 		Watches(
@@ -273,6 +292,8 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
 			builder.WithPredicates(tenantSecretPredicate())).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForPluginsConfigMap),
+			builder.WithPredicates(pluginsConfigMapPredicate())).
 		Watches(&aigatewayv1alpha1.AIGuardrail{},
 			handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
 			builder.WithPredicates(nemoCalloutChanged())).
@@ -286,6 +307,69 @@ func (r *Reconciler) maasTenantConfigForRoutingOverlay(ctx context.Context, obj 
 		return nil
 	}
 	return r.maasTenantConfigForNamespace(ctx, obj)
+}
+
+// ippShapedConfigMap reports whether obj is a ConfigMap holding legacy IPP
+// plugin configuration.
+func ippShapedConfigMap(obj client.Object) bool {
+	cm, ok := obj.(*corev1.ConfigMap)
+	return ok && isIPPPluginsConfigMapData(cm.Data)
+}
+
+// pluginsConfigMapIndex indexes MaasTenantConfigs by the name of the plugins
+// ConfigMap their tenant renders. The name is indexed rather than parsed back
+// into a tenant, because ResourceName hashes long tenant identifiers.
+const pluginsConfigMapIndex = "tenant.pluginsConfigMapName"
+
+func indexMaasTenantConfigByPluginsConfigMap(obj client.Object) []string {
+	return []string{PayloadProcessingPluginsConfigMapForTenant(IdentifierFor(obj))}
+}
+
+// maasTenantConfigForPluginsConfigMap maps a payload-processing plugins
+// ConfigMap back to its tenant's MaasTenantConfig. Only a live Praxis tenant
+// whose gateway namespace holds the ConfigMap is enqueued: a tenant being torn
+// down deletes the ConfigMap itself, a tenant on legacy IPP has no migration
+// gate to wake, and the same name elsewhere is not this tenant's. A tenant
+// whose owner cannot be resolved from the cache is still enqueued; its
+// reconcile resolves the owner itself.
+func (r *Reconciler) maasTenantConfigForPluginsConfigMap(ctx context.Context, obj client.Object) []reconcile.Request {
+	if !isReleasedPluginConfigMap(obj) {
+		return nil
+	}
+	configs := &unstructured.UnstructuredList{}
+	configs.SetGroupVersionKind(MaasTenantConfigGVK.GroupVersion().WithKind(MaasTenantConfigGVK.Kind + "List"))
+	if err := r.Client.List(ctx, configs, client.MatchingFields{pluginsConfigMapIndex: obj.GetName()}); err != nil {
+		r.Log.Error(err, "list MaasTenantConfigs for the plugins ConfigMap watch; tenants were not enqueued",
+			"namespace", obj.GetNamespace(), "name", obj.GetName())
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range configs.Items {
+		mtc := &configs.Items[i]
+		if !mtc.GetDeletionTimestamp().IsZero() || !UsesPraxis(mtc) {
+			continue
+		}
+		if gatewayNamespace, ok := r.tenantGatewayNamespace(ctx, mtc); ok && gatewayNamespace != obj.GetNamespace() {
+			continue
+		}
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(mtc)})
+	}
+	return requests
+}
+
+// tenantGatewayNamespace reads the gateway namespace mtc's owning AITenant
+// publishes, from the cache; false when it cannot be resolved.
+func (r *Reconciler) tenantGatewayNamespace(ctx context.Context, mtc *unstructured.Unstructured) (string, bool) {
+	name, namespace, ok := OwningAITenantRef(mtc)
+	if !ok {
+		return "", false
+	}
+	aitenant := NewAITenant()
+	if err := r.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, aitenant); err != nil {
+		return "", false
+	}
+	_, gatewayNamespace, ok := GatewayRef(aitenant)
+	return gatewayNamespace, ok
 }
 
 func (r *Reconciler) maasTenantConfigForNamespace(_ context.Context, obj client.Object) []reconcile.Request {
@@ -530,8 +614,14 @@ func (r *Reconciler) preparePraxisOwnerForApply(
 		return nil, "", "", ctrl.Result{}, fmt.Errorf("ensure praxis may deploy: %w", err)
 	}
 	if !ready {
-		log.Info("waiting for the legacy IPP cleanup to finish before applying praxis-extproc")
-		return nil, "", "", ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+		// Only MaasTenantConfig annotations end this wait (the handoff status,
+		// including this pass's own claim, and the backend selection), and the
+		// MaasTenantConfig watch admits every annotation change, so there is
+		// nothing to poll. A new input that is not an annotation needs its own
+		// watch.
+		log.Info("waiting for the payload-processing handoff before applying praxis-extproc",
+			"status", PayloadProcessingStatus(mtc))
+		return nil, "", "", ctrl.Result{}, nil
 	}
 	return aitenant, gatewayName, gatewayNamespace, ctrl.Result{}, nil
 }
@@ -542,7 +632,7 @@ func (r *Reconciler) preparePraxisOwnerForApply(
 // cleanup pass later), wait for readiness, then render/apply.
 func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *unstructured.Unstructured, tenantID string) (ctrl.Result, error) {
 	aitenant, gatewayName, gatewayNamespace, result, err := r.preparePraxisOwnerForApply(ctx, log, mtc)
-	if err != nil || result.RequeueAfter > 0 {
+	if err != nil || aitenant == nil {
 		return result, err
 	}
 
@@ -689,8 +779,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	// RHOAIENG-98846: do not ForceOwnership-overwrite a leftover IPP plugins
 	// ConfigMap unless the operator force-annotated the MaasTenantConfig.
 	if err := r.ensurePluginsConfigMapMigrationAllowed(ctx, mtc, gatewayNamespace, tenantID); err != nil {
-		log.Info("waiting for plugins ConfigMap migration gate before applying praxis-extproc", "error", err)
-		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+		return r.pluginsMigrationGateResult(ctx, log, mtc, err)
 	}
 
 	// Re-validate the owning AITenant live, immediately before writing cluster
@@ -742,6 +831,38 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+}
+
+// pluginsMigrationGateResult maps an ensurePluginsConfigMapMigrationAllowed
+// failure to the reconcile result. A failed read is returned for retry. A
+// refusal waits: the force annotation arrives through the MaasTenantConfig
+// watch, and a change to or removal of the leftover ConfigMap through the
+// plugins ConfigMap watch, but only once the informer holds the version that
+// refused. A ConfigMap the informer never saw, such as one created during a
+// watch gap, produces no delete event even after a relist, so until the cache
+// catches up the gate polls. Since nothing repeats a refusal once it waits on
+// events, it is also reported as a Warning event on the MaasTenantConfig.
+func (r *Reconciler) pluginsMigrationGateResult(ctx context.Context, log logr.Logger, mtc *unstructured.Unstructured, err error) (ctrl.Result, error) {
+	refusal, ok := errors.AsType[*pluginsMigrationRefusedError](err)
+	if !ok {
+		return ctrl.Result{}, err
+	}
+	log.Info("waiting for plugins ConfigMap migration gate before applying praxis-extproc", "error", err)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(mtc, nil, corev1.EventTypeWarning, reasonPluginsMigrationRefused, applyPraxisAction, "%s", err.Error())
+	}
+	cached := &corev1.ConfigMap{}
+	err = r.Client.Get(ctx, refusal.key, cached)
+	if apierrors.IsNotFound(err) {
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("read cached plugins ConfigMap %s: %w", refusal.key, err)
+	}
+	if cached.ResourceVersion != refusal.resourceVersion {
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 // omitNetworkPolicies drops controller-managed NetworkPolicies when the
@@ -1221,7 +1342,7 @@ func (r *Reconciler) waitForForeignOwnership(ctx context.Context, resources []un
 	return nil
 }
 
-func isReleasedPluginConfigMap(obj *unstructured.Unstructured) bool {
+func isReleasedPluginConfigMap(obj client.Object) bool {
 	name := obj.GetName()
 	return name == PayloadProcessingPluginsConfigMapName || strings.HasPrefix(name, PayloadProcessingPluginsConfigMapName+"-")
 }

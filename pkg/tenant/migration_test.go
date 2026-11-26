@@ -18,11 +18,15 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func newMTCFixture(namespace string, annotations map[string]string) *unstructured.Unstructured {
@@ -68,7 +72,7 @@ func TestEnsurePraxisMayDeploy(t *testing.T) {
 		}
 	})
 
-	t.Run("cleanup-complete claims to steady", func(t *testing.T) {
+	t.Run("cleanup-complete claims to steady and ends the pass", func(t *testing.T) {
 		mtc := newMTCFixture("ns-claim", map[string]string{
 			AnnotationPayloadProcessingType:   PayloadProcessingBackendPraxis,
 			AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete,
@@ -78,8 +82,8 @@ func TestEnsurePraxisMayDeploy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EnsurePraxisMayDeploy: %v", err)
 		}
-		if !ready {
-			t.Fatal("ready = false, want true after claim")
+		if ready {
+			t.Fatal("ready = true, want false: the claim's own update starts the apply")
 		}
 		var got unstructured.Unstructured
 		got.SetGroupVersionKind(MaasTenantConfigGVK)
@@ -103,22 +107,79 @@ func TestEnsurePraxisMayDeploy(t *testing.T) {
 		}
 	})
 
+	t.Run("a persistent claim conflict is returned", func(t *testing.T) {
+		mtc := newMTCFixture("ns-conflict", map[string]string{
+			AnnotationPayloadProcessingType:   PayloadProcessingBackendPraxis,
+			AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete,
+		})
+		// A write between the claim's Get and Update, such as a maas-controller
+		// status update, produces no event the MaasTenantConfig watch admits,
+		// so once retries against the cache run out the caller must retry
+		// rather than wait.
+		conflict := func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
+			return apierrors.NewConflict(schema.GroupResource{Group: MaasTenantConfigGVK.Group, Resource: "maastenantconfigs"},
+				obj.GetName(), errors.New("the object has been modified"))
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).WithInterceptorFuncs(interceptor.Funcs{Update: conflict}).Build()
+		ready, err := EnsurePraxisMayDeploy(t.Context(), cl, mtc)
+		if !apierrors.IsConflict(err) {
+			t.Fatalf("err = %v, want the conflict", err)
+		}
+		if ready {
+			t.Fatal("ready = true, want false on a lost claim write")
+		}
+	})
+
+	t.Run("a claim conflict is retried against a fresh read", func(t *testing.T) {
+		mtc := newMTCFixture("ns-conflict-once", map[string]string{
+			AnnotationPayloadProcessingType:   PayloadProcessingBackendPraxis,
+			AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete,
+		})
+		updates := 0
+		conflictOnce := func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			updates++
+			if updates == 1 {
+				return apierrors.NewConflict(schema.GroupResource{Group: MaasTenantConfigGVK.Group, Resource: "maastenantconfigs"},
+					obj.GetName(), errors.New("the object has been modified"))
+			}
+			return c.Update(ctx, obj, opts...)
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).WithInterceptorFuncs(interceptor.Funcs{Update: conflictOnce}).Build()
+		ready, err := EnsurePraxisMayDeploy(t.Context(), cl, mtc)
+		if err != nil || ready {
+			t.Fatalf("ready=%v err=%v, want the retried claim to win and end the pass", ready, err)
+		}
+		var got unstructured.Unstructured
+		got.SetGroupVersionKind(MaasTenantConfigGVK)
+		if err := cl.Get(t.Context(), client.ObjectKeyFromObject(mtc), &got); err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if PayloadProcessingStatus(&got) != PayloadProcessingStatusSteady {
+			t.Fatalf("status = %q, want %q", PayloadProcessingStatus(&got), PayloadProcessingStatusSteady)
+		}
+	})
+
 	t.Run("concurrent claim attempts", func(t *testing.T) {
 		mtc := newMTCFixture("ns-race", map[string]string{
 			AnnotationPayloadProcessingType:   PayloadProcessingBackendPraxis,
 			AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete,
 		})
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).Build()
+		updates := 0
+		countUpdates := func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			updates++
+			return c.Update(ctx, obj, opts...)
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc).WithInterceptorFuncs(interceptor.Funcs{Update: countUpdates}).Build()
 
-		readerA := mtc.DeepCopy()
-		readerB := mtc.DeepCopy()
-		claimedA, errA := claimPraxisSteady(context.Background(), cl, readerA)
-		claimedB, errB := claimPraxisSteady(context.Background(), cl, readerB)
+		// Both claimers start from the same cleanup-complete snapshot; the
+		// second re-reads steady and must not write again.
+		errA := claimPraxisSteady(t.Context(), cl, mtc.DeepCopy())
+		errB := claimPraxisSteady(t.Context(), cl, mtc.DeepCopy())
 		if errA != nil || errB != nil {
 			t.Fatalf("claim errors: %v %v", errA, errB)
 		}
-		if claimedA == claimedB {
-			t.Fatalf("exactly one claimer should win, got claimedA=%v claimedB=%v", claimedA, claimedB)
+		if updates != 1 {
+			t.Fatalf("claim writes = %d, want exactly one", updates)
 		}
 	})
 
@@ -135,12 +196,8 @@ func TestEnsurePraxisMayDeploy(t *testing.T) {
 		live.SetAnnotations(annotations)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(live).Build()
 
-		claimed, err := claimPraxisSteady(context.Background(), cl, caller)
-		if err != nil {
+		if err := claimPraxisSteady(t.Context(), cl, caller); err != nil {
 			t.Fatalf("claimPraxisSteady: %v", err)
-		}
-		if claimed {
-			t.Fatal("claimed = true, want false when live object no longer selects praxis")
 		}
 		var got unstructured.Unstructured
 		got.SetGroupVersionKind(MaasTenantConfigGVK)

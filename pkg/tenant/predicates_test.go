@@ -17,12 +17,14 @@ limitations under the License.
 package tenant
 
 import (
+	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
@@ -158,6 +160,111 @@ func TestMaasTenantConfigPredicate(t *testing.T) {
 			admit: true,
 		},
 		{
+			name: "max requests annotation set admits",
+			old:  func(*unstructured.Unstructured) {},
+			new: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationExtProcMaxRequests: "1024"})
+			},
+			admit: true,
+		},
+		{
+			name: "max requests annotation change admits",
+			old: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationExtProcMaxRequests: "64"})
+			},
+			new: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationExtProcMaxRequests: "1024"})
+			},
+			admit: true,
+		},
+		{
+			name: "max requests annotation clear admits",
+			old: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationExtProcMaxRequests: "1024"})
+			},
+			new:   func(u *unstructured.Unstructured) { u.SetAnnotations(map[string]string{}) },
+			admit: true,
+		},
+		{
+			name: "max body bytes annotation set admits",
+			old:  func(*unstructured.Unstructured) {},
+			new: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationExtProcMaxBodyBytes: "20971520"})
+			},
+			admit: true,
+		},
+		{
+			name: "force migration annotation set admits",
+			old:  func(*unstructured.Unstructured) {},
+			new: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationForcePayloadProcessingMigration: "true"})
+			},
+			admit: true,
+		},
+		{
+			// maas-controller ends the IPP handoff wait with this write.
+			name: "cleanup-complete handoff signal admits",
+			old:  func(*unstructured.Unstructured) {},
+			new: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete})
+			},
+			admit: true,
+		},
+		{
+			// A reconcile that re-reads its own earlier claim from a cache that
+			// has just caught up waits for this event.
+			name: "steady claim admits",
+			old: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{
+					AnnotationExtProcMaxRequests:      "1024",
+					AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete,
+				})
+			},
+			new: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{
+					AnnotationExtProcMaxRequests:      "1024",
+					AnnotationPayloadProcessingStatus: PayloadProcessingStatusSteady,
+				})
+			},
+			admit: true,
+		},
+		{
+			name: "steady claim alongside another annotation change admits",
+			old: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{
+					AnnotationExtProcMaxRequests:      "64",
+					AnnotationPayloadProcessingStatus: PayloadProcessingStatusCleanupComplete,
+				})
+			},
+			new: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{
+					AnnotationExtProcMaxRequests:      "1024",
+					AnnotationPayloadProcessingStatus: PayloadProcessingStatusSteady,
+				})
+			},
+			admit: true,
+		},
+		{
+			// IdentifierFor names every per-tenant resource, including the
+			// plugins ConfigMap the migration gate waits on.
+			name: "tenant identity label change admits",
+			old: func(u *unstructured.Unstructured) {
+				u.SetLabels(map[string]string{LabelManagedByAITenant: "true", LabelTenantName: "tenant-a"})
+			},
+			new: func(u *unstructured.Unstructured) {
+				u.SetLabels(map[string]string{LabelManagedByAITenant: "true", LabelTenantName: "tenant-b"})
+			},
+			admit: true,
+		},
+		{
+			name: "any other annotation change admits",
+			old:  func(*unstructured.Unstructured) {},
+			new: func(u *unstructured.Unstructured) {
+				u.SetAnnotations(map[string]string{AnnotationAITenantName: "tenant-a"})
+			},
+			admit: true,
+		},
+		{
 			name: "status-only update is dropped",
 			old:  func(*unstructured.Unstructured) {},
 			new: func(u *unstructured.Unstructured) {
@@ -168,7 +275,7 @@ func TestMaasTenantConfigPredicate(t *testing.T) {
 			admit: false,
 		},
 		{
-			name:  "annotation churn on other annotations is dropped",
+			name:  "unrelated label change is dropped",
 			old:   func(*unstructured.Unstructured) {},
 			new:   func(u *unstructured.Unstructured) { u.SetLabels(map[string]string{"unrelated": "bump"}) },
 			admit: false,
@@ -185,14 +292,14 @@ func TestMaasTenantConfigPredicate(t *testing.T) {
 	}
 }
 
-func TestNotControllerOwnedSecret(t *testing.T) {
+func TestNotControllerOwned(t *testing.T) {
 	owned := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-x", Labels: map[string]string{managedByLabel: render.FieldOwner}}}
 	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "source-api-key"}}
 
-	if notControllerOwnedSecret(owned) {
+	if notControllerOwned(owned) {
 		t.Error("controller-owned secret admitted; want excluded")
 	}
-	if !notControllerOwnedSecret(foreign) {
+	if !notControllerOwned(foreign) {
 		t.Error("foreign secret excluded; want admitted")
 	}
 }
@@ -223,5 +330,76 @@ func TestTenantSecretPredicate(t *testing.T) {
 		if !preds.Delete(event.DeleteEvent{Object: obj}) {
 			t.Errorf("delete of %s excluded; want admitted", obj.GetName())
 		}
+	}
+}
+
+func TestPluginsConfigMapPredicate(t *testing.T) {
+	preds := pluginsConfigMapPredicate()
+	owned := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: PayloadProcessingPluginsConfigMapName, Labels: map[string]string{managedByLabel: render.FieldOwner}}}
+	leftover := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: PayloadProcessingPluginsConfigMapName}}
+
+	if preds.Create(event.CreateEvent{Object: owned}) || preds.Update(updateFor(owned, owned)) {
+		t.Error("write to the controller-owned plugins ConfigMap admitted; want excluded")
+	}
+	if !preds.Create(event.CreateEvent{Object: leftover}) || !preds.Update(updateFor(leftover, leftover)) {
+		t.Error("write to a leftover plugins ConfigMap excluded; want admitted")
+	}
+	// IPP data in a ConfigMap carrying this controller's label still blocks
+	// the gate; changing it away must reach the queue.
+	ippOwned := owned.DeepCopy()
+	ippOwned.Data = map[string]string{ippProcessingConfigKey: "kind: PayloadProcessorConfig\n"}
+	if !preds.Update(updateFor(ippOwned, owned)) {
+		t.Error("update away from IPP data on a controller-owned plugins ConfigMap excluded; want admitted")
+	}
+	// Removing a leftover ends the migration gate's wait; removing ours must
+	// be re-applied.
+	for _, obj := range []client.Object{owned, leftover} {
+		if !preds.Delete(event.DeleteEvent{Object: obj}) {
+			t.Error("delete of a plugins ConfigMap excluded; want admitted")
+		}
+	}
+}
+
+func TestMaasTenantConfigForPluginsConfigMap(t *testing.T) {
+	// The default tenant's owning AITenant is not published, so its gateway
+	// namespace is unknown and any namespace maps to it.
+	defaultTenant := newMTC(DefaultAITenantName, "", PayloadProcessingBackendPraxis, DefaultAITenantName, "ai-tenants")
+	named := newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants")
+	namedOwner := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "openshift-ingress", "tenant-ns")
+	deleting := withMTCFinalizer(newMTC("deleting-ns", "deleting", PayloadProcessingBackendPraxis, "deleting", "ai-tenants"))
+	deleting.SetDeletionTimestamp(new(metav1.Now()))
+	legacy := newMTC("legacy-ns", "legacy", PayloadProcessingBackendIPP, "legacy", "ai-tenants")
+	c := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).
+		WithObjects(defaultTenant, named, namedOwner, deleting, legacy).
+		WithIndex(NewMaasTenantConfig(), pluginsConfigMapIndex, indexMaasTenantConfigByPluginsConfigMap).
+		Build()
+	r := &Reconciler{Client: c}
+
+	cases := []struct {
+		desc, name, namespace string
+		want                  []client.ObjectKey
+	}{
+		{desc: "default tenant", name: PayloadProcessingPluginsConfigMapForTenant(""), namespace: "openshift-ingress", want: []client.ObjectKey{client.ObjectKeyFromObject(defaultTenant)}},
+		{desc: "named tenant in its gateway namespace", name: PayloadProcessingPluginsConfigMapForTenant("redteam"), namespace: "openshift-ingress", want: []client.ObjectKey{client.ObjectKeyFromObject(named)}},
+		{desc: "same name outside the gateway namespace", name: PayloadProcessingPluginsConfigMapForTenant("redteam"), namespace: "elsewhere"},
+		// A tenant being torn down deletes its own plugins ConfigMap, and a
+		// tenant on legacy IPP has no migration gate to wake.
+		{desc: "deleting tenant", name: PayloadProcessingPluginsConfigMapForTenant("deleting"), namespace: "openshift-ingress"},
+		{desc: "legacy IPP tenant", name: PayloadProcessingPluginsConfigMapForTenant("legacy"), namespace: "openshift-ingress"},
+		{desc: "no such tenant", name: PayloadProcessingPluginsConfigMapForTenant("unknown"), namespace: "openshift-ingress"},
+		{desc: "routing overlay", name: praxisOverlayName, namespace: "openshift-ingress"},
+		{desc: "external model plugins", name: PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam"), namespace: "openshift-ingress"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: tc.name, Namespace: tc.namespace}}
+			var got []client.ObjectKey
+			for _, req := range r.maasTenantConfigForPluginsConfigMap(t.Context(), cm) {
+				got = append(got, req.NamespacedName)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("requests = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

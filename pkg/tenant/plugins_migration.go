@@ -18,6 +18,7 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -35,7 +36,31 @@ const (
 
 	ippPreProcessingConfigKey = "custom-pre-processing-ipp-config.yaml"
 	ippProcessingConfigKey    = "custom-ipp-config.yaml"
+
+	// reasonPluginsMigrationRefused is the Warning event reason on a
+	// MaasTenantConfig whose Praxis apply the migration gate refuses.
+	reasonPluginsMigrationRefused = "PluginsMigrationRefused"
+	applyPraxisAction             = "ApplyPraxis"
 )
+
+// errForceMigrationRevoked is the force annotation the pass acted on having
+// been removed before the gate ran.
+var errForceMigrationRevoked = errors.New(AnnotationForcePayloadProcessingMigration + " was removed during this reconcile")
+
+// pluginsMigrationRefusedError is the gate refusing an overwrite, as opposed to
+// failing to read the live ConfigMap. It carries the version that refused, so
+// the caller can tell whether the informer has seen it.
+type pluginsMigrationRefusedError struct {
+	key             client.ObjectKey
+	resourceVersion string
+}
+
+func (e *pluginsMigrationRefusedError) Error() string {
+	return fmt.Sprintf(
+		"live IPP-shaped plugins ConfigMap %s still present; refusing Praxis overwrite without %s=true (maas-controller should gate/cleanup first)",
+		e.key, AnnotationForcePayloadProcessingMigration,
+	)
+}
 
 // ensurePluginsConfigMapMigrationAllowed is defense-in-depth for RHOAIENG-98846.
 // maas-controller owns the primary gate (fingerprint known-good baselines before
@@ -48,7 +73,20 @@ func (r *Reconciler) ensurePluginsConfigMapMigrationAllowed(
 	mtc *unstructured.Unstructured,
 	gatewayNamespace, tenantID string,
 ) error {
+	// The pass chose its apply set from the force annotation it read at its
+	// start: under force, a released IPP plugins ConfigMap is kept for
+	// overwrite (omitUnmanagedReleasedPluginConfigMaps). The overwrite cannot
+	// be undone, so confirm the operator has not revoked force since, whatever
+	// the ConfigMap holds now. A revocation fails the pass; its retry, or the
+	// annotation update, recomputes the apply set from the current object.
 	if forcePayloadProcessingMigration(mtc) {
+		live := NewMaasTenantConfig()
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(mtc), live); err != nil {
+			return fmt.Errorf("re-read MaasTenantConfig %s for %s: %w", client.ObjectKeyFromObject(mtc), AnnotationForcePayloadProcessingMigration, err)
+		}
+		if !forcePayloadProcessingMigration(live) {
+			return fmt.Errorf("MaasTenantConfig %s: %w", client.ObjectKeyFromObject(mtc), errForceMigrationRevoked)
+		}
 		return nil
 	}
 
@@ -71,10 +109,7 @@ func (r *Reconciler) ensurePluginsConfigMapMigrationAllowed(
 	if !isIPPPluginsConfigMapData(cm.Data) {
 		return nil
 	}
-	return fmt.Errorf(
-		"live IPP-shaped plugins ConfigMap %s/%s still present; refusing Praxis overwrite without %s=true (maas-controller should gate/cleanup first)",
-		cm.Namespace, cm.Name, AnnotationForcePayloadProcessingMigration,
-	)
+	return &pluginsMigrationRefusedError{key: key, resourceVersion: cm.ResourceVersion}
 }
 
 func forcePayloadProcessingMigration(mtc *unstructured.Unstructured) bool {

@@ -32,6 +32,11 @@ const (
 	maasNamespace       = "ai-tenants"
 	eventuallyTimeout   = 15 * time.Second
 	pollInterval        = 50 * time.Millisecond
+	// eventTimeout bounds waits that only a watch event can end in time. It
+	// is below NotReadyRequeueInterval (10s) and the suite's one-minute
+	// resync, so a requeue cannot satisfy it; reconciles here take
+	// milliseconds, so it still leaves ample headroom.
+	eventTimeout = 5 * time.Second
 )
 
 // The AITenant's gateway differs from the model controller's default flags,

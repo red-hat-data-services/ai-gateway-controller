@@ -31,15 +31,6 @@ var allowedExtProcResponseBodyModes = map[string]struct{}{
 	"BUFFERED": {},
 }
 
-// extProcResponseBodyModeAnnotation returns the raw annotation value used by
-// watch predicates so annotation-only flips enqueue a reconcile.
-func extProcResponseBodyModeAnnotation(mtc *unstructured.Unstructured) string {
-	if mtc == nil {
-		return ""
-	}
-	return mtc.GetAnnotations()[AnnotationExtProcResponseBodyMode]
-}
-
 // resolveExtProcResponseBodyMode reads AnnotationExtProcResponseBodyMode from
 // the MaasTenantConfig. Absent or invalid values fall back to
 // DefaultExtProcResponseBodyMode; invalid values also log a warning.

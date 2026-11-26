@@ -290,7 +290,7 @@ func TestReconcileAppliesAndPrunesNemoCallerGrants(t *testing.T) {
 		nemoService     = "tenant-a-nemo"
 	)
 	serviceAccount := PayloadProcessingPostServiceAccountName("redteam")
-	mtc := withMarker(newMTC(tenantNamespace, "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc := withMarker(newMTC(tenantNamespace, "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusSteady)
 	mtc.Object["spec"] = map[string]any{"guardrails": []any{map[string]any{"ref": map[string]any{"name": "secure"}}}}
 	if err := unstructured.SetNestedField(mtc.Object, nemoNamespace, "status", "infraNamespace"); err != nil {
 		t.Fatal(err)

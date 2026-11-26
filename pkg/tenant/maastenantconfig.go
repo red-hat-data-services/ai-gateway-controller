@@ -22,6 +22,7 @@ import (
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -109,8 +110,10 @@ func OutputChecksUnsupported(ctx context.Context, reader client.Reader, namespac
 // tenantreconcile.TenantIdentifierFor: the default/legacy tenant (unlabeled,
 // or labeled with DefaultAITenantName) returns "" so its resources keep the
 // unsuffixed names Phase 1 always used; every other AITenant-managed tenant
-// returns its tenant name for "{base}-{tenantID}" naming.
-func IdentifierFor(mtc *unstructured.Unstructured) string {
+// returns its tenant name for "{base}-{tenantID}" naming. Only labels are
+// read, so watch predicates and field indexers can pass their objects as they
+// are.
+func IdentifierFor(mtc metav1.Object) string {
 	labels := mtc.GetLabels()
 	if labels == nil || labels[LabelManagedByAITenant] != "true" {
 		return ""
