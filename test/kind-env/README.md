@@ -393,7 +393,16 @@ ExtProc pod.
 
 The shared MaaS/KServe post-auth ExtProc keeps request buffering and streams
 response-body events so the opt-in Anthropic Messages translator can process
-progressive SSE. Translation filters remain absent when
+progressive SSE. The default shared `response_body_mode` is `STREAMED` (not
+`BUFFERED`). The experimental annotation
+`maas.opendatahub.io/experimental-extproc-response-body-mode` can select
+`STREAMED`, `BUFFERED`, or `NONE`. `NONE` falls back to `STREAMED` when API
+translation is enabled. When Output-phase guardrail callouts remain after infra
+pinning, the controller forces `BUFFERED` so Praxis can evaluate response
+checks; without those callouts the default stays `STREAMED`. The Kind
+shared-translation suite proves annotation-only flips reconcile without bumping
+`MaasTenantConfig` generation and that `NONE` stays constrained to `STREAMED`
+while translation is on. Translation filters remain absent when
 `MaasTenantConfig.spec.apiTranslation.enabled` is omitted or false; ordinary
 shared routes still traverse the ExtProc chain. The Kind qualification covers
 default-off passthrough and an unrelated OpenAI SSE route.
@@ -499,7 +508,7 @@ CLUSTER="anthropic-published-$(date -u +%Y%m%dT%H%M%SZ | tr '[:upper:]' '[:lower
 export PROVIDER_RECORDER_IMAGE="provider-recorder:$CLUSTER"
 unset PRAXIS_AI_REPO
 EXT_SOURCE_SHA=cffd4219f080348176d3bfdbc99028372dec7e50
-EXT_IMAGE='quay.io/opendatahub/odh-praxis-extproc@sha256:a67be44e530961ca7e6dc453220ebe11a6641a2003577f3c4ddb1f426555b874'
+EXT_IMAGE='quay.io/opendatahub/odh-praxis-extproc@sha256:6beb7981e3d126b038e7d5a7fb52ba16fa73aebb97cd495ba274791c053e82f7'
 RUN_EVIDENCE="$PWD/evidence/published-extproc-qualification"
 export PRAXIS_EXTPROC_REPO=/path/to/clean/praxis-extproc-at-merge-sha
 export EXTPROC_IMAGE_MODE=published EXPECTED_EXTPROC_SOURCE_SHA="$EXT_SOURCE_SHA"

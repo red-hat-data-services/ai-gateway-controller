@@ -37,6 +37,8 @@ API server, including on failure. The current kubeconfig is never used.
   configures its ExtProc workload. Deleting that model removes its route,
   overlay and workload, then releases its finalizer.
   Both paths require the shipped permission to patch model finalizers.
+- When that tenant's AITenant starts terminating, the published model reports
+  `TenantNotReady` and keeps its route and overlay.
 - The shipped controller identity may create, patch and delete Secrets in a
   tenant namespace for its credential copies, and read ReferenceGrants in a
   provider namespace and across all namespaces. It can read Gateways in the
@@ -47,6 +49,7 @@ API server, including on failure. The current kubeconfig is never used.
   non-positive values. Accepted values remain readable by typed Get/List.
   A typed fixture is converted to unstructured input and only its timeout is
   replaced with a raw string, so validation happens on the server.
+- Guardrail admission rejects a guardrail that sets no provider.
 
 Tests use Go's `testing` package and testify. The scenario states its
 preconditions, user action and expected outcome. Small typed builders describe

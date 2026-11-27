@@ -37,15 +37,16 @@ func renderTestResources(t *testing.T) []unstructured.Unstructured {
 		t.Fatalf("render.Build: %v", err)
 	}
 	return Render(built, Params{
-		Namespace:          testInfraNamespace,
-		DashboardNamespace: DefaultDashboardNamespace,
-		Image:              "quay.io/example/kube-auth-proxy:test",
-		OIDCIssuerURL:      testIssuer,
-		Hostname:           testHostname,
-		OIDCClientID:       "test-client",
-		GatewayName:        testGatewayName,
-		GatewayNamespace:   testGatewayNamespace,
-		AuthorinoNamespace: DefaultAuthorinoNamespace,
+		Namespace:           testInfraNamespace,
+		DashboardNamespace:  DefaultDashboardNamespace,
+		Image:               "quay.io/example/kube-auth-proxy:test",
+		OIDCIssuerURL:       testIssuer,
+		Hostname:            testHostname,
+		OIDCClientID:        "test-client",
+		GatewayName:         testGatewayName,
+		GatewayNamespace:    testGatewayNamespace,
+		GatewayListenerName: "web-secure",
+		AuthorinoNamespace:  DefaultAuthorinoNamespace,
 	})
 }
 
@@ -132,16 +133,16 @@ func TestRenderSubstitutesTenantValues(t *testing.T) {
 func TestRenderBuildsConsumerPortalRoutes(t *testing.T) {
 	resources := renderTestResources(t)
 	portal := findResource(t, resources, "HTTPRoute", PortalRouteName)
-	hostnames, _, _ := unstructured.NestedStringSlice(portal.Object, "spec", "hostnames")
-	if len(hostnames) != 1 || hostnames[0] != testHostname {
-		t.Errorf("portal HTTPRoute hostnames = %v, want [%s]", hostnames, testHostname)
+	portalHostnames, found, err := unstructured.NestedStringSlice(portal.Object, "spec", "hostnames")
+	if found || err != nil || len(portalHostnames) != 0 {
+		t.Errorf("portal HTTPRoute hostnames = %v (found=%t, err=%v), want none", portalHostnames, found, err)
 	}
 	parents, _, _ := unstructured.NestedSlice(portal.Object, "spec", "parentRefs")
 	if len(parents) != 1 {
 		t.Fatalf("portal parentRefs = %v, want one", parents)
 	}
 	parent, ok := parents[0].(map[string]any)
-	if !ok || parent["name"] != testGatewayName || parent["namespace"] != testGatewayNamespace || parent["sectionName"] != "https" {
+	if !ok || parent["name"] != testGatewayName || parent["namespace"] != testGatewayNamespace || parent["sectionName"] != "web-secure" {
 		t.Errorf("portal parentRef = %#v", parent)
 	}
 
@@ -172,6 +173,10 @@ func TestRenderBuildsConsumerPortalRoutes(t *testing.T) {
 	}
 
 	oauth := findResource(t, resources, "HTTPRoute", OAuthRouteName)
+	oauthHostnames, found, err := unstructured.NestedStringSlice(oauth.Object, "spec", "hostnames")
+	if found || err != nil || len(oauthHostnames) != 0 {
+		t.Errorf("oauth HTTPRoute hostnames = %v (found=%t, err=%v), want none", oauthHostnames, found, err)
+	}
 	oauthRule := firstNestedMap(t, oauth.Object, "spec", "rules")
 	oauthPath, _, _ := unstructured.NestedString(firstNestedMap(t, oauthRule, "matches"), "path", "value")
 	oauthBackendRef := firstNestedMap(t, oauthRule, "backendRefs")
@@ -311,13 +316,13 @@ func TestRenderStripsClientIdentityHeaders(t *testing.T) {
 			}
 		}
 	}
-	// Headers the AuthPolicy does not inject; the four x-maas-* identity
-	// headers and the other policy-injected headers are overwritten by the
-	// AuthPolicy instead (the route filter runs after the auth mutation).
+	// Headers the AuthPolicy does not inject. Policy-injected headers are
+	// overwritten after this route filter, so they must not be removed here.
 	want := []string{
 		"x-auth-request-preferred-username", "x-auth-request-groups", "x-auth-request-access-token",
 		"x-forwarded-user", "x-forwarded-email", "x-forwarded-groups", "x-forwarded-preferred-username",
-		"x-maas-keyname", "x-maas-subscription-rate-limit-id",
+		"x-maas-group", "x-maas-keyname", "x-maas-organization-id", "x-maas-orgid",
+		"x-maas-roles", "x-maas-subscription-rate-limit-id", "x-maas-username",
 	}
 	if len(removed) != len(want) {
 		t.Fatalf("strip list = %v, want %v", removed, want)
@@ -410,6 +415,15 @@ func TestRenderBuildsAuthPolicies(t *testing.T) {
 	if sessionTarget != PortalRouteName || session.GetNamespace() != testInfraNamespace {
 		t.Errorf("session AuthPolicy target = %s in %s", sessionTarget, session.GetNamespace())
 	}
+	browserRule, found, err := unstructured.NestedMap(session.Object,
+		"spec", "rules", "authentication", "browser")
+	if !found || err != nil {
+		t.Fatalf("browser authentication rule not found: found=%t err=%v", found, err)
+	}
+	anonymousRule, ok := browserRule["anonymous"].(map[string]any)
+	if !ok || len(anonymousRule) != 0 {
+		t.Errorf("browser authentication anonymous = %#v, want empty object", browserRule["anonymous"])
+	}
 	wantProxyURL := "https://" + AuthProxyName + "." + testInfraNamespace + ".svc.cluster.local:4180/oauth2/auth"
 	if !strings.Contains(rego, `"url": "`+wantProxyURL+`"`) || !strings.Contains(string(raw), `"code":302`) {
 		t.Errorf("session AuthPolicy proxy URL or redirect is wrong: url present=%t",
@@ -417,6 +431,8 @@ func TestRenderBuildsAuthPolicies(t *testing.T) {
 	}
 	for _, want := range []string{
 		"x-forwarded-id-token",
+		"x-forwarded-access-token",
+		"x-maas-identity",
 		"/oauth2/start?rd=",
 		"allow = true",
 		"login_location := sprintf",
@@ -429,17 +445,10 @@ func TestRenderBuildsAuthPolicies(t *testing.T) {
 		// their values: the test issuer appears in the JWT rule and the
 		// client-bound azp predicate, and the client id in the latter.
 		"issuerUrl\":\"https://keycloak.apps.example.com/realms/tenant-a",
-		"x-maas-username",
-		"x-maas-group",
-		"x-maas-orgid",
-		"x-maas-roles",
 		"azp == 'test-client",
 		"io.jwt.decode",
-		// RHAI-10610: the flattened MS-0007 contract reads flat scalar
-		// organization claims instead of the orgs array-of-objects.
-		`object.get(organization_claims, "org_id", "")`,
-		`object.get(organization_claims, "roles", [])`,
-		"system:authenticated",
+		`identity_claims = claims`,
+		`json.marshal({"source": "oidc", "claims": forwarded_claims})`,
 		"application_cookies",
 		"_maas_consumer_proxy",
 		"Invalid bearer token",
@@ -456,6 +465,62 @@ func TestRenderBuildsAuthPolicies(t *testing.T) {
 	}
 	if !strings.Contains(location, "login_location") || !strings.Contains(location, "/oauth2/start?rd=%2Fmaas-portal%2F") {
 		t.Errorf("session redirect expression = %q, want login_location with fallback", location)
+	}
+}
+
+func TestRenderForwardsRawPortalClaims(t *testing.T) {
+	resources := renderTestResources(t)
+	session := findResource(t, resources, "AuthPolicy", "maas-consumer-portal-session")
+	rego, _, _ := unstructured.NestedString(session.Object,
+		"spec", "rules", "authorization", "session-and-identity", "opa", "rego")
+	for _, want := range []string{
+		`"iss": object.get(identity_claims, "iss", "")`,
+		`"sub": object.get(identity_claims, "sub", "")`,
+		`"aud": object.get(identity_claims, "aud", "")`,
+		`"azp": object.get(identity_claims, "azp", "")`,
+		`"groups": object.get(identity_claims, "groups", [])`,
+		`org_id := object.get(identity_claims, "org_id", null)`,
+		`is_string(org_id)`,
+		`"org_id": org_id`,
+		`"org_name": object.get(identity_claims, "org_name", "")`,
+		`"roles": object.get(identity_claims, "roles", [])`,
+	} {
+		if !strings.Contains(rego, want) {
+			t.Errorf("session AuthPolicy missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"organization_claims",
+		"group_header_values",
+		"system:authenticated",
+	} {
+		if strings.Contains(rego, unwanted) {
+			t.Errorf("session AuthPolicy must not contain %q", unwanted)
+		}
+	}
+	successHeaders, found, err := unstructured.NestedMap(session.Object,
+		"spec", "rules", "response", "success", "headers")
+	if !found || err != nil {
+		t.Fatalf("success response headers not found: found=%t err=%v", found, err)
+	}
+	for _, unwanted := range []string{
+		"x-maas-username",
+		"x-maas-group",
+		"x-maas-organization-id",
+		"x-maas-orgid",
+		"x-maas-roles",
+	} {
+		if _, exists := successHeaders[unwanted]; exists {
+			t.Errorf("success response headers must not contain %q", unwanted)
+		}
+	}
+	identityHeader, ok := successHeaders["x-maas-identity"].(map[string]any)
+	if !ok {
+		t.Fatalf("success response headers missing x-maas-identity: %#v", successHeaders)
+	}
+	expression, _, _ := unstructured.NestedString(identityHeader, "plain", "expression")
+	if expression != "auth.authorization['session-and-identity'].identity_header" {
+		t.Errorf("x-maas-identity expression = %q", expression)
 	}
 }
 

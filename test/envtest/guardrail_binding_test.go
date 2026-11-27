@@ -48,7 +48,7 @@ func guardrailPolicy(namespace, providerName, providerNamespace, configID string
 		Spec: aigatewayv1alpha1.AIGuardrailSpec{
 			Provider: aigatewayv1alpha1.AIGuardrailProvider{
 				Timeout: metav1.Duration{Duration: 5 * time.Second},
-				Nemo: aigatewayv1alpha1.AIGuardrailNemoProvider{
+				Nemo: &aigatewayv1alpha1.AIGuardrailNemoProvider{
 					Ref: aigatewayv1alpha1.AIGuardrailNamespacedReference{
 						Name: providerName, Namespace: providerNamespace,
 					},

@@ -30,13 +30,16 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discv1 "k8s.io/api/discovery/v1"
 	netwv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -61,6 +64,7 @@ const (
 func testScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
+	_ = discv1.AddToScheme(scheme)
 	_ = appsv1.AddToScheme(scheme)
 	_ = netwv1.AddToScheme(scheme)
 	for _, gvk := range []struct{ group, version, kind string }{
@@ -156,6 +160,10 @@ func httpsListener(hostname string) map[string]any {
 	return map[string]any{"name": "https", "protocol": "HTTPS", "port": int64(443), "hostname": hostname}
 }
 
+func httpsListenerNamed(name, hostname string) map[string]any {
+	return map[string]any{"name": name, "protocol": "HTTPS", "port": int64(443), "hostname": hostname}
+}
+
 // newGatewayRoute builds a TLS-secured, path-unrestricted OpenShift Route
 // that fronts the Gateway in the ClusterIP + Route pattern, where the
 // Gateway listener has no hostname.
@@ -166,9 +174,18 @@ func newGatewayRoute(name, host, backendService string) *unstructured.Unstructur
 	u.SetNamespace(testGatewayNamespace)
 	u.Object["spec"] = map[string]any{
 		"host": host,
-		"to":   map[string]any{"kind": "Service", "name": backendService, "weight": int64(100)},
+		"to": map[string]any{
+			"kind": "Service", "name": backendService, "weight": int64(100),
+		},
+		"port": map[string]any{"targetPort": int64(8443)},
 		"tls":  map[string]any{"termination": "reencrypt"},
 	}
+	u.Object["status"] = map[string]any{"ingress": []any{map[string]any{
+		"host": host,
+		"conditions": []any{map[string]any{
+			"type": "Admitted", "status": "True",
+		}},
+	}}}
 	return u
 }
 
@@ -183,13 +200,45 @@ func withStatusAddresses(gateway *unstructured.Unstructured, values ...string) *
 }
 
 // newGatewayDataService builds the Gateway's data-plane Service, identified
-// by the gateway-name label the Route backend check requires.
+// by the gateway-name selector its pods carry.
 func newGatewayDataService(name, gatewayName string) *corev1.Service {
-	return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
-		Name:      name,
-		Namespace: testGatewayNamespace,
-		Labels:    map[string]string{"gateway.networking.k8s.io/gateway-name": gatewayName},
-	}}
+	return newGatewayDataServicePort(name, gatewayName, 443, 8443)
+}
+
+func newGatewayDataServicePort(name, gatewayName string, port, targetPort int32) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testGatewayNamespace},
+		Spec: corev1.ServiceSpec{Selector: map[string]string{
+			"gateway.networking.k8s.io/gateway-name": gatewayName,
+		}, Ports: []corev1.ServicePort{{
+			Name:       "https",
+			Port:       port,
+			TargetPort: intstr.FromInt32(targetPort),
+		}},
+		},
+	}
+}
+
+func newGatewayEndpointSlice(service *corev1.Service) *discv1.EndpointSlice {
+	endpointPort := int32(8443)
+	portName := ""
+	if len(service.Spec.Ports) == 1 {
+		portName = service.Spec.Ports[0].Name
+		if service.Spec.Ports[0].TargetPort.Type == intstr.Int {
+			endpointPort = service.Spec.Ports[0].TargetPort.IntVal
+		}
+	}
+	return &discv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      service.Name + "-endpoints",
+			Namespace: service.Namespace,
+			Labels:    map[string]string{"kubernetes.io/service-name": service.Name},
+		},
+		Ports: []discv1.EndpointPort{{
+			Name: &portName,
+			Port: &endpointPort,
+		}},
+	}
 }
 
 // insecureRoute builds a Route without spec.tls, which serves plain HTTP and
@@ -208,6 +257,75 @@ func subpathRoute(name, host, backendService string) *unstructured.Unstructured 
 		spec["path"] = "/api"
 	}
 	return route
+}
+
+func unadmittedRoute(name, host, backendService string) *unstructured.Unstructured {
+	route := newGatewayRoute(name, host, backendService)
+	if status, ok := route.Object["status"].(map[string]any); ok {
+		status["ingress"] = []any{map[string]any{
+			"host": host,
+			"conditions": []any{map[string]any{
+				"type": "Admitted", "status": "False",
+			}},
+		}}
+	}
+	return route
+}
+
+func routeWithoutAdmission(name, host, backendService string) *unstructured.Unstructured {
+	route := newGatewayRoute(name, host, backendService)
+	unstructured.RemoveNestedField(route.Object, "status")
+	return route
+}
+
+func edgeTerminationRoute(name, host, backendService string) *unstructured.Unstructured {
+	route := newGatewayRoute(name, host, backendService)
+	if spec, ok := route.Object["spec"].(map[string]any); ok {
+		spec["tls"] = map[string]any{"termination": "edge"}
+	}
+	return route
+}
+
+func routeWithAlternateBackend(route *unstructured.Unstructured, backendService string, weight int64) *unstructured.Unstructured {
+	if spec, ok := route.Object["spec"].(map[string]any); ok {
+		spec["alternateBackends"] = []any{map[string]any{
+			"kind": "Service", "name": backendService, "weight": weight,
+		}}
+	}
+	return route
+}
+
+func routeWithTargetPort(route *unstructured.Unstructured, targetPort int64) *unstructured.Unstructured {
+	if spec, ok := route.Object["spec"].(map[string]any); ok {
+		spec["port"] = map[string]any{"targetPort": targetPort}
+	}
+	return route
+}
+
+func routeWithoutTargetPort(route *unstructured.Unstructured) *unstructured.Unstructured {
+	unstructured.RemoveNestedField(route.Object, "spec", "port")
+	return route
+}
+
+func routeWithAdmittedHosts(route *unstructured.Unstructured, hosts ...string) *unstructured.Unstructured {
+	ingresses := make([]any, 0, len(hosts))
+	for _, host := range hosts {
+		ingresses = append(ingresses, map[string]any{
+			"host": host,
+			"conditions": []any{map[string]any{
+				"type": "Admitted", "status": "True",
+			}},
+		})
+	}
+	route.Object["status"] = map[string]any{"ingress": ingresses}
+	return route
+}
+
+func gatewayEndpointSliceWithPort(service *corev1.Service, port int32) *discv1.EndpointSlice {
+	slice := newGatewayEndpointSlice(service)
+	slice.Name = fmt.Sprintf("%s-port-%d", service.Name, port)
+	slice.Ports[0].Port = &port
+	return slice
 }
 
 func adminCredentialsSecret() *corev1.Secret {
@@ -319,7 +437,25 @@ func (r *recorder) funcs() interceptor.Funcs {
 
 func newReconciler(t *testing.T, objects ...client.Object) (*Reconciler, *recorder) {
 	t.Helper()
+	return newReconcilerWithEndpointSlices(t, true, objects...)
+}
+
+func newReconcilerWithEndpointSlices(
+	t *testing.T,
+	injectEndpointSlices bool,
+	objects ...client.Object,
+) (*Reconciler, *recorder) {
+	t.Helper()
 	rec := &recorder{}
+	if injectEndpointSlices {
+		for _, object := range objects {
+			service, ok := object.(*corev1.Service)
+			if !ok || service.Spec.Selector[gatewayNameLabel] == "" {
+				continue
+			}
+			objects = append(objects, newGatewayEndpointSlice(service))
+		}
+	}
 	c := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(objects...).WithInterceptorFuncs(rec.funcs()).Build()
 	return &Reconciler{
 		Client:         c,
@@ -329,6 +465,26 @@ func newReconciler(t *testing.T, objects ...client.Object) (*Reconciler, *record
 		Image:          "quay.io/example/kube-auth-proxy:test",
 		ResyncInterval: 5 * time.Minute,
 	}, rec
+}
+
+func newReconcilerWithRouteListError(t *testing.T, listErr error) *Reconciler {
+	t.Helper()
+	c := fake.NewClientBuilder().WithScheme(testScheme()).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, client client.WithWatch, object client.ObjectList, opts ...client.ListOption) error {
+			if list, ok := object.(*unstructured.UnstructuredList); ok && list.GetKind() == gvkOpenShiftRouteList.Kind {
+				return listErr
+			}
+			return client.List(ctx, object, opts...)
+		},
+	}).Build()
+	return &Reconciler{
+		Client:         c,
+		APIReader:      c,
+		Log:            logr.Discard(),
+		ManifestPath:   testManifestPath,
+		Image:          "quay.io/example/kube-auth-proxy:test",
+		ResyncInterval: 5 * time.Minute,
+	}
 }
 
 func reconcileMTC(t *testing.T, r *Reconciler) ctrl.Result {
@@ -448,6 +604,236 @@ func TestReconcileDiscoversDifferentlyNamedGatewayRoute(t *testing.T) {
 	assertPortalAppliedWithHostname(t, r, rec, testHostname)
 }
 
+// OpenShift may publish the concrete host only in status.ingress after the
+// router admits a Route; spec.host can be omitted.
+func TestReconcileUsesGatewayRouteStatusHostWithoutSpecHost(t *testing.T) {
+	route := newGatewayRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default")
+	unstructured.RemoveNestedField(route.Object, "spec", "host")
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("")),
+		route,
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+}
+
+// OpenShift may split traffic across a primary and alternate Service backends.
+// Every backend that can receive traffic must still terminate on the Gateway.
+func TestReconcileAcceptsAlternateGatewayServiceBackend(t *testing.T) {
+	route := routeWithAlternateBackend(
+		newGatewayRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default"),
+		testGatewayName+"-openshift-canary", 50)
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("")),
+		route,
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		newGatewayDataService(testGatewayName+"-openshift-canary", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+}
+
+// The Route's numeric target is the endpoint port, not the Service's frontend
+// port. A named target resolves through the endpoint port name.
+func TestReconcileAcceptsNamedRouteTargetPort(t *testing.T) {
+	route := newGatewayRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default")
+	if spec, ok := route.Object["spec"].(map[string]any); ok {
+		spec["port"] = map[string]any{"targetPort": "https"}
+	}
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("")),
+		route,
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+}
+
+func TestReconcileRejectsNamedRouteTargetWithoutEndpointSlice(t *testing.T) {
+	route := newGatewayRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default")
+	if spec, ok := route.Object["spec"].(map[string]any); ok {
+		spec["port"] = map[string]any{"targetPort": "https"}
+	}
+	r, rec := newReconcilerWithEndpointSlices(t, false,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("")),
+		route,
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	if res := reconcileMTC(t, r); res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
+	}
+	if len(rec.applied) != 0 {
+		t.Errorf("applied %v with no resolved endpoint port", rec.applied)
+	}
+}
+
+// A named Service targetPort is not itself an endpoint port; the EndpointSlice
+// resolves it to the numeric port that a Route may target.
+func TestReconcileResolvesNamedServiceTargetThroughEndpointSlice(t *testing.T) {
+	service := newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName)
+	service.Spec.Ports[0].TargetPort = intstr.FromString("https-container")
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("")),
+		newGatewayRoute(GatewayRouteName, testHostname, service.Name),
+		service,
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+}
+
+func TestReconcileUsesRouteHostMatchingListenerWildcard(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("*.apps.example.com")),
+		newGatewayRoute(GatewayRouteName, "maas.apps.example.com", testGatewayName+"-openshift-default"),
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, "maas.apps.example.com")
+}
+
+func TestReconcileUsesDiscoveredGatewayListenerName(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListenerNamed("web-secure", testHostname)),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+	route := rec.objects["HTTPRoute"]
+	if route == nil {
+		t.Fatal("portal HTTPRoute was not applied")
+	}
+	parents, _, _ := unstructured.NestedSlice(route.Object, "spec", "parentRefs")
+	if len(parents) != 1 {
+		t.Fatalf("portal parentRefs = %#v, want one", parents)
+	}
+	parent, ok := parents[0].(map[string]any)
+	if !ok || parent["sectionName"] != "web-secure" {
+		t.Errorf("portal parentRef = %#v, want sectionName %q", parent, "web-secure")
+	}
+}
+
+func TestReconcileSkipsMismatchedConventionalGatewayRoute(t *testing.T) {
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("*.apps.example.com")),
+		newGatewayRoute(GatewayRouteName, "evil.example.com", testGatewayName+"-openshift-default"),
+		newGatewayRoute("customer-route", "maas.apps.example.com", testGatewayName+"-openshift-default"),
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, "maas.apps.example.com")
+}
+
+func TestReconcileUsesMatchingAdmittedRouteIngress(t *testing.T) {
+	route := routeWithAdmittedHosts(
+		newGatewayRoute(GatewayRouteName, "", testGatewayName+"-openshift-default"),
+		"evil.example.com", "maas.apps.example.com")
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("*.apps.example.com")),
+		route,
+		newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, "maas.apps.example.com")
+}
+
+func TestReconcileDeduplicatesDualStackEndpointPorts(t *testing.T) {
+	service := newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName)
+	route := routeWithoutTargetPort(newGatewayRoute(GatewayRouteName, testHostname, service.Name))
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		newGateway(httpsListener("")),
+		route,
+		service,
+		gatewayEndpointSliceWithPort(service, 8443),
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, testHostname)
+}
+
+func TestReconcileSkipsMismatchedGatewayStatusAddress(t *testing.T) {
+	gateway := withStatusAddresses(
+		newGateway(httpsListener("*.apps.example.com")),
+		"evil.example.com", "maas.apps.example.com")
+	r, rec := newReconciler(t,
+		newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+		newAITenant(aitenantOpts{issuer: testIssuer}),
+		gateway,
+		adminCredentialsSecret(),
+		dashboardService(),
+	)
+	assertPortalAppliedWithHostname(t, r, rec, "maas.apps.example.com")
+}
+
+func TestInternalClusterHostnameSupportsCustomClusterDomain(t *testing.T) {
+	if !internalClusterHostname("gateway.openshift-ingress.svc.corp.example", "corp.example") {
+		t.Error("custom cluster-domain Service hostname was treated as external")
+	}
+	if internalClusterHostname("maas.apps.example.com.", "corp.example") {
+		t.Error("external hostname with a trailing dot was treated as internal")
+	}
+}
+
+func TestGatewayRouteHostnameHandlesRouteAPIAvailability(t *testing.T) {
+	noMatch := &apimeta.NoKindMatchError{
+		GroupKind:        schema.GroupKind{Group: "route.openshift.io", Kind: "RouteList"},
+		SearchedVersions: []string{"v1"},
+	}
+	routeResource := schema.GroupResource{Group: "route.openshift.io", Resource: "routes"}
+	for name, listErr := range map[string]error{
+		"no match":       noMatch,
+		"not found":      apierrors.NewNotFound(routeResource, "routes"),
+		"forbidden list": apierrors.NewForbidden(routeResource, "routes", nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newReconcilerWithRouteListError(t, listErr)
+			hostname, err := r.gatewayRouteHostname(
+				context.Background(), testGatewayNamespace, testGatewayName, 443, "")
+			if apierrors.IsForbidden(listErr) {
+				if err == nil {
+					t.Fatal("expected a Forbidden list error to be preserved")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected unavailable Route API to be skipped, got %v", err)
+			}
+			if hostname != "" {
+				t.Fatalf("hostname = %q, want empty", hostname)
+			}
+		})
+	}
+}
+
 // The listener hostname wins over status addresses and the Route.
 func TestReconcilePrefersListenerHostnameOverFallbacks(t *testing.T) {
 	gateway := withStatusAddresses(newGateway(httpsListener(testHostname)), "other.example.com")
@@ -477,9 +863,9 @@ func assertPortalAppliedWithHostname(t *testing.T, r *Reconciler, rec *recorder,
 	if route == nil {
 		t.Fatal("portal HTTPRoute was not applied")
 	}
-	hostnames, _, _ := unstructured.NestedStringSlice(route.Object, "spec", "hostnames")
-	if len(hostnames) != 1 || hostnames[0] != hostname {
-		t.Errorf("portal HTTPRoute hostnames = %v, want [%s]", hostnames, hostname)
+	hostnames, found, err := unstructured.NestedStringSlice(route.Object, "spec", "hostnames")
+	if found || err != nil || len(hostnames) != 0 {
+		t.Errorf("portal HTTPRoute hostnames = %v (found=%t, err=%v), want none", hostnames, found, err)
 	}
 
 	deployment := rec.objects["Deployment"]
@@ -718,12 +1104,95 @@ func TestReconcileRequeuesUntilPrerequisitesExist(t *testing.T) {
 			newAITenant(aitenantOpts{issuer: testIssuer}),
 			newGateway(httpsListener("")),
 			newGatewayRoute(GatewayRouteName, testHostname, testGatewayName+"-canary"),
-			// Exists and shares the Gateway name prefix, but is not this
-			// Gateway's data-plane Service.
+			// Exists and shares the Gateway name prefix, but does not select
+			// this Gateway's data-plane pods.
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{
 				Name:      testGatewayName + "-canary",
 				Namespace: testGatewayNamespace,
 			}},
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route sends traffic to an alternate non-Gateway backend": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			routeWithAlternateBackend(
+				newGatewayRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default"),
+				"unrelated-service", 50),
+			newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+			newGatewayDataService("unrelated-service", "some-other-gateway"),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route uses edge TLS termination": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			edgeTerminationRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default"),
+			newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route targets the Service frontend port instead of its endpoint port": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			routeWithTargetPort(newGatewayRoute(
+				GatewayRouteName, testHostname, testGatewayName+"-openshift-default"), 443),
+			newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route targets an endpoint port outside the Service mapping": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			routeWithTargetPort(newGatewayRoute(
+				GatewayRouteName, testHostname, testGatewayName+"-openshift-default"), 8080),
+			newGatewayDataServicePort(testGatewayName+"-openshift-default", testGatewayName, 443, 9090),
+			gatewayEndpointSliceWithPort(
+				newGatewayDataServicePort(testGatewayName+"-openshift-default", testGatewayName, 443, 9090), 8080),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route targets a second HTTPS listener": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(
+				httpsListener(""),
+				map[string]any{"name": "admin-https", "protocol": "HTTPS", "port": int64(8443)},
+			),
+			routeWithTargetPort(newGatewayRoute(
+				GatewayRouteName, testHostname, testGatewayName+"-admin"), 8443),
+			newGatewayDataServicePort(testGatewayName+"-admin", testGatewayName, 8443, 8443),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route host does not match listener wildcard": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("*.apps.example.com")),
+			newGatewayRoute(GatewayRouteName, "evil.example.com", testGatewayName+"-openshift-default"),
+			newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route is not admitted": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			unadmittedRoute(GatewayRouteName, testHostname, testGatewayName+"-openshift-default"),
+			newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
+			adminCredentialsSecret(),
+			dashboardService(),
+		},
+		"Gateway Route has no admission status": {
+			newMTC(tenant.DefaultAITenantName, testInfraNamespace),
+			newAITenant(aitenantOpts{issuer: testIssuer}),
+			newGateway(httpsListener("")),
+			routeWithoutAdmission(GatewayRouteName, testHostname, testGatewayName+"-openshift-default"),
+			newGatewayDataService(testGatewayName+"-openshift-default", testGatewayName),
 			adminCredentialsSecret(),
 			dashboardService(),
 		},

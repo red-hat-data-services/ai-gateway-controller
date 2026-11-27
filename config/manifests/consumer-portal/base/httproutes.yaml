@@ -6,12 +6,10 @@ metadata:
     app.kubernetes.io/name: maas-consumer-portal
     app.kubernetes.io/part-of: maas-consumer-portal
 spec:
-  hostnames:
-    - CONSUMER_PORTAL_HOSTNAME
   parentRefs:
     - name: CONSUMER_PORTAL_GATEWAY_NAME
       namespace: CONSUMER_PORTAL_GATEWAY_NAMESPACE
-      sectionName: https
+      sectionName: CONSUMER_PORTAL_GATEWAY_LISTENER_NAME
   rules:
     - matches:
         - path:
@@ -36,8 +34,8 @@ spec:
               replacePrefixMatch: /
         # Outer defense for headers the portal AuthPolicy does not inject:
         # the route filter runs after the auth mutation, so it must not
-        # remove any header the AuthPolicy sets (the four x-maas-*
-        # identity headers, x-auth-request-user/-email, and
+        # remove any header the AuthPolicy sets (x-maas-identity,
+        # x-auth-request-user/-email, and
         # x-forwarded-id-token) — those are overwritten by the policy
         # on success instead.
         - type: RequestHeaderModifier
@@ -50,8 +48,13 @@ spec:
               - x-forwarded-email
               - x-forwarded-groups
               - x-forwarded-preferred-username
+              - x-maas-group
               - x-maas-keyname
+              - x-maas-organization-id
+              - x-maas-orgid
+              - x-maas-roles
               - x-maas-subscription-rate-limit-id
+              - x-maas-username
         - type: ResponseHeaderModifier
           responseHeaderModifier:
             set:
@@ -70,12 +73,10 @@ metadata:
     app.kubernetes.io/name: maas-consumer-portal-oauth2
     app.kubernetes.io/part-of: maas-consumer-portal
 spec:
-  hostnames:
-    - CONSUMER_PORTAL_HOSTNAME
   parentRefs:
     - name: CONSUMER_PORTAL_GATEWAY_NAME
       namespace: CONSUMER_PORTAL_GATEWAY_NAMESPACE
-      sectionName: https
+      sectionName: CONSUMER_PORTAL_GATEWAY_LISTENER_NAME
   rules:
     - matches:
         - path:

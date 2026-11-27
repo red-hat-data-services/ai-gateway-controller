@@ -73,7 +73,7 @@ func newGuardrail(namespace, providerName, providerNamespace string) *aigatewayv
 		ObjectMeta: metav1.ObjectMeta{Name: guardrailName, Namespace: namespace, Generation: testGeneration},
 		Spec: aigatewayv1alpha1.AIGuardrailSpec{
 			Provider: aigatewayv1alpha1.AIGuardrailProvider{
-				Nemo: aigatewayv1alpha1.AIGuardrailNemoProvider{
+				Nemo: &aigatewayv1alpha1.AIGuardrailNemoProvider{
 					Ref: aigatewayv1alpha1.AIGuardrailNamespacedReference{Name: providerName, Namespace: providerNamespace},
 				},
 				Timeout: metav1.Duration{Duration: 2 * time.Second},

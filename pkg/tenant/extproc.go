@@ -52,8 +52,9 @@ const extprocConfigHashAnnotation = "ai-gateway-controller.opendatahub.io/extpro
 // authoritative MaasTenantConfig permission. The translation filters are
 // restricted to Anthropic Messages requests and do not change the dedicated
 // ExternalModel processor. maxBodyBytes bounds stream_usage_inject buffering
-// (and related translation filters when enabled).
-func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, apiTranslation bool, maxBodyBytes int64) error {
+// (and related translation filters when enabled). responseBodyMode sets the
+// shared ipp Envoy response_body_mode (see resolveExtProcResponseBodyMode).
+func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, apiTranslation bool, maxBodyBytes int64, responseBodyMode string) error {
 	wantCM := PayloadProcessingPluginsConfigMapForTenant(tenantID)
 	wantDeploy := PayloadProcessingDeploymentName(tenantID)
 	var configMap *unstructured.Unstructured
@@ -73,7 +74,7 @@ func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gat
 	if configMap == nil || deployment == nil {
 		return errors.New("shared ExtProc resources are missing the plugin ConfigMap or Deployment")
 	}
-	if err := configureSharedExtProcResponseMode(resources, tenantID, apiTranslation); err != nil {
+	if err := configureSharedExtProcResponseMode(resources, tenantID, responseBodyMode, apiTranslation); err != nil {
 		return err
 	}
 	data, found, err := unstructured.NestedStringMap(configMap.Object, "data")
@@ -95,15 +96,19 @@ func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gat
 	return nil
 }
 
-// configureSharedExtProcResponseMode keeps streaming scoped to tenants that
-// explicitly enable API translation. The shared inference HTTPRoutes are not
-// owned here and do not have a stable controller-provided route identity, so a
-// route-level override cannot be safely attached by this reconciler.
-func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, tenantID string, apiTranslation bool) error {
-	want := "BUFFERED"
+// configureSharedExtProcResponseMode sets the shared ipp response_body_mode.
+// The shared inference HTTPRoutes are not owned here and do not have a stable
+// controller-provided route identity, so a route-level override cannot be
+// safely attached by this reconciler. responseBodyMode comes from
+// resolveExtProcResponseBodyMode (default STREAMED).
+func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, tenantID, responseBodyMode string, apiTranslation bool) error {
+	want := responseBodyMode
+	if want == "" {
+		want = DefaultExtProcResponseBodyMode
+	}
 	var routeCacheAction string
 	if apiTranslation {
-		want = "STREAMED"
+		// Messages path rewrite needs route-cache retention.
 		routeCacheAction = "RETAIN"
 	}
 	filterName := PayloadProcessingEnvoyFilterName(tenantID)
@@ -165,13 +170,13 @@ func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, t
 // filters; the injection runs first and does not touch the
 // Messages requests they translate.
 // This runtime render owns the effective static chain because it
-// replaces the vendored ConfigMap value during reconciliation. The tenant's
-// permission also selects the shared ipp response mode: BUFFERED by default
-// and STREAMED when translation is enabled so the Messages SSE filter can emit
-// progressive events. Retaining the route cache is also scoped to
-// translation-enabled tenants because only that shared path rewrites Messages
-// requests. The separate ipp-pre mode and ExternalModel processor are
-// unchanged.
+// replaces the vendored ConfigMap value during reconciliation. The shared
+// ipp response mode defaults to STREAMED so SSE reaches clients
+// progressively while response-path plugins (metering, Messages SSE
+// translation) still see body chunks. Retaining the route cache stays scoped
+// to translation-enabled tenants because only that shared path rewrites
+// Messages requests. The separate ipp-pre mode and ExternalModel processor
+// are unchanged.
 //
 // apiTranslation enables the Anthropic Messages translation filters.
 // maxBodyBytes bounds stream_usage_inject (and related translation buffers).
@@ -184,6 +189,16 @@ func sharedExtProcConfig(apiTranslation bool, maxBodyBytes int64) string {
 	b.WriteString("  grpc_address: \"0.0.0.0:9004\"\n")
 	b.WriteString("  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
+	// Metrics auth must stay off for this chain. This deployment runs as the
+	// post-auth ServiceAccount with automountServiceAccountToken: false (see
+	// pkg/tenant/rename.go), so Praxis cannot build the TokenReview/SAR client:
+	// with the upstream default (enabled: true) it exits at startup before the
+	// gRPC listener opens, and the pod CrashLoops, taking tenant inference
+	// down. The pre-auth chain keeps auth enabled from the vendored
+	// pre-extproc.yaml because it uses the shared, bound ServiceAccount. Do not
+	// "fix" this by binding the post-auth ServiceAccount - it must hold no API
+	// permissions.
+	b.WriteString("  metrics_auth:\n    enabled: false\n")
 	// Bound every buffered body at the server, matching the vendored ODH
 	// ConfigMap. Do not set insecure_options.allow_unbounded_body: after
 	// RHOAIENG-102139 that flag leaves streamed bodies uncapped.
@@ -527,6 +542,10 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	var b strings.Builder
 	b.WriteString("server:\n  grpc_address: \"0.0.0.0:9004\"\n  health_address: \"0.0.0.0:50052\"\n")
 	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
+	// Same reasoning as sharedExtProcConfig: this config runs in a pod that
+	// does not mount a ServiceAccount token, so Praxis must not try to
+	// TokenReview-authenticate /metrics - it would exit before serving gRPC.
+	b.WriteString("  metrics_auth:\n    enabled: false\n")
 	// Always bound at the server (ODH 10 MiB default / tenant annotation).
 	// Translation keeps a small overhead above the request budget for
 	// model-rewrite copies. Never emit allow_unbounded_body (RHOAIENG-102139).
